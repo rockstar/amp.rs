@@ -1,5 +1,5 @@
 use amp_protocol::AmpBox;
-use serde::de::{self, DeserializeOwned, DeserializeSeed, Visitor};
+use serde::de::{self, Deserialize, DeserializeSeed, Visitor};
 
 use crate::Error;
 
@@ -11,24 +11,26 @@ use crate::Error;
 /// and `()` or a unit struct reads from any box, ignoring every key.
 /// The crate README lists how every AMP type maps to a Rust type.
 ///
-/// Values are copied out of the box, so `T` must own its data: a `String`
-/// field works, a `&str` field does not compile.
+/// String and byte values are borrowed from the box rather than copied, so
+/// `T` may hold `&str`, `&[u8]`, or `Cow` fields, and the result cannot
+/// outlive `amp_box`. Numbers, booleans, and other parsed values are copied
+/// as they are parsed. An owned type works as before.
 ///
 /// A `#[serde(flatten)]` field can only hold `String` and `Option<String>`
 /// fields. Serde buffers flattened values without their types, and AMP
 /// values carry no type of their own, so every buffered value arrives as a
 /// string. An integer or boolean field behind `flatten` fails with serde's
 /// "invalid type: string" error.
-pub fn from_box<T>(amp_box: &AmpBox) -> Result<T, Error>
+pub fn from_box<'a, T>(amp_box: &'a AmpBox) -> Result<T, Error>
 where
-    T: DeserializeOwned,
+    T: Deserialize<'a>,
 {
     T::deserialize(BoxDeserializer { amp_box })
 }
 
 /// Deserializes the top-level value, which must be a struct or map.
-struct BoxDeserializer<'a> {
-    amp_box: &'a AmpBox,
+struct BoxDeserializer<'de> {
+    amp_box: &'de AmpBox,
 }
 
 macro_rules! not_a_box {
@@ -39,7 +41,7 @@ macro_rules! not_a_box {
     };
 }
 
-impl<'de, 'a> de::Deserializer<'de> for BoxDeserializer<'a> {
+impl<'de> de::Deserializer<'de> for BoxDeserializer<'de> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
@@ -129,16 +131,18 @@ impl<'de, 'a> de::Deserializer<'de> for BoxDeserializer<'a> {
     }
 }
 
-/// Walks a box's pairs as a map.
-struct BoxAccess<'a, I> {
+/// Walks a box's pairs as a map. The pairs borrow from the input for the
+/// whole deserialization, whether they come from an [`AmpBox`] or straight
+/// from the bytes of an `AmpList` element.
+struct BoxAccess<'de, I> {
     iter: I,
     /// The value belonging to the key most recently handed out.
-    value: Option<&'a [u8]>,
+    value: Option<&'de [u8]>,
 }
 
-impl<'de, 'a, I> de::MapAccess<'de> for BoxAccess<'a, I>
+impl<'de, I> de::MapAccess<'de> for BoxAccess<'de, I>
 where
-    I: ExactSizeIterator<Item = (&'a [u8], &'a [u8])>,
+    I: ExactSizeIterator<Item = (&'de [u8], &'de [u8])>,
 {
     type Error = Error;
 
@@ -168,13 +172,14 @@ where
     }
 }
 
-/// Deserializes one value's bytes, or one key's.
-struct ValueDeserializer<'a> {
-    bytes: &'a [u8],
+/// Deserializes one value's bytes, or one key's. Text and bytes are handed to
+/// the visitor borrowed, so a `&'de str` field points into the input.
+struct ValueDeserializer<'de> {
+    bytes: &'de [u8],
 }
 
-impl<'a> ValueDeserializer<'a> {
-    fn text(&self, expected: &'static str) -> Result<&'a str, Error> {
+impl<'de> ValueDeserializer<'de> {
+    fn text(&self, expected: &'static str) -> Result<&'de str, Error> {
         std::str::from_utf8(self.bytes).map_err(|_| Error::InvalidValue(expected))
     }
 
@@ -193,15 +198,15 @@ macro_rules! parse_number {
     };
 }
 
-impl<'de, 'a> de::Deserializer<'de> for ValueDeserializer<'a> {
+impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     type Error = Error;
 
     /// The wire carries no type information, so an untyped read yields the
     /// text if there is valid UTF-8 and the raw bytes otherwise.
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         match std::str::from_utf8(self.bytes) {
-            Ok(text) => visitor.visit_str(text),
-            Err(_) => visitor.visit_bytes(self.bytes),
+            Ok(text) => visitor.visit_borrowed_str(text),
+            Err(_) => visitor.visit_borrowed_bytes(self.bytes),
         }
     }
 
@@ -238,7 +243,7 @@ impl<'de, 'a> de::Deserializer<'de> for ValueDeserializer<'a> {
     }
 
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        visitor.visit_str(self.text("a UTF-8 string")?)
+        visitor.visit_borrowed_str(self.text("a UTF-8 string")?)
     }
 
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
@@ -246,7 +251,7 @@ impl<'de, 'a> de::Deserializer<'de> for ValueDeserializer<'a> {
     }
 
     fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        visitor.visit_bytes(self.bytes)
+        visitor.visit_borrowed_bytes(self.bytes)
     }
 
     fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
@@ -340,7 +345,7 @@ impl<'de, 'a> de::Deserializer<'de> for ValueDeserializer<'a> {
 }
 
 /// A unit enum variant, spelled as its name.
-impl<'de, 'a> de::EnumAccess<'de> for ValueDeserializer<'a> {
+impl<'de> de::EnumAccess<'de> for ValueDeserializer<'de> {
     type Error = Error;
     type Variant = Self;
 
@@ -351,7 +356,7 @@ impl<'de, 'a> de::EnumAccess<'de> for ValueDeserializer<'a> {
     }
 }
 
-impl<'de, 'a> de::VariantAccess<'de> for ValueDeserializer<'a> {
+impl<'de> de::VariantAccess<'de> for ValueDeserializer<'de> {
     type Error = Error;
 
     fn unit_variant(self) -> Result<(), Error> {
@@ -376,12 +381,12 @@ impl<'de, 'a> de::VariantAccess<'de> for ValueDeserializer<'a> {
 }
 
 /// Walks the elements of a `ListOf` or `AmpList` value.
-struct SeqAccess<'a> {
-    bytes: &'a [u8],
+struct SeqAccess<'de> {
+    bytes: &'de [u8],
     pos: usize,
 }
 
-impl<'de, 'a> de::SeqAccess<'de> for SeqAccess<'a> {
+impl<'de> de::SeqAccess<'de> for SeqAccess<'de> {
     type Error = Error;
 
     fn next_element_seed<T: DeserializeSeed<'de>>(
@@ -409,13 +414,13 @@ impl<'de, 'a> de::SeqAccess<'de> for SeqAccess<'a> {
 /// element's own type decides: a struct or map reads a box, anything else
 /// reads a length-prefixed value. Reports how many bytes it used through
 /// `consumed`.
-struct ElementDeserializer<'a, 'c> {
-    bytes: &'a [u8],
+struct ElementDeserializer<'de, 'c> {
+    bytes: &'de [u8],
     consumed: &'c mut usize,
 }
 
-impl<'a, 'c> ElementDeserializer<'a, 'c> {
-    fn scalar(self) -> Result<ValueDeserializer<'a>, Error> {
+impl<'de, 'c> ElementDeserializer<'de, 'c> {
+    fn scalar(self) -> Result<ValueDeserializer<'de>, Error> {
         let expected = "a length-prefixed list element";
         let len = match self.bytes.get(..2) {
             Some(&[high, low]) => u16::from_be_bytes([high, low]) as usize,
@@ -429,10 +434,15 @@ impl<'a, 'c> ElementDeserializer<'a, 'c> {
         Ok(ValueDeserializer { bytes })
     }
 
-    fn amp_box(self) -> Result<AmpBox, Error> {
-        let (amp_box, consumed) = AmpBox::decode(self.bytes).map_err(Error::Protocol)?;
+    /// Reads the element as a box, borrowing its pairs from the input rather
+    /// than building an `AmpBox`, so the element's fields can borrow too.
+    fn amp_box<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        let (pairs, consumed) = AmpBox::decode_borrowed(self.bytes).map_err(Error::Protocol)?;
         *self.consumed = consumed;
-        Ok(amp_box)
+        visitor.visit_map(BoxAccess {
+            iter: pairs.into_iter(),
+            value: None,
+        })
     }
 }
 
@@ -444,7 +454,7 @@ macro_rules! scalar_element {
     };
 }
 
-impl<'de, 'a, 'c> de::Deserializer<'de> for ElementDeserializer<'a, 'c> {
+impl<'de, 'c> de::Deserializer<'de> for ElementDeserializer<'de, 'c> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
@@ -519,18 +529,16 @@ impl<'de, 'a, 'c> de::Deserializer<'de> for ElementDeserializer<'a, 'c> {
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        let amp_box = self.amp_box()?;
-        BoxDeserializer { amp_box: &amp_box }.deserialize_map(visitor)
+        self.amp_box(visitor)
     }
 
     fn deserialize_struct<V: Visitor<'de>>(
         self,
-        name: &'static str,
-        fields: &'static [&'static str],
+        _name: &'static str,
+        _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        let amp_box = self.amp_box()?;
-        BoxDeserializer { amp_box: &amp_box }.deserialize_struct(name, fields, visitor)
+        self.amp_box(visitor)
     }
 
     fn is_human_readable(&self) -> bool {
@@ -540,6 +548,7 @@ impl<'de, 'a, 'c> de::Deserializer<'de> for ElementDeserializer<'a, 'c> {
 
 #[cfg(test)]
 mod test {
+    use std::borrow::Cow;
     use std::collections::{BTreeMap, HashMap};
 
     use serde::Deserialize;
@@ -553,7 +562,7 @@ mod test {
         v: T,
     }
 
-    fn value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
+    fn value<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
         let mut amp_box = AmpBox::new();
         amp_box.insert("v", bytes).unwrap();
         from_box::<One<T>>(&amp_box).map(|one| one.v)
@@ -630,6 +639,81 @@ mod test {
             }
         }
         assert_eq!(value::<Raw>(b"\x00\xff").unwrap(), Raw(vec![0, 255]));
+    }
+
+    /// Text and bytes come out of the box without a copy: the references
+    /// point into the box's own storage, and a `Cow` stays borrowed.
+    #[test]
+    fn text_and_bytes_are_borrowed_from_the_box() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Borrowed<'a> {
+            s: &'a str,
+            b: &'a [u8],
+            #[serde(borrow)]
+            c: Cow<'a, str>,
+        }
+        let mut amp_box = AmpBox::new();
+        amp_box.insert("s", "hello").unwrap();
+        amp_box.insert("b", b"\x00\xff".to_vec()).unwrap();
+        amp_box.insert("c", "cow").unwrap();
+        let borrowed: Borrowed = from_box(&amp_box).unwrap();
+        assert_eq!(borrowed.s, "hello");
+        assert_eq!(borrowed.b, b"\x00\xff");
+        assert!(matches!(borrowed.c, Cow::Borrowed("cow")));
+        assert_eq!(borrowed.s.as_ptr(), amp_box.get("s").unwrap().as_ptr());
+        assert_eq!(borrowed.b.as_ptr(), amp_box.get("b").unwrap().as_ptr());
+
+        assert!(matches!(
+            from_box::<Borrowed>(&{
+                let mut amp_box = amp_box.clone();
+                amp_box.insert("s", b"\xff".to_vec()).unwrap();
+                amp_box
+            }),
+            Err(Error::InvalidValue(_))
+        ));
+    }
+
+    /// An `AmpList` element is read straight out of the parent value's
+    /// bytes, so its fields borrow from the box like top-level fields do.
+    #[test]
+    fn list_elements_borrow_from_the_box() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Item<'a> {
+            name: &'a str,
+            #[serde(borrow)]
+            raw: Cow<'a, [u8]>,
+        }
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct List<'a> {
+            #[serde(borrow)]
+            v: Vec<Item<'a>>,
+        }
+        let mut amp_box = AmpBox::new();
+        let list = b"\x00\x04name\x00\x01a\x00\x03raw\x00\x01\xff\x00\x00\x00\x04name\x00\x02bc\x00\x03raw\x00\x00\x00\x00";
+        amp_box.insert("v", list.to_vec()).unwrap();
+        let list: List = from_box(&amp_box).unwrap();
+        assert_eq!(list.v.len(), 2);
+        assert_eq!(list.v[0].name, "a");
+        assert!(matches!(&list.v[0].raw, Cow::Borrowed(b) if *b == b"\xff"));
+        assert_eq!(list.v[1].name, "bc");
+        assert_eq!(list.v[1].raw, Cow::Borrowed(&b""[..]));
+        let value = amp_box.get("v").unwrap();
+        let bc = value.windows(2).position(|w| w == b"bc").unwrap();
+        assert_eq!(list.v[1].name.as_ptr(), value[bc..].as_ptr());
+    }
+
+    /// A key repeated inside a list element keeps its last value, as a
+    /// repeated key in a top-level box does.
+    #[test]
+    fn list_element_with_repeated_key_keeps_the_last_value() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Item {
+            k: u8,
+        }
+        assert_eq!(
+            value::<Vec<Item>>(b"\x00\x01k\x00\x011\x00\x01k\x00\x012\x00\x00").unwrap(),
+            vec![Item { k: 2 }]
+        );
     }
 
     #[test]

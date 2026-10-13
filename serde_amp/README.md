@@ -56,7 +56,7 @@ pairs. Each field holds one AMP value:
 |-------------------|-------------------------------------------------------------------|
 | Integer           | any integer type, as decimal text                                 |
 | Unicode           | `String`, `&str`, `char`, as UTF-8                                |
-| String (bytes)    | a type that serializes as bytes, such as `serde_bytes::ByteBuf`   |
+| String (bytes)    | `&[u8]` when reading; `serde_bytes::ByteBuf` or `Bytes` to write  |
 | Boolean           | `bool`, as `True` or `False`                                      |
 | Float             | `f32`, `f64`, including `inf`, `-inf`, and `NaN`                  |
 | Decimal           | a `String`, or a decimal type that serializes as text             |
@@ -69,6 +69,11 @@ pairs. Each field holds one AMP value:
 A unit enum variant is written as its name, which suits a command argument
 that takes one of a fixed set of strings. Keys that a struct does not name are
 ignored when reading.
+
+Text and bytes are borrowed from the box when reading, not copied, so a struct
+may hold `&str`, `&[u8]`, or `Cow` fields and then lives no longer than the
+box. This holds inside an `AmpList` too. Owned fields such as `String` work as
+they always have.
 
 Note that a plain `Vec<u8>` is a `ListOf(Integer)`, because that is how serde
 sees it. Use `serde_bytes` or a custom `Serialize` for an AMP `String`.
@@ -89,9 +94,6 @@ integer or boolean field behind `flatten` fails with serde's own
 `invalid type: string "13", expected u32`. If you were reaching for `flatten`
 to add the protocol's `_command` or `_ask` keys, use the request and response
 types in `amp-protocol` instead, which carry your arguments as a box.
-
-**Values are copied out of the box.** `from_box` requires an owned type, so a
-struct with a `&str` field does not compile. Use `String`.
 
 License
 --

@@ -136,14 +136,33 @@ impl AmpBox {
     /// 255. A key that repeats within one box keeps the last value, matching
     /// the reference implementation.
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
-        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let (pairs, consumed) = Self::decode_borrowed(bytes)?;
+        let entries = pairs
+            .into_iter()
+            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .collect();
+        Ok((AmpBox { entries }, consumed))
+    }
+
+    /// Decodes one box from the front of `bytes` without copying its contents.
+    ///
+    /// Returns the box's pairs as slices into `bytes`, in wire order, and the
+    /// number of bytes the box occupied. The pairs are exactly those
+    /// [`decode`](Self::decode) would hold, including a repeated key keeping
+    /// its last value, and the errors are the same. Use this when the pairs
+    /// are read once and the box itself is not needed.
+    // A pair of slices is the whole point of this function, and a named
+    // alias for it would be one more public type to learn.
+    #[allow(clippy::type_complexity)]
+    pub fn decode_borrowed(bytes: &[u8]) -> Result<(Vec<(&[u8], &[u8])>, usize), Error> {
+        let mut pairs: Vec<(&[u8], &[u8])> = Vec::new();
         let mut keys = Keys::new();
         let mut pos = 0;
         loop {
             let key_len = read_u16(bytes, pos)?;
             pos += 2;
             if key_len == 0 {
-                return Ok((AmpBox { entries }, pos));
+                return Ok((pairs, pos));
             }
             if key_len > MAX_KEY_LENGTH {
                 return Err(Error::KeyTooLong { len: key_len });
@@ -157,14 +176,10 @@ impl AmpBox {
             pos += value_len;
 
             match keys.position(key) {
-                Some(index) => {
-                    let existing = &mut entries[index].1;
-                    existing.clear();
-                    existing.extend_from_slice(value);
-                }
+                Some(index) => pairs[index].1 = value,
                 None => {
-                    keys.push(key, entries.len());
-                    entries.push((key.to_vec(), value.to_vec()));
+                    keys.push(key, pairs.len());
+                    pairs.push((key, value));
                 }
             }
         }
@@ -437,6 +452,21 @@ mod test {
         let (amp_box, _) = AmpBox::decode(b"\x00\x01k\x00\x011\x00\x01k\x00\x012\x00\x00").unwrap();
         assert_eq!(amp_box.len(), 1);
         assert_eq!(amp_box.get("k"), Some(&b"2"[..]));
+    }
+
+    #[test]
+    fn decode_borrowed_matches_decode() {
+        let input = b"\x00\x01k\x00\x011\x00\x01j\x00\x02ab\x00\x01k\x00\x012\x00\x00tail";
+        let (pairs, consumed) = AmpBox::decode_borrowed(input).unwrap();
+        assert_eq!(pairs, vec![(&b"k"[..], &b"2"[..]), (&b"j"[..], &b"ab"[..])]);
+        assert_eq!(consumed, input.len() - 4);
+        let (amp_box, owned_consumed) = AmpBox::decode(input).unwrap();
+        assert_eq!(owned_consumed, consumed);
+        assert_eq!(amp_box.iter().collect::<Vec<_>>(), pairs);
+        assert!(matches!(
+            AmpBox::decode_borrowed(&input[..consumed - 1]),
+            Err(Error::Incomplete)
+        ));
     }
 
     /// Encodes one pair by hand, since `AmpBox` will not hold a duplicate.

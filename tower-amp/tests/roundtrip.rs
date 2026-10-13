@@ -321,17 +321,19 @@ async fn bad_arguments_are_unknown_errors() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn requests_on_one_connection_run_concurrently() {
     let client = connect(router());
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let (slow, fast) = tokio::join!(
         client.call(&Sleep { millis: 200 }),
         client.call(&Sleep { millis: 10 }),
     );
     assert_eq!(slow.unwrap().millis, 200);
     assert_eq!(fast.unwrap().millis, 10);
-    assert!(started.elapsed() < Duration::from_millis(400));
+    // The clock is paused, so this is exactly the longer sleep rather than
+    // the sum of both: the two requests overlapped.
+    assert_eq!(started.elapsed(), Duration::from_millis(200));
 }
 
 #[tokio::test]
@@ -350,7 +352,7 @@ async fn commands_share_state_and_stateless_commands_join_them() {
     assert_eq!(total.total, 4);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn middleware_errors_reach_the_peer_as_unknown() {
     let service = ServiceBuilder::new()
         .timeout(Duration::from_millis(20))
@@ -638,7 +640,7 @@ fn assert_key_too_long<T: std::fmt::Debug>(result: &Result<T, Error>) {
 /// A call the peer is too slow to answer fails with `Timeout`, and the
 /// connection carries on: the answer that arrives later is discarded rather
 /// than confusing a later call.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_slow_answer_times_out_and_is_later_discarded() {
     let client = connect(router()).with_timeout(Duration::from_millis(20));
     let failed = client.call(&Sleep { millis: 100 }).await;
@@ -655,7 +657,7 @@ async fn a_slow_answer_times_out_and_is_later_discarded() {
 
 /// The limit belongs to the handle, so clones of one connection can have
 /// different limits, including none.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn clones_take_their_own_timeout() {
     let patient = connect(router());
     let hasty = patient.clone().with_timeout(Duration::from_millis(20));
@@ -667,7 +669,7 @@ async fn clones_take_their_own_timeout() {
     assert!(matches!(failed, Err(Error::Timeout)), "{failed:?}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_service_form_honors_the_timeout() {
     let mut client = connect(router()).with_timeout(Duration::from_millis(20));
     let mut arguments = AmpBox::new();
@@ -681,7 +683,7 @@ async fn the_service_form_honors_the_timeout() {
 /// write is never sent. The pipe holds less than one request and the peer
 /// does not read until both calls have timed out, so the first request is
 /// stuck mid-write and the second is still queued when they time out.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_abandoned_request_is_not_written() {
     let (client_io, peer) = tokio::io::duplex(16);
     let client = Client::new(client_io).with_timeout(Duration::from_millis(20));

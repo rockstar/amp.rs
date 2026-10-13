@@ -60,7 +60,7 @@ wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 tower = { workspace = true, features = ["timeout", "limit"] }
 # Only for the test that asserts what the `tracing` feature logs.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

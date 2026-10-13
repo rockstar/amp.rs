@@ -2,3 +2,5 @@
 **/*.rs.bk
 **/*.rustfmt
 Cargo.lock
+# For the Twisted interoperability tests; see DEVELOPING.md.
+.venv/

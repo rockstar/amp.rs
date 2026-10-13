@@ -1,0 +1,5 @@
+error: `response` given twice
+ --> tests/ui/response_twice.rs:3:26
+  |
+3 | #[command(response = (), response = ())]
+  |                          ^^^^^^^^

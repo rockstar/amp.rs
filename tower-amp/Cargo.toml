@@ -69,7 +69,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # runtime. `signal` is for the examples and the README, which stop on
 # Ctrl-C.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+# `process` is for tests/twisted.rs, which runs the Python peer.
+tokio = { workspace = true, features = ["process", "rt-multi-thread", "signal"] }
 # Compiles the `#[command]` cases under tests/ui and checks the compiler's
 # output, which needs cargo and so cannot run inside WebAssembly.
 trybuild = "1"

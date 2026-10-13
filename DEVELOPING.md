@@ -127,6 +127,31 @@ so a change to the client should only ever need one of those to change.
 Only the WASI tests run, so a change to the browser-only helpers is checked
 by clippy alone; test the browser path by hand in a page.
 
+Twisted interoperability
+--
+
+AMP's reference implementation is Twisted's, and the point of these crates
+is to talk to it, so `tower-amp/tests/twisted.rs` runs this crate's server
+against Twisted's client and this crate's client against Twisted's server,
+over TCP on loopback. The Python side is `tower-amp/tests/twisted/peer.py`,
+whose commands are the `Sum` and `Divide` from Twisted's AMP documentation.
+
+The tests are marked `#[ignore]`, since they need a Python with Twisted
+installed, so `cargo test` and the hooks skip them and only CI runs them.
+To run them by hand:
+
+```
+python3 -m venv .venv && .venv/bin/pip install twisted
+PYTHON="$PWD/.venv/bin/python" cargo test -p tower-amp --test twisted -- --ignored
+```
+
+`PYTHON` names the interpreter and defaults to `python3`. It must be an
+absolute path or a name on `PATH`: cargo runs the test binary from the
+crate's own directory, not the repository root, so a relative
+`.venv/bin/python` is not found. The tests kill
+the Python server they start when they finish, and a peer that does not
+answer within thirty seconds fails the test rather than hanging it.
+
 Benchmarks
 --
 

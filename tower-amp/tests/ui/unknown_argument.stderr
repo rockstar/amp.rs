@@ -1,0 +1,5 @@
+error: unknown argument `nam`; expected `name` or `response`
+ --> tests/ui/unknown_argument.rs:3:11
+  |
+3 | #[command(nam = "Cmd")]
+  |           ^^^

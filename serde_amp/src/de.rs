@@ -339,8 +339,11 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
         visitor.visit_enum(self)
     }
 
+    /// Keys are arbitrary bytes on the wire. A non-UTF-8 key is handed over
+    /// as bytes so that a derived field visitor can treat it as unknown and
+    /// skip it instead of failing the whole struct.
     fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        self.deserialize_str(visitor)
+        self.deserialize_any(visitor)
     }
 
     /// The value is already framed, so there is nothing to skip over.
@@ -954,6 +957,14 @@ mod test {
             from_box::<One<u8>>(&AmpBox::new()),
             Err(Error::Message(message)) if message.contains("missing field")
         ));
+    }
+
+    #[test]
+    fn non_utf8_keys_are_ignored_like_any_other_unknown_key() {
+        let mut amp_box = AmpBox::new();
+        amp_box.insert(b"\xff\xfe".to_vec(), "ignored").unwrap();
+        amp_box.insert("v", "1").unwrap();
+        assert_eq!(from_box::<One<u8>>(&amp_box).unwrap(), One { v: 1 });
     }
 
     #[test]

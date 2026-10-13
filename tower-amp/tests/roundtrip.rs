@@ -156,6 +156,17 @@ impl Handle for LongDescription {
     }
 }
 
+/// Panics instead of answering.
+#[derive(Serialize, Deserialize)]
+#[command]
+struct Boom {}
+
+impl Handle for Boom {
+    async fn handle(self) -> Result<(), Error> {
+        panic!("handler bug")
+    }
+}
+
 fn router() -> Router {
     Router::new()
         .command::<Sum>()
@@ -363,4 +374,22 @@ async fn over_long_error_description_is_truncated() {
                 && description.len() == 65_535
                 && description.bytes().all(|b| b == b'y')
     ));
+}
+
+/// A handler that panics must still be answered, as `UNKNOWN`, and must not
+/// take the connection down with it.
+#[tokio::test]
+async fn a_panicking_handler_is_answered_with_unknown() {
+    let client = connect(Router::new().command::<Boom>().command::<Sum>());
+    let failed = tokio::time::timeout(Duration::from_secs(2), client.call(&Boom {}))
+        .await
+        .expect("no answer: the panic was swallowed");
+    assert!(matches!(
+        failed,
+        Err(Error::Command { code, description })
+            if code == "UNKNOWN" && description.contains("handler bug")
+    ));
+    // The connection must survive.
+    let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
+    assert_eq!(total.total, 3);
 }

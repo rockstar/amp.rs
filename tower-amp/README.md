@@ -59,7 +59,8 @@ handler returns `()`, which is an empty box on the wire.
 A request for a command the router does not know is answered with the
 `UNHANDLED` error code. `Error::new` goes to the peer as its code and
 description; any other error, including arguments that fail to parse, goes
-as `UNKNOWN` with the error's message.
+as `UNKNOWN` with the error's message. A handler that panics is answered the
+same way, with the panic's message, and the connection stays up.
 
 Commands that share state implement `HandleWith` for the state type instead,
 and the router is built with `Router::with_state`:

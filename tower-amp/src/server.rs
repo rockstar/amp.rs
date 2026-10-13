@@ -4,6 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::task::JoinError;
 use tokio_util::codec::Framed;
 use tower::{Service, ServiceExt};
 
@@ -36,9 +37,10 @@ where
 /// requests on a connection run concurrently and are answered in whatever
 /// order they finish, as the protocol allows. A request without `_ask` gets
 /// no reply. A failed request is answered with the error's code and
-/// description, or with `UNKNOWN` for an error that has no code. Answers and
-/// errors the peer sends, which would belong to commands this side had
-/// called, are ignored.
+/// description, or with `UNKNOWN` for an error that has no code. A request
+/// whose handler panics is answered with `UNKNOWN` and the panic's message,
+/// and the connection carries on. Answers and errors the peer sends, which
+/// would belong to commands this side had called, are ignored.
 ///
 /// Returns once the peer closes the connection and every request already
 /// received has been answered, or with the error that ended the connection.
@@ -84,15 +86,22 @@ where
 /// request wants one.
 async fn respond<S>(mut service: S, request: Request, responses: mpsc::Sender<AmpBox>)
 where
-    S: Service<Request, Response = AmpBox>,
+    S: Service<Request, Response = AmpBox> + Send + 'static,
     S::Error: Into<Error>,
+    S::Future: Send,
 {
     let ask = request.ask.clone();
-    let result = async {
+    // The service runs on a task of its own so that a handler that panics
+    // takes down only that task. This one survives to answer the request,
+    // which would otherwise wait on the peer forever.
+    let call = tokio::spawn(async move {
         let service = service.ready().await.map_err(Into::into)?;
         service.call(request).await.map_err(Into::into)
-    }
-    .await;
+    });
+    let result = match call.await {
+        Ok(result) => result,
+        Err(err) => Err(panicked(err)),
+    };
     let Some(ask) = ask else {
         return;
     };
@@ -104,6 +113,23 @@ where
         Err(err) => error_response(ask, &err),
     };
     let _ = responses.send(response).await;
+}
+
+/// The error a handler that did not finish is answered with. A panic's
+/// message, when it has one, goes in the description, since the peer has no
+/// other way to learn what went wrong.
+fn panicked(err: JoinError) -> Error {
+    let description = match err.try_into_panic() {
+        Ok(payload) => match payload.downcast_ref::<&str>() {
+            Some(message) => format!("command panicked: {message}"),
+            None => match payload.downcast_ref::<String>() {
+                Some(message) => format!("command panicked: {message}"),
+                None => "command panicked".to_string(),
+            },
+        },
+        Err(_) => "command was cancelled".to_string(),
+    };
+    Error::new(ErrorResponse::UNKNOWN, description)
 }
 
 /// Builds the error box for `ask`. A code or description longer than a box

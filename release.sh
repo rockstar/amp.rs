@@ -158,7 +158,7 @@ while read -r crate version dir; do
     echo "  $crate $version: changed since $tag, will bump to $next"
     bump_crates+=("$crate")
     bump_versions+=("$next")
-    bump_summary+=("$crate $version -> $next")
+    bump_summary+=("$crate $next")
     release_tags+=("$crate-$next")
 done < <(crates)
 

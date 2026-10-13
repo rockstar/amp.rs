@@ -1,4 +1,6 @@
+use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use amp_protocol::codec::AmpCodec;
 use amp_protocol::{AmpBox, Answer, ErrorResponse, Message, Request};
@@ -18,12 +20,21 @@ use crate::Error;
 /// is held to this much memory rather than as much as it cares to send.
 const MAX_IN_FLIGHT: usize = 256;
 
+/// How long the accept loop waits after `accept` fails for want of a file
+/// descriptor, so that it neither spins nor gives up while the process is
+/// briefly at its limit.
+const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
+
 /// Accepts connections on `listener` forever, serving each one with a clone
 /// of `service` on its own task.
 ///
-/// Returns only when accepting a connection fails. An error on one
-/// connection ends that connection and is discarded; call
-/// [`serve_connection`] from your own accept loop to observe those errors.
+/// Returns only when accepting a connection fails for good. A peer that
+/// drops its connection before it is accepted, or an accept that fails
+/// because the process is briefly out of file descriptors, is skipped and
+/// the loop carries on; anything else, such as the listener being closed,
+/// ends `serve` with that error. An error on one connection ends that
+/// connection and is discarded; call [`serve_connection`] from your own
+/// accept loop to observe those errors.
 ///
 /// Each connection uses a default [`AmpCodec`], which refuses a box longer
 /// than 16 MiB; [`serve_with_codec`] takes another.
@@ -50,12 +61,57 @@ where
     S::Future: Send,
 {
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => match retry_after(&err) {
+                Some(delay) => {
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                None => return Err(err.into()),
+            },
+        };
         let service = service.clone();
         tokio::spawn(async move {
             let _ = serve_connection_with_codec(stream, service, codec).await;
         });
     }
+}
+
+/// How the accept loop treats an error from `accept`: `Some(delay)` means
+/// wait that long and try again, `None` means the error ends `serve`.
+///
+/// A peer that resets or hangs up between connecting and being accepted
+/// surfaces as a connection error on `accept`, and says nothing about the
+/// listener. Running out of file descriptors (`EMFILE`, `ENFILE`) clears
+/// once a connection closes, but retrying at once would spin until then.
+/// Both are routine under load or a port scan, and neither is a reason to
+/// stop serving. This matches what hyper's `AddrIncoming` and axum's
+/// `serve` do.
+fn retry_after(err: &io::Error) -> Option<Duration> {
+    match err.kind() {
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::Interrupted => Some(Duration::ZERO),
+        _ if out_of_descriptors(err) => Some(OUT_OF_DESCRIPTORS_BACKOFF),
+        _ => None,
+    }
+}
+
+/// Whether `err` is `EMFILE` or `ENFILE`: the process or the system has no
+/// file descriptor left for the connection. `io::ErrorKind` has no variant
+/// for either, so this goes by the OS error code.
+fn out_of_descriptors(err: &io::Error) -> bool {
+    const OUT_OF_DESCRIPTORS: &[i32] = if cfg!(windows) {
+        // WSAEMFILE; Windows has no per-system equivalent of ENFILE.
+        &[10024]
+    } else {
+        // ENFILE, EMFILE: the same on Linux, macOS and the BSDs.
+        &[23, 24]
+    };
+    err.raw_os_error()
+        .is_some_and(|code| OUT_OF_DESCRIPTORS.contains(&code))
 }
 
 /// Serves one connection until the peer closes it.
@@ -229,6 +285,39 @@ fn fit(s: &str) -> &str {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn a_peer_that_hangs_up_before_accept_is_skipped() {
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert_eq!(retry_after(&io::Error::from(kind)), Some(Duration::ZERO));
+        }
+    }
+
+    #[test]
+    fn running_out_of_descriptors_backs_off() {
+        let codes: &[i32] = if cfg!(windows) { &[10024] } else { &[23, 24] };
+        for &code in codes {
+            let err = io::Error::from_raw_os_error(code);
+            assert_eq!(retry_after(&err), Some(OUT_OF_DESCRIPTORS_BACKOFF), "{err}");
+        }
+    }
+
+    #[test]
+    fn other_accept_errors_end_serve() {
+        for err in [
+            io::Error::from(io::ErrorKind::NotConnected),
+            io::Error::from(io::ErrorKind::Other),
+            // EBADF: the listener's descriptor is gone.
+            io::Error::from_raw_os_error(9),
+        ] {
+            assert_eq!(retry_after(&err), None, "{err}");
+        }
+    }
 
     #[test]
     fn limit_matches_amp_protocol() {

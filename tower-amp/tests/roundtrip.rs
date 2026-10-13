@@ -685,3 +685,73 @@ async fn arguments_that_cannot_become_a_box_fail_the_client_with_serialize() {
         .await;
     assert!(matches!(failed, Err(Error::Serialize(_))), "{failed:?}");
 }
+
+/// Binds a listener on a free port and serves `service` on it with `serve`,
+/// so a test can connect to it over real TCP.
+async fn listen<S>(service: S) -> std::net::SocketAddr
+where
+    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
+    S::Error: Into<Error>,
+    S::Future: Send,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(tower_amp::serve(listener, service));
+    addr
+}
+
+/// A client connected over TCP to the server at `addr`.
+async fn connect_tcp(addr: std::net::SocketAddr) -> Client {
+    Client::new(tokio::net::TcpStream::connect(addr).await.unwrap())
+}
+
+/// `serve` accepts connections over real TCP, serves each on its own, and
+/// goes on accepting after a peer connects and hangs up without a word.
+#[tokio::test]
+async fn serve_accepts_connections_over_tcp() {
+    let addr = listen(router()).await;
+
+    let first = connect_tcp(addr).await;
+    let second = connect_tcp(addr).await;
+    let total = first.call(&Sum { a: 1, b: 2 }).await.unwrap();
+    assert_eq!(total.total, 3);
+    let total = second.call(&Sum { a: 3, b: 4 }).await.unwrap();
+    assert_eq!(total.total, 7);
+
+    // A peer that connects and leaves at once ends its own connection, not
+    // the server.
+    drop(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let third = connect_tcp(addr).await;
+    let total = third.call(&Sum { a: 5, b: 6 }).await.unwrap();
+    assert_eq!(total.total, 11);
+}
+
+/// `serve_with_codec` frames every connection it accepts with the codec it
+/// was given, and a connection that breaks the limit ends only itself.
+#[tokio::test]
+async fn serve_with_codec_frames_every_connection_with_it() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(tower_amp::serve_with_codec(
+        listener,
+        router(),
+        AmpCodec::with_max_frame_length(1024),
+    ));
+
+    let client = connect_tcp(addr).await;
+    let payload = "x".repeat(8_000);
+    let failed = tokio::time::timeout(Duration::from_secs(2), client.call(&Echo { payload }))
+        .await
+        .expect("the server buffered the oversized box instead of rejecting it");
+    assert!(peer_closed(&failed), "{failed:?}");
+
+    // The server is still accepting, and still enforcing the limit.
+    let client = connect_tcp(addr).await;
+    let small = client
+        .call(&Echo {
+            payload: "ok".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(small.payload, "ok");
+}

@@ -198,6 +198,9 @@ longer than 16 MiB and closes rather than buffering without bound. Pass an
 Not yet supported: commands the server initiates on a client, TLS, graceful
 shutdown, and tracing. A connection error inside `serve` ends that connection
 silently; write the accept loop yourself with `serve_connection` to see it.
+`serve` itself survives a peer that hangs up before it is accepted and a
+process briefly out of file descriptors, and returns only on an error that
+means the listener is no good.
 
 License
 --

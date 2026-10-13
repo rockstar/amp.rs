@@ -52,27 +52,31 @@ where
     let (mut sink, mut stream) = Framed::new(io, AmpCodec::new()).split();
     let (responses, mut pending) = mpsc::channel::<AmpBox>(16);
 
-    loop {
-        tokio::select! {
-            incoming = stream.next() => match incoming {
-                None => break,
-                Some(Err(err)) => return Err(err.into()),
-                Some(Ok(amp_box)) => match Message::from_box(amp_box)? {
-                    Message::Request(request) => {
-                        tokio::spawn(respond(service.clone(), request, responses.clone()));
-                    }
-                    Message::Answer(_) | Message::Error(_) => {}
-                },
-            },
-            Some(response) = pending.recv() => sink.send(response).await?,
+    // Reading and writing are separate futures so that a write the peer is
+    // slow to accept never stops this side from reading. If both sides
+    // stopped reading while blocked on a write, neither would ever drain the
+    // other's buffer.
+    let read = async move {
+        while let Some(incoming) = stream.next().await {
+            match Message::from_box(incoming?)? {
+                Message::Request(request) => {
+                    tokio::spawn(respond(service.clone(), request, responses.clone()));
+                }
+                Message::Answer(_) | Message::Error(_) => {}
+            }
         }
-    }
-
-    // The peer is done sending. Answer what is still in flight, then stop.
-    drop(responses);
-    while let Some(response) = pending.recv().await {
-        sink.send(response).await?;
-    }
+        // The peer is done sending. Dropping this sender lets the writer
+        // finish once every request already received has been answered.
+        drop(responses);
+        Ok::<_, Error>(())
+    };
+    let write = async move {
+        while let Some(response) = pending.recv().await {
+            sink.send(response).await?;
+        }
+        Ok::<_, Error>(())
+    };
+    tokio::try_join!(read, write)?;
     Ok(())
 }
 

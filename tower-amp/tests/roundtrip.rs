@@ -105,6 +105,25 @@ impl HandleWith<Counter> for Read {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[command(response = Echoed)]
+struct Echo {
+    payload: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct Echoed {
+    payload: String,
+}
+
+impl Handle for Echo {
+    async fn handle(self) -> Result<Echoed, Error> {
+        Ok(Echoed {
+            payload: self.payload,
+        })
+    }
+}
+
 /// A command nothing handles.
 #[derive(Serialize, Deserialize)]
 #[command(response = Total)]
@@ -120,6 +139,7 @@ fn router() -> Router {
         .command::<Sum>()
         .command::<Divide>()
         .command::<Sleep>()
+        .command::<Echo>()
 }
 
 /// Serves `service` on one end of a pipe and returns a client on the other.
@@ -264,4 +284,27 @@ async fn server_answers_in_flight_requests_after_the_client_stops_sending() {
     assert_eq!(slept.millis, 50);
     drop(client);
     server.await.unwrap().unwrap();
+}
+
+/// Both sides must keep reading while they are blocked on a write. Thirty-two
+/// 8 KB calls in flight at once saturate the 4 KB pipe in both directions, so
+/// a connection loop that stops reading while it writes hangs here.
+#[tokio::test]
+async fn pipelined_large_calls_do_not_deadlock() {
+    let client = connect(router());
+    let payload = "x".repeat(8_000);
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..32 {
+        let client = client.clone();
+        let payload = payload.clone();
+        set.spawn(async move { client.call(&Echo { payload }).await.unwrap() });
+    }
+    let all = async {
+        while let Some(echoed) = set.join_next().await {
+            assert_eq!(echoed.unwrap().payload.len(), 8_000);
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), all)
+        .await
+        .expect("deadlocked: neither side is reading while blocked on write");
 }

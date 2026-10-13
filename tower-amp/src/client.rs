@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use amp_protocol::codec::AmpCodec;
@@ -41,6 +41,9 @@ struct Outgoing {
     request: Request,
     reply: oneshot::Sender<Result<AmpBox, Error>>,
 }
+
+/// Calls waiting for a reply, keyed by ask.
+type Pending = HashMap<Vec<u8>, oneshot::Sender<Result<AmpBox, Error>>>;
 
 impl Client {
     /// Starts a client over `io`, typically a connected `TcpStream`. The
@@ -110,80 +113,117 @@ impl Service<Request> for Client {
 
 /// Drives the connection: writes outgoing requests, matches incoming
 /// responses to them, and refuses incoming requests.
+///
+/// Reading and writing are separate futures so that a write the peer is slow
+/// to accept never stops this side from reading. If both sides stopped
+/// reading while blocked on a write, neither would ever drain the other's
+/// buffer. The connection ends when either future does: the peer closed it
+/// or broke the protocol, a write failed, or every clone of the client is
+/// gone.
 async fn run<T>(io: T, mut outgoing: mpsc::Receiver<Outgoing>)
 where
     T: AsyncRead + AsyncWrite,
 {
     let (mut sink, mut stream) = Framed::new(io, AmpCodec::new()).split();
-    let mut pending: HashMap<Vec<u8>, oneshot::Sender<Result<AmpBox, Error>>> = HashMap::new();
+    // Calls waiting for a reply, keyed by ask. The writer registers a call
+    // before it writes the request, so a reply can never arrive first.
+    // NOTE: this is a `std::sync::Mutex` by design! We don't want the mutex
+    // to be held across an await, and using the `std::sync` version, rather
+    // than the `tokio::sync` version, ensures we can't mess that up.
+    let pending: Mutex<Pending> = Mutex::new(HashMap::new());
+    let (refusals, mut refused) = mpsc::channel::<AmpBox>(16);
 
-    loop {
-        tokio::select! {
-            next = outgoing.recv() => {
-                let Some(Outgoing { request, reply }) = next else {
-                    // Every clone of the client is gone.
-                    break;
-                };
-                let ask = request.ask.clone();
-                let amp_box = match request.into_box() {
-                    Ok(amp_box) => amp_box,
-                    Err(err) => {
-                        let _ = reply.send(Err(err.into()));
+    let read = async {
+        while let Some(Ok(amp_box)) = stream.next().await {
+            match Message::from_box(amp_box) {
+                Ok(Message::Answer(answer)) => {
+                    if let Some(reply) = lock(&pending).remove(&answer.answer) {
+                        let _ = reply.send(Ok(answer.results));
+                    }
+                }
+                Ok(Message::Error(error)) => {
+                    if let Some(reply) = lock(&pending).remove(&error.error) {
+                        let _ = reply.send(Err(Error::new(
+                            String::from_utf8_lossy(&error.code),
+                            String::from_utf8_lossy(&error.description),
+                        )));
+                    }
+                }
+                Ok(Message::Request(request)) => {
+                    let Some(refusal) = request.error(
+                        ErrorResponse::UNHANDLED,
+                        "this client does not handle commands",
+                    ) else {
                         continue;
-                    }
-                };
-                if let Err(err) = sink.send(amp_box).await {
-                    let _ = reply.send(Err(err.into()));
-                    break;
-                }
-                match ask {
-                    Some(ask) => {
-                        pending.insert(ask, reply);
-                    }
-                    None => {
-                        let _ = reply.send(Ok(AmpBox::new()));
+                    };
+                    let Ok(amp_box) = refusal.into_box() else {
+                        continue;
+                    };
+                    if refusals.send(amp_box).await.is_err() {
+                        break;
                     }
                 }
+                // The peer sent a box that is not a message.
+                Err(_) => break,
             }
-            incoming = stream.next() => {
-                let Some(Ok(amp_box)) = incoming else {
-                    // The peer closed the connection or sent something that
-                    // is not a box.
-                    break;
-                };
-                match Message::from_box(amp_box) {
-                    Ok(Message::Answer(answer)) => {
-                        if let Some(reply) = pending.remove(&answer.answer) {
-                            let _ = reply.send(Ok(answer.results));
-                        }
-                    }
-                    Ok(Message::Error(error)) => {
-                        if let Some(reply) = pending.remove(&error.error) {
-                            let _ = reply.send(Err(Error::new(
-                                String::from_utf8_lossy(&error.code),
-                                String::from_utf8_lossy(&error.description),
-                            )));
-                        }
-                    }
-                    Ok(Message::Request(request)) => {
-                        let Some(refusal) = request.error(
-                            ErrorResponse::UNHANDLED,
-                            "this client does not handle commands",
-                        ) else {
+        }
+        // The peer closed the connection or sent something that is not a box.
+    };
+    let write = async {
+        loop {
+            tokio::select! {
+                next = outgoing.recv() => {
+                    let Some(Outgoing { request, reply }) = next else {
+                        // Every clone of the client is gone.
+                        break;
+                    };
+                    let ask = request.ask.clone();
+                    let amp_box = match request.into_box() {
+                        Ok(amp_box) => amp_box,
+                        Err(err) => {
+                            let _ = reply.send(Err(err.into()));
                             continue;
-                        };
-                        let Ok(amp_box) = refusal.into_box() else {
-                            continue;
-                        };
-                        if sink.send(amp_box).await.is_err() {
-                            break;
+                        }
+                    };
+                    match ask {
+                        Some(ask) => {
+                            lock(&pending).insert(ask.clone(), reply);
+                            if let Err(err) = sink.send(amp_box).await {
+                                if let Some(reply) = lock(&pending).remove(&ask) {
+                                    let _ = reply.send(Err(err.into()));
+                                }
+                                break;
+                            }
+                        }
+                        None => {
+                            if let Err(err) = sink.send(amp_box).await {
+                                let _ = reply.send(Err(err.into()));
+                                break;
+                            }
+                            let _ = reply.send(Ok(AmpBox::new()));
                         }
                     }
-                    Err(_) => break,
+                }
+                Some(refusal) = refused.recv() => {
+                    if sink.send(refusal).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
+    };
+    tokio::select! {
+        () = read => {}
+        () = write => {}
     }
     // Dropping `pending` fails every call still waiting with
     // `Error::ConnectionClosed`.
+}
+
+/// Locks `pending`. A poisoned lock only means a task panicked while holding
+/// it, which nothing here can do, so the map is still sound to use.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

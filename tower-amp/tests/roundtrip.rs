@@ -126,6 +126,28 @@ impl Handle for Echo {
     }
 }
 
+/// `Sum` as a client that expects a key the server never sends.
+#[derive(Serialize)]
+#[command(name = "Sum", response = Misread)]
+struct MisreadSum {
+    a: i64,
+    b: i64,
+}
+
+#[derive(Deserialize, Debug)]
+struct Misread {
+    /// Never read, since the results never parse.
+    #[allow(dead_code)]
+    sum: i64,
+}
+
+/// Arguments with no AMP representation.
+#[derive(Serialize)]
+#[command(response = Total)]
+struct NestedSum {
+    inner: Total,
+}
+
 /// A command nothing handles.
 #[derive(Serialize, Deserialize)]
 #[command(response = Total)]
@@ -241,7 +263,9 @@ async fn bad_arguments_are_unknown_errors() {
     assert!(matches!(
         failed,
         Err(Error::Command { code, description })
-            if code == "UNKNOWN" && description.contains("missing field")
+            if code == "UNKNOWN"
+                && description.starts_with("could not deserialize: ")
+                && description.contains("missing field")
     ));
 }
 
@@ -584,4 +608,36 @@ async fn an_abandoned_request_is_not_written() {
     }
     assert_eq!(written.len(), 1, "{written:?}");
     assert_eq!(written[0].get("payload"), Some(&b"first"[..]));
+}
+
+#[tokio::test]
+async fn results_that_do_not_match_fail_the_client_with_deserialize() {
+    let client = connect(router());
+    let failed = client.call(&MisreadSum { a: 1, b: 2 }).await;
+    assert!(matches!(failed, Err(Error::Deserialize(_))), "{failed:?}");
+    let err = failed.unwrap_err();
+    assert!(std::error::Error::source(&err).is_some());
+    assert!(
+        err.to_string().starts_with("could not deserialize: "),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn arguments_that_cannot_become_a_box_fail_the_client_with_serialize() {
+    // No peer at all: the failure is local and nothing is sent.
+    let (client_io, _peer) = tokio::io::duplex(64);
+    let client = Client::new(client_io);
+    let failed = client
+        .call(&NestedSum {
+            inner: Total { total: 1 },
+        })
+        .await;
+    assert!(matches!(failed, Err(Error::Serialize(_))), "{failed:?}");
+    let failed = client
+        .notify(&NestedSum {
+            inner: Total { total: 1 },
+        })
+        .await;
+    assert!(matches!(failed, Err(Error::Serialize(_))), "{failed:?}");
 }

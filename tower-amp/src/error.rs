@@ -24,8 +24,16 @@ pub enum Error {
     /// A box broke the protocol, or a peer sent a box that is neither a
     /// request nor a response.
     Protocol(amp_protocol::Error),
-    /// Arguments or results could not be converted to or from a box.
-    Serde(serde_amp::Error),
+    /// Arguments or results of this side's own type could not be turned
+    /// into a box to send. The type is at fault, not the peer: a nested
+    /// struct, for example, has no AMP representation.
+    Serialize(serde_amp::Error),
+    /// A box from the peer did not match the type it was read as: on a
+    /// server, the arguments of a command; on a client, the results of a
+    /// call. The two sides disagree about the command's schema, or the peer
+    /// sent something malformed. A server answers the peer with this as an
+    /// `UNKNOWN` error.
+    Deserialize(serde_amp::Error),
     /// The connection closed before the command was answered, or before it
     /// could be sent.
     ConnectionClosed {
@@ -86,7 +94,8 @@ impl fmt::Display for Error {
             Error::Command { code, description } => write!(f, "{code}: {description}"),
             Error::Io(err) => write!(f, "connection failed: {err}"),
             Error::Protocol(err) => write!(f, "protocol error: {err}"),
-            Error::Serde(err) => write!(f, "conversion failed: {err}"),
+            Error::Serialize(err) => write!(f, "could not serialize: {err}"),
+            Error::Deserialize(err) => write!(f, "could not deserialize: {err}"),
             Error::ConnectionClosed { cause: Some(cause) } => {
                 write!(f, "connection closed: {cause}")
             }
@@ -101,7 +110,8 @@ impl std::error::Error for Error {
         match self {
             Error::Io(err) => Some(err),
             Error::Protocol(err) => Some(err),
-            Error::Serde(err) => Some(err),
+            Error::Serialize(err) => Some(err),
+            Error::Deserialize(err) => Some(err),
             Error::ConnectionClosed { cause: Some(cause) } => Some(cause.as_ref()),
             _ => None,
         }
@@ -120,12 +130,6 @@ impl From<amp_protocol::Error> for Error {
             amp_protocol::Error::Io(err) => Error::Io(err),
             other => Error::Protocol(other),
         }
-    }
-}
-
-impl From<serde_amp::Error> for Error {
-    fn from(err: serde_amp::Error) -> Self {
-        Error::Serde(err)
     }
 }
 

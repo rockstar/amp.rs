@@ -69,9 +69,9 @@ where
             match serde_amp::from_box::<C>(&arguments) {
                 Ok(command) => Box::pin(async move {
                     let response = HandleWith::handle(command, state).await?;
-                    serde_amp::to_box(&response).map_err(Error::Serde)
+                    serde_amp::to_box(&response).map_err(Error::Serialize)
                 }),
-                Err(err) => Box::pin(ready(Err(err.into()))),
+                Err(err) => Box::pin(ready(Err(Error::Deserialize(err)))),
             }
         };
         // The table is only shared once the router has been cloned, so this

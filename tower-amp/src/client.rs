@@ -140,7 +140,8 @@ impl Client {
     /// results.
     ///
     /// An error response from the peer comes back as [`Error::Command`] with
-    /// the peer's code and description.
+    /// the peer's code and description. Results that do not match
+    /// `C::Response` fail with [`Error::Deserialize`].
     pub async fn call<C>(&self, arguments: &C) -> Result<C::Response, Error>
     where
         C: Command + Serialize,
@@ -148,9 +149,10 @@ impl Client {
     {
         // Any `_ask` marks the request as wanting a reply; `send` assigns the
         // real one.
-        let request = Request::new(C::NAME, serde_amp::to_box(arguments)?).with_ask(Vec::new());
+        let arguments = serde_amp::to_box(arguments).map_err(Error::Serialize)?;
+        let request = Request::new(C::NAME, arguments).with_ask(Vec::new());
         let results = self.send(request).await?;
-        Ok(serde_amp::from_box(&results)?)
+        serde_amp::from_box(&results).map_err(Error::Deserialize)
     }
 
     /// Sends the command that `arguments` belongs to without asking for a
@@ -159,7 +161,8 @@ impl Client {
     where
         C: Command + Serialize,
     {
-        let request = Request::new(C::NAME, serde_amp::to_box(arguments)?);
+        let arguments = serde_amp::to_box(arguments).map_err(Error::Serialize)?;
+        let request = Request::new(C::NAME, arguments);
         self.send(request).await.map(drop)
     }
 

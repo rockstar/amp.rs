@@ -122,6 +122,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer) = listener.accept().await?;
+        // As `serve` does, so that replies written back to back are not
+        // each held for the acknowledgement of the one before.
+        let _ = stream.set_nodelay(true);
         let service = service.clone();
         tokio::spawn(async move {
             if let Err(err) = tower_amp::serve_connection(stream, service).await {

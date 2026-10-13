@@ -37,10 +37,13 @@ struct Quotient {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = TcpStream::connect("127.0.0.1:1234").await?;
+    // Without this, a request made while the one before it is
+    // unacknowledged waits for that acknowledgement (Nagle's algorithm).
+    stream.set_nodelay(true)?;
     // A call that is not answered within five seconds fails with
     // `Error::Timeout` instead of waiting on the server forever.
-    let client = Client::new(TcpStream::connect("127.0.0.1:1234").await?)
-        .with_timeout(Duration::from_secs(5));
+    let client = Client::new(stream).with_timeout(Duration::from_secs(5));
 
     let total = client.call(&Sum { a: 13, b: 81 }).await?;
     println!("13 + 81 = {}", total.total);

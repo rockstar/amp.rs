@@ -43,6 +43,10 @@ const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 /// discarded, and calling [`serve_connection`] from your own accept loop is
 /// the way to observe the latter.
 ///
+/// `TCP_NODELAY` is set on every connection accepted, so that the replies
+/// to pipelined calls go out as they are ready rather than each waiting on
+/// the acknowledgement of the one before it.
+///
 /// Each connection uses a default [`AmpCodec`], which refuses a box longer
 /// than 16 MiB; [`serve_with_codec`] takes another. [`serve_with_shutdown`]
 /// is the same server with a way to stop it.
@@ -138,6 +142,13 @@ where
         };
         match accepted {
             Ok((stream, _)) => {
+                // Replies are small and written one at a time, and a peer
+                // that pipelines calls gets several back to back. With
+                // Nagle's algorithm on, each would wait for the ACK of the
+                // one before it, up to the peer's delayed-ACK timer. This
+                // only fails on a socket already dead, which the connection
+                // task finds out for itself.
+                let _ = stream.set_nodelay(true);
                 let service = service.clone();
                 let shutdown = shutdown.clone();
                 connections.spawn(async move {
@@ -222,6 +233,11 @@ fn out_of_descriptors(err: &io::Error) -> bool {
 /// error or the panic's message; without it, a failure the peer did not ask
 /// to hear about is discarded. Answers and errors the peer sends, which would
 /// belong to commands this side had called, are ignored.
+///
+/// `io` need not be a socket, so nothing is done to its options. An accept
+/// loop of your own should set `TCP_NODELAY` on each `TcpStream`, as
+/// [`serve`] does, so that replies written back to back are not each held
+/// for the peer's acknowledgement of the one before.
 ///
 /// Returns once the peer closes the connection and every request already
 /// received has been answered, or with the error that ended the connection.

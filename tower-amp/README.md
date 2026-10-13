@@ -126,6 +126,10 @@ A client is cheap to clone and every clone shares the connection, with any
 number of calls in flight at once. `notify` sends a command without asking
 for a reply.
 
+Set `TCP_NODELAY` on a `TcpStream` before handing it to `Client::new`, so
+that a request does not wait for the acknowledgement of the one before it.
+`serve` sets it on the connections it accepts.
+
 A call waits until it is answered or the connection ends. `with_timeout`
 puts a limit on that, after which the call fails with `Error::Timeout`:
 
@@ -243,7 +247,8 @@ tower-amp = { version = "0.2", features = ["tracing"] }
 Not yet supported: commands the server initiates on a client, and TLS. A
 connection error inside `serve` ends that connection and is only logged;
 write the accept loop yourself with `serve_connection` to handle it, at the
-cost of `serve_with_shutdown`, which has no connection-level counterpart. `serve` itself survives a peer that hangs up before it is
+cost of `serve_with_shutdown`, which has no connection-level counterpart,
+and set `TCP_NODELAY` on each stream yourself. `serve` itself survives a peer that hangs up before it is
 accepted and a process briefly out of file descriptors, and returns only on
 an error that means the listener is no good.
 

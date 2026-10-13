@@ -92,6 +92,13 @@ macro_rules! constructors {
             /// wasm32-unknown-unknown on the host's event loop through
             /// `wasm-bindgen-futures`.
             ///
+            /// Set `TCP_NODELAY` on a `TcpStream` before passing it, with
+            /// `stream.set_nodelay(true)`. Each request is written as it is
+            /// made, and with Nagle's algorithm on, a request made while
+            /// the one before it is unacknowledged waits for that
+            /// acknowledgement, up to the server's delayed-ACK timer. The
+            /// server sets it on the connections it accepts.
+            ///
             /// The connection uses a default [`AmpCodec`], which refuses a
             /// box longer than 16 MiB and closes the connection;
             /// [`with_codec`](Client::with_codec) takes another.

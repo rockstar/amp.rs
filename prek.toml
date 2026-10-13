@@ -1,5 +1,9 @@
 # Install the git hook once per clone with `prek install`.
 # Every hook runs across the whole workspace, not just the staged crate.
+default_install_hook_types = ["pre-commit", "commit-msg"]
+# Hooks without an explicit `stages` only run at pre-commit, not again at commit-msg.
+default_stages = ["pre-commit"]
+
 [[repos]]
 repo = "local"
 
@@ -42,3 +46,12 @@ language = "system"
 entry = "cargo semver-checks --workspace"
 types_or = ["rust", "toml"]
 pass_filenames = false
+
+# Runs at the commit-msg stage, after the message is written. Rejects anything
+# that is not a conventional commit: type(scope)?!?: subject
+[[repos.hooks]]
+id = "conventional-commit"
+name = "conventional commit message"
+language = "system"
+entry = "sh -c 'grep -Eq \"^(feat|fix|docs|refactor|perf|test|build|ci|chore|revert)(\\([a-z0-9_-]+\\))?!?: .+\" \"$1\" || { echo \"commit message must be a conventional commit (type(scope)?: subject)\"; exit 1; }' --"
+stages = ["commit-msg"]

@@ -138,6 +138,20 @@ it is answered, from your own `tokio::time::timeout` or `select!`, is safe
 in the same way: the call is forgotten, and if its request had not been
 written yet it is not sent.
 
+In the browser
+--
+
+The client builds for `wasm32-unknown-unknown`, for a page that calls
+commands on a server over a WebSocket, through a `wasm-bindgen` bridge or
+any other framework that runs futures in a browser. `Client::new` takes
+anything that implements tokio's `AsyncRead` and `AsyncWrite`, which several
+WebSocket crates for the browser provide, and the connection is driven on
+the page's event loop. `with_timeout` works, on the browser's timer.
+
+The I/O type need not be `Send` there, since the browser has one thread, and
+the client's futures are not `Send` either. The server is not available, as
+a browser cannot listen for connections.
+
 Examples
 --
 

@@ -31,6 +31,16 @@ entry = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 types_or = ["rust", "toml"]
 pass_filenames = false
 
+# Library targets only: the examples and tests need TCP and a tokio runtime.
+# Needs `rustup target add wasm32-unknown-unknown`.
+[[repos.hooks]]
+id = "cargo-clippy-wasm"
+name = "cargo clippy (wasm32-unknown-unknown)"
+language = "system"
+entry = "cargo clippy --workspace --all-features --target wasm32-unknown-unknown -- -D warnings"
+types_or = ["rust", "toml"]
+pass_filenames = false
+
 [[repos.hooks]]
 id = "cargo-test"
 name = "cargo test"

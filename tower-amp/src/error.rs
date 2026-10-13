@@ -71,7 +71,8 @@ impl Error {
         )
     }
 
-    /// The code that goes on the wire.
+    /// The code that goes on the wire. Only a server answers with an error.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn code(&self) -> &str {
         match self {
             Error::Command { code, .. } => code,
@@ -79,7 +80,9 @@ impl Error {
         }
     }
 
-    /// The description that goes on the wire.
+    /// The description that goes on the wire. Only a server answers with an
+    /// error.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn description(&self) -> String {
         match self {
             Error::Command { description, .. } => description.clone(),

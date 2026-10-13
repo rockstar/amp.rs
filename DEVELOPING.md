@@ -14,13 +14,15 @@ repository root and cover every crate.
 Pre-commit hooks
 --
 
-Formatting, build, clippy, and semver checks run as git pre-commit hooks via
-[prek](https://prek.j178.dev), configured in [prek.toml](prek.toml).
-Install prek, then enable the hook once per clone:
+Formatting, build, clippy, test, semver, and WebAssembly checks run as git
+pre-commit hooks via [prek](https://prek.j178.dev), configured in
+[prek.toml](prek.toml). Install prek and the wasm target, then enable the
+hook once per clone:
 
 ```
 cargo install prek                        # or: brew install prek
 cargo install cargo-semver-checks --locked # or: cargo binstall cargo-semver-checks
+rustup target add wasm32-unknown-unknown
 prek install
 ```
 
@@ -70,6 +72,29 @@ Only library targets are checked, since dev-dependencies do not affect
 consumers and may need a newer toolchain. Raising the floor is a minor version
 bump for the crates that need it; the comment next to `rust-version` records
 what currently sets it, so update that when you move it.
+
+WebAssembly
+--
+
+`tower-amp`'s client builds for `wasm32-unknown-unknown`, the target a
+browser runs, so CI and the hooks check the library targets of the whole
+workspace there:
+
+```
+cargo clippy --workspace --all-features --target wasm32-unknown-unknown -- -D warnings
+```
+
+Only the library targets are checked, since the examples and tests need TCP
+and a tokio runtime. The server is compiled out on that target for the same
+reason, and `Cargo.toml` enables the tokio features that need a runtime only
+elsewhere; tokio fails to build for wasm32-unknown-unknown with any other
+feature, so a new tokio feature goes in the target-specific table unless it is
+one of `io-util`, `macros`, `rt`, `sync`, or `time`. Everything that differs
+by target in the client is a small `#[cfg]`'d helper (`spawn`, `timeout`, the
+`Send` bound on the I/O type, and the `Service` future type), so a change to
+the client should only ever need one of those to change. Nothing runs the
+tests in a browser, so a change to the connection's logic still gets its
+coverage from the native tests.
 
 Benchmarks
 --

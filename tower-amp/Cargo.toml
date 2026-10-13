@@ -23,10 +23,24 @@ amp-protocol = { path = "../amp-protocol", version = "0.1", features = ["tokio"]
 futures-util = { workspace = true, features = ["sink"] }
 serde = { workspace = true }
 serde_amp = { path = "../serde_amp", version = "0.3" }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+# Only the tokio features that build on wasm32-unknown-unknown go here; see
+# the target tables below.
+tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tower-amp-macros = { path = "../tower-amp-macros", version = "0.1" }
+
+# Everywhere but wasm32-unknown-unknown, a connection is driven by a task on
+# the tokio runtime and the server listens on TCP.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+
+# On wasm32-unknown-unknown there is no tokio runtime, so a connection is
+# driven on the host's event loop and a timeout is a host timer. Only the
+# client builds there.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }
+wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }

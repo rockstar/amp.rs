@@ -78,40 +78,59 @@ type Pending = HashMap<Vec<u8>, oneshot::Sender<Result<AmpBox, Error>>>;
 /// it has ended cleanly.
 type Cause = Mutex<Option<Arc<Error>>>;
 
-impl Client {
-    /// Starts a client over `io`, typically a connected `TcpStream`. The
-    /// connection is driven by a task spawned on the current runtime.
-    ///
-    /// The connection uses a default [`AmpCodec`], which refuses a box
-    /// longer than 16 MiB and closes the connection; [`with_codec`](Client::with_codec)
-    /// takes another.
-    pub fn new<T>(io: T) -> Client
-    where
-        T: AsyncRead + AsyncWrite + Send + 'static,
-    {
-        Self::with_codec(io, AmpCodec::new())
-    }
+/// The constructors, with the bound on the I/O type passed in: the task that
+/// drives the connection may move between threads on the tokio runtime, so
+/// `io` must be `Send` there, but on wasm32-unknown-unknown it runs on the
+/// host's single thread, and the I/O types available there are not `Send`.
+macro_rules! constructors {
+    ($($bound:tt)+) => {
+        impl Client {
+            /// Starts a client over `io`, typically a connected `TcpStream`,
+            /// or in WebAssembly anything that reads and writes a byte
+            /// stream, such as a WebSocket adapter. The connection is driven
+            /// by a task spawned on the current tokio runtime, or on
+            /// wasm32-unknown-unknown on the host's event loop through
+            /// `wasm-bindgen-futures`.
+            ///
+            /// The connection uses a default [`AmpCodec`], which refuses a
+            /// box longer than 16 MiB and closes the connection;
+            /// [`with_codec`](Client::with_codec) takes another.
+            pub fn new<T>(io: T) -> Client
+            where
+                T: $($bound)+,
+            {
+                Self::with_codec(io, AmpCodec::new())
+            }
 
-    /// [`new`](Client::new) with the codec the connection is framed by, for
-    /// setting the largest box the peer may send with
-    /// [`AmpCodec::with_max_frame_length`].
-    pub fn with_codec<T>(io: T, codec: AmpCodec) -> Client
-    where
-        T: AsyncRead + AsyncWrite + Send + 'static,
-    {
-        let (outgoing, incoming) = mpsc::channel(16);
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let cause = Arc::new(Mutex::new(None));
-        tokio::spawn(run(io, codec, incoming, pending.clone(), cause.clone()));
-        Client {
-            outgoing,
-            next_ask: Arc::new(AtomicU64::new(1)),
-            pending,
-            cause,
-            timeout: None,
+            /// [`new`](Client::new) with the codec the connection is framed
+            /// by, for setting the largest box the peer may send with
+            /// [`AmpCodec::with_max_frame_length`].
+            pub fn with_codec<T>(io: T, codec: AmpCodec) -> Client
+            where
+                T: $($bound)+,
+            {
+                let (outgoing, incoming) = mpsc::channel(16);
+                let pending = Arc::new(Mutex::new(HashMap::new()));
+                let cause = Arc::new(Mutex::new(None));
+                spawn(run(io, codec, incoming, pending.clone(), cause.clone()));
+                Client {
+                    outgoing,
+                    next_ask: Arc::new(AtomicU64::new(1)),
+                    pending,
+                    cause,
+                    timeout: None,
+                }
+            }
         }
-    }
+    };
+}
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+constructors!(AsyncRead + AsyncWrite + Send + 'static);
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+constructors!(AsyncRead + AsyncWrite + 'static);
+
+impl Client {
     /// Fails any call or notification that has not completed within `limit`
     /// with [`Error::Timeout`]. Without a limit, a call waits until it is
     /// answered or the connection ends.
@@ -172,7 +191,7 @@ impl Client {
     async fn send(&self, request: Request) -> Result<AmpBox, Error> {
         let exchange = self.exchange(request);
         match self.timeout {
-            Some(limit) => tokio::time::timeout(limit, exchange)
+            Some(limit) => timeout(limit, exchange)
                 .await
                 .unwrap_or(Err(Error::Timeout)),
             None => exchange.await,
@@ -248,7 +267,11 @@ impl Drop for Waiting<'_> {
 impl Service<Request> for Client {
     type Response = AmpBox;
     type Error = Error;
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     type Future = Pin<Box<dyn Future<Output = Result<AmpBox, Error>> + Send>>;
+    /// Not `Send`, since the host's timer that the timeout waits on is not.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    type Future = Pin<Box<dyn Future<Output = Result<AmpBox, Error>>>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Poll::Ready(Ok(()))
@@ -388,6 +411,41 @@ async fn run<T>(
     // waiting, and each finds `cause` already recorded. The client still
     // holds `pending`, so it has to be emptied rather than dropped.
     lock(&pending).clear();
+}
+
+/// Spawns the task that drives a connection on the current tokio runtime.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn spawn(task: impl Future<Output = ()> + Send + 'static) {
+    tokio::spawn(task);
+}
+
+/// Spawns the task that drives a connection on the host's event loop, since
+/// there is no tokio runtime to spawn it on in WebAssembly.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn spawn(task: impl Future<Output = ()> + 'static) {
+    wasm_bindgen_futures::spawn_local(task);
+}
+
+/// Waits for `future` for at most `limit`; `None` if the limit was reached
+/// first.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn timeout<F: Future>(limit: Duration, future: F) -> Option<F::Output> {
+    tokio::time::timeout(limit, future).await.ok()
+}
+
+/// Waits for `future` for at most `limit`; `None` if the limit was reached
+/// first. The timer is the host's, since tokio's needs a runtime and the
+/// clock behind it is not available in WebAssembly.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+async fn timeout<F: Future>(limit: Duration, future: F) -> Option<F::Output> {
+    use futures_util::future::{Either, select};
+    use gloo_timers::future::TimeoutFuture;
+
+    let millis = u32::try_from(limit.as_millis()).unwrap_or(u32::MAX);
+    match select(std::pin::pin!(future), TimeoutFuture::new(millis)).await {
+        Either::Left((output, _)) => Some(output),
+        Either::Right(((), _)) => None,
+    }
 }
 
 /// Locks `mutex`. A poisoned lock only means a task panicked while holding

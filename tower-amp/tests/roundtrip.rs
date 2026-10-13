@@ -134,6 +134,28 @@ struct Nope {}
 #[command(name = "Sum", response = Total)]
 struct BadSum {}
 
+/// Fails with an error code longer than a box value may be.
+#[derive(Serialize, Deserialize)]
+#[command]
+struct LongCode {}
+
+impl Handle for LongCode {
+    async fn handle(self) -> Result<(), Error> {
+        Err(Error::new("X".repeat(70_000), "too long to send"))
+    }
+}
+
+/// Fails with an error description longer than a box value may be.
+#[derive(Serialize, Deserialize)]
+#[command]
+struct LongDescription {}
+
+impl Handle for LongDescription {
+    async fn handle(self) -> Result<(), Error> {
+        Err(Error::new("LONG", "y".repeat(70_000)))
+    }
+}
+
 fn router() -> Router {
     Router::new()
         .command::<Sum>()
@@ -307,4 +329,38 @@ async fn pipelined_large_calls_do_not_deadlock() {
     tokio::time::timeout(Duration::from_secs(5), all)
         .await
         .expect("deadlocked: neither side is reading while blocked on write");
+}
+
+/// An error code too long for the wire must still be answered, cut down to
+/// what fits, rather than panicking the task that would have answered it.
+#[tokio::test]
+async fn over_long_error_code_still_gets_an_answer() {
+    let client = connect(Router::new().command::<LongCode>().command::<Sum>());
+    let failed = tokio::time::timeout(Duration::from_secs(2), client.call(&LongCode {}))
+        .await
+        .expect("no answer: the respond task panicked");
+    assert!(matches!(
+        failed,
+        Err(Error::Command { code, description })
+            if code.len() == 65_535
+                && code.bytes().all(|b| b == b'X')
+                && description == "too long to send"
+    ));
+    // The connection must survive.
+    let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
+    assert_eq!(total.total, 3);
+}
+
+/// An over-long description keeps as much as fits instead of being dropped.
+#[tokio::test]
+async fn over_long_error_description_is_truncated() {
+    let client = connect(Router::new().command::<LongDescription>());
+    let failed = client.call(&LongDescription {}).await;
+    assert!(matches!(
+        failed,
+        Err(Error::Command { code, description })
+            if code == "LONG"
+                && description.len() == 65_535
+                && description.bytes().all(|b| b == b'y')
+    ));
 }

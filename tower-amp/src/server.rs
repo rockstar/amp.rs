@@ -106,11 +106,70 @@ where
     let _ = responses.send(response).await;
 }
 
-/// Builds the error box for `ask`. Falls back to an empty description if the
-/// error's description is too long for the wire.
+/// Builds the error box for `ask`. A code or description longer than a box
+/// value may be is cut down to fit, since the handler's error must be
+/// answered somehow and the alternative is a request the peer waits on
+/// forever.
 fn error_response(ask: Vec<u8>, err: &Error) -> AmpBox {
-    ErrorResponse::new(ask.clone(), err.code(), err.description())
+    let description = err.description();
+    ErrorResponse::new(ask, fit(err.code()), fit(&description))
         .into_box()
-        .or_else(|_| ErrorResponse::new(ask, err.code(), "").into_box())
-        .expect("an ask that came off the wire fits back on it")
+        .expect("the ask came off the wire and the other fields were cut to fit")
+}
+
+/// The longest value a box may carry, as `amp_protocol` enforces it. The
+/// crate does not export the limit; `limit_matches_amp_protocol` below pins
+/// this copy to it.
+const MAX_VALUE_LENGTH: usize = 0xFFFF;
+
+/// Truncates `s` to the longest prefix that fits a box value without
+/// splitting a character.
+fn fit(s: &str) -> &str {
+    if s.len() <= MAX_VALUE_LENGTH {
+        return s;
+    }
+    let mut end = MAX_VALUE_LENGTH;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn limit_matches_amp_protocol() {
+        let mut amp_box = AmpBox::new();
+        amp_box.insert("k", vec![0; MAX_VALUE_LENGTH]).unwrap();
+        assert!(amp_box.insert("k", vec![0; MAX_VALUE_LENGTH + 1]).is_err());
+    }
+
+    #[test]
+    fn fit_keeps_what_fits() {
+        let short = "x".repeat(MAX_VALUE_LENGTH);
+        assert_eq!(fit(&short).len(), MAX_VALUE_LENGTH);
+        let long = "x".repeat(MAX_VALUE_LENGTH + 1);
+        assert_eq!(fit(&long).len(), MAX_VALUE_LENGTH);
+    }
+
+    #[test]
+    fn fit_does_not_split_a_character() {
+        // Two-byte characters, so the limit falls in the middle of one.
+        let long = "é".repeat(MAX_VALUE_LENGTH);
+        let fitted = fit(&long);
+        assert_eq!(fitted.len(), MAX_VALUE_LENGTH - 1);
+        assert!(fitted.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn over_long_fields_still_make_a_box() {
+        let err = Error::new("X".repeat(70_000), "y".repeat(70_000));
+        let amp_box = error_response(b"1".to_vec(), &err);
+        let response = ErrorResponse::from_box(amp_box).unwrap();
+        assert_eq!(response.error, b"1");
+        assert_eq!(response.code.len(), MAX_VALUE_LENGTH);
+        assert_eq!(response.description.len(), MAX_VALUE_LENGTH);
+    }
 }

@@ -21,7 +21,9 @@
 # pushed first, then each tag in its own push: GitHub creates no push events
 # at all when more than three tags arrive in one push, and without an event
 # the release workflow never runs. It publishes each tagged crate to
-# crates.io.
+# crates.io and creates a GitHub release whose notes come from
+# ./release-notes.sh; a dry run prints those notes so they can be read
+# before anything is pushed.
 #
 # Usage:
 #   ./release.sh            bump, tag and push
@@ -177,6 +179,14 @@ if $dry_run; then
     echo "  git push $remote $branch"
     for tag in "${release_tags[@]}"; do
         echo "  git push $remote $tag"
+    done
+    echo
+    echo "Release notes the workflow would post:"
+    for tag in "${release_tags[@]}"; do
+        echo
+        echo "## $tag"
+        echo
+        ./release-notes.sh "$tag" HEAD
     done
     exit 0
 fi

@@ -1,14 +1,22 @@
+use std::sync::Arc;
+
 use amp_protocol::codec::AmpCodec;
 use amp_protocol::{AmpBox, Answer, ErrorResponse, Message, Request};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinError;
 use tokio_util::codec::Framed;
 use tower::{Service, ServiceExt};
 
 use crate::Error;
+
+/// How many requests one connection may have in flight: received and not
+/// yet answered. Past this the connection stops reading until a reply has
+/// been queued, so a peer that sends requests without reading the replies
+/// is held to this much memory rather than as much as it cares to send.
+const MAX_IN_FLIGHT: usize = 256;
 
 /// Accepts connections on `listener` forever, serving each one with a clone
 /// of `service` on its own task.
@@ -54,8 +62,10 @@ where
 ///
 /// Every request is handed to a clone of `service` on its own task, so the
 /// requests on a connection run concurrently and are answered in whatever
-/// order they finish, as the protocol allows. A request without `_ask` gets
-/// no reply. A failed request is answered with the error's code and
+/// order they finish, as the protocol allows. At most 256 requests are in
+/// flight on a connection at once; past that it stops reading until one has
+/// been answered, which a peer sees as ordinary backpressure on its writes.
+/// A request without `_ask` gets no reply. A failed request is answered with the error's code and
 /// description, or with `UNKNOWN` for an error that has no code. A request
 /// whose handler panics is answered with `UNKNOWN` and the panic's message,
 /// and the connection carries on. Answers and errors the peer sends, which
@@ -93,6 +103,7 @@ where
 {
     let (mut sink, mut stream) = Framed::new(io, codec).split();
     let (responses, mut pending) = mpsc::channel::<AmpBox>(16);
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
 
     // Reading and writing are separate futures so that a write the peer is
     // slow to accept never stops this side from reading. If both sides
@@ -102,7 +113,15 @@ where
         while let Some(incoming) = stream.next().await {
             match Message::from_box(incoming?)? {
                 Message::Request(request) => {
-                    tokio::spawn(respond(service.clone(), request, responses.clone()));
+                    // Waiting here, rather than spawning without bound, is
+                    // what holds the peer to `MAX_IN_FLIGHT`. Replies are
+                    // written by `write` below, which does not depend on
+                    // this loop, so waiting cannot deadlock.
+                    let permit = Arc::clone(&in_flight)
+                        .acquire_owned()
+                        .await
+                        .expect("the semaphore is never closed");
+                    tokio::spawn(respond(service.clone(), request, responses.clone(), permit));
                 }
                 Message::Answer(_) | Message::Error(_) => {}
             }
@@ -123,9 +142,15 @@ where
 }
 
 /// Runs one request through the service and queues its response, if the
-/// request wants one.
-async fn respond<S>(mut service: S, request: Request, responses: mpsc::Sender<AmpBox>)
-where
+/// request wants one. The permit is the request's share of the connection's
+/// in-flight limit, released when this returns: once the response is queued,
+/// or at once for a request that wants none.
+async fn respond<S>(
+    mut service: S,
+    request: Request,
+    responses: mpsc::Sender<AmpBox>,
+    _permit: OwnedSemaphorePermit,
+) where
     S: Service<Request, Response = AmpBox> + Send + 'static,
     S::Error: Into<Error>,
     S::Future: Send,

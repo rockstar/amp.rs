@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use amp_protocol::{AmpBox, Request};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tower::{Service, ServiceBuilder};
@@ -107,6 +107,18 @@ impl HandleWith<Counter> for Read {
         Ok(Count {
             count: counter.0.load(Ordering::SeqCst),
         })
+    }
+}
+
+/// Counts itself in and never answers.
+#[derive(Serialize, Deserialize)]
+#[command]
+struct Hang {}
+
+impl HandleWith<Counter> for Hang {
+    async fn handle(self, counter: Counter) -> Result<(), Error> {
+        counter.0.fetch_add(1, Ordering::SeqCst);
+        std::future::pending().await
     }
 }
 
@@ -393,6 +405,35 @@ async fn pipelined_large_calls_do_not_deadlock() {
     tokio::time::timeout(Duration::from_secs(5), all)
         .await
         .expect("deadlocked: neither side is reading while blocked on write");
+}
+
+/// A peer that sends requests faster than they are answered must not make
+/// the server take on every request it sends. Each `Hang` handler counts
+/// itself in and never finishes, so its request stays in flight for good and
+/// the count is exactly how many requests the server took on.
+#[tokio::test]
+async fn a_flooding_peer_is_held_to_the_in_flight_limit() {
+    let counter = Counter::default();
+    let router = Router::with_state(counter.clone()).command::<Hang>();
+    let (peer, server_io) = tokio::io::duplex(4096);
+    tokio::spawn(tower_amp::serve_connection(server_io, router));
+    // The peer writes far more than the limit and never reads. Its writes
+    // block once the server stops reading, so it runs on its own task and
+    // keeps the pipe open by never finishing.
+    tokio::spawn(async move {
+        let mut peer = tokio_util::codec::Framed::new(peer, AmpCodec::new());
+        for i in 0..2_000u32 {
+            let request = Request::new("Hang", AmpBox::new()).with_ask(i.to_string());
+            peer.send(request.into_box().unwrap()).await.unwrap();
+        }
+        std::future::pending::<()>().await;
+    });
+
+    // Give the server far longer than it needs to take on everything it is
+    // going to, then check that it stopped at the limit.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let handled = counter.0.load(Ordering::SeqCst);
+    assert_eq!(handled, 256, "the server took on {handled} requests");
 }
 
 /// An error code too long for the wire must still be answered, cut down to

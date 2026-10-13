@@ -185,7 +185,10 @@ How it fits together
   re-exported here, so only this crate needs to be a dependency.
 
 Requests on one connection are handled concurrently, each on its own task,
-and answered in the order they finish, as the protocol allows.
+and answered in the order they finish, as the protocol allows. At most 256
+requests are in flight on a connection at once; past that the connection
+stops reading until one has been answered, so a peer that sends without
+reading its replies is held to a bounded amount of memory.
 
 A box is read in full before it is handled, so a connection refuses one
 longer than 16 MiB and closes rather than buffering without bound. Pass an

@@ -309,6 +309,22 @@ async fn client_is_a_service() {
 }
 
 #[tokio::test]
+async fn the_client_assigns_every_ask() {
+    let client = connect(router());
+    // A fresh client gives its first typed call the ask "1". A request sent
+    // through the service with that same ask must not evict it.
+    let slow = client.call(&Sleep { millis: 50 });
+    let mut arguments = AmpBox::new();
+    arguments.insert("a", "1").unwrap();
+    arguments.insert("b", "2").unwrap();
+    let request = Request::new("Sum", arguments).with_ask("1");
+    let fast = Service::call(&mut client.clone(), request);
+    let (slow, fast) = tokio::join!(slow, fast);
+    slow.unwrap();
+    assert_eq!(fast.unwrap().get("total"), Some(&b"3"[..]));
+}
+
+#[tokio::test]
 async fn a_closed_connection_fails_calls() {
     let (client_io, server_io) = tokio::io::duplex(64);
     drop(server_io);

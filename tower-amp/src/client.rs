@@ -27,7 +27,8 @@ use crate::{Command, Error};
 /// A client is also a tower [`Service`] from a [`Request`] to the results
 /// box, which is the untyped form of [`call`](Client::call): a request with
 /// `_ask` waits for its answer, and one without is sent and resolves at once
-/// with an empty box.
+/// with an empty box. The client assigns every `_ask` itself; see the
+/// [`Service`] impl.
 ///
 /// Requests the peer sends to this client are refused with the `UNHANDLED`
 /// error code.
@@ -97,8 +98,9 @@ impl Client {
         C: Command + Serialize,
         C::Response: DeserializeOwned,
     {
-        let ask = self.next_ask.fetch_add(1, Ordering::Relaxed).to_string();
-        let request = Request::new(C::NAME, serde_amp::to_box(arguments)?).with_ask(ask);
+        // Any `_ask` marks the request as wanting a reply; `send` assigns the
+        // real one.
+        let request = Request::new(C::NAME, serde_amp::to_box(arguments)?).with_ask(Vec::new());
         let results = self.send(request).await?;
         Ok(serde_amp::from_box(&results)?)
     }
@@ -113,7 +115,20 @@ impl Client {
         self.send(request).await.map(drop)
     }
 
-    async fn send(&self, request: Request) -> Result<AmpBox, Error> {
+    /// Sends `request`, assigning its `_ask` if it has one, and waits for the
+    /// answer, or for the request to be written if it has none.
+    async fn send(&self, mut request: Request) -> Result<AmpBox, Error> {
+        // The ask only has to be unique on this connection, and the counter
+        // is the one place that can guarantee that, so whatever the caller
+        // set is replaced. Only its presence matters.
+        if request.ask.is_some() {
+            request.ask = Some(
+                self.next_ask
+                    .fetch_add(1, Ordering::Relaxed)
+                    .to_string()
+                    .into(),
+            );
+        }
         let (reply, response) = oneshot::channel();
         // Either channel is gone only once the connection has ended, and
         // `run` records why before it drops either of them.
@@ -134,6 +149,14 @@ impl Client {
     }
 }
 
+/// The untyped form of [`Client::call`] and [`Client::notify`].
+///
+/// A request with an `_ask` waits for its answer; one without is sent and
+/// resolves at once with an empty box. The value of the `_ask` is ignored:
+/// the client replaces it with one of its own, since an `_ask` only has to
+/// be unique on this connection and only the client can guarantee that. A
+/// request forwarded from another connection can therefore keep the `_ask`
+/// it arrived with.
 impl Service<Request> for Client {
     type Response = AmpBox;
     type Error = Error;

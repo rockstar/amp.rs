@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use amp_protocol::ErrorResponse;
 
@@ -25,8 +26,15 @@ pub enum Error {
     Protocol(amp_protocol::Error),
     /// Arguments or results could not be converted to or from a box.
     Serde(serde_amp::Error),
-    /// The connection closed before the command was answered.
-    ConnectionClosed,
+    /// The connection closed before the command was answered, or before it
+    /// could be sent.
+    ConnectionClosed {
+        /// What ended the connection: the I/O error, or the box from the
+        /// peer that broke the protocol. `None` when the peer closed the
+        /// connection cleanly. Shared, since one failure fails every call
+        /// that was waiting on the connection.
+        cause: Option<Arc<Error>>,
+    },
 }
 
 impl Error {
@@ -36,6 +44,12 @@ impl Error {
             code: code.into(),
             description: description.into(),
         }
+    }
+
+    /// The error for a call on a connection that has ended because of
+    /// `cause`, or cleanly.
+    pub(crate) fn closed(cause: Option<Arc<Error>>) -> Self {
+        Error::ConnectionClosed { cause }
     }
 
     /// The error for a request naming a command the router does not know.
@@ -70,7 +84,10 @@ impl fmt::Display for Error {
             Error::Io(err) => write!(f, "connection failed: {err}"),
             Error::Protocol(err) => write!(f, "protocol error: {err}"),
             Error::Serde(err) => write!(f, "conversion failed: {err}"),
-            Error::ConnectionClosed => f.write_str("connection closed"),
+            Error::ConnectionClosed { cause: Some(cause) } => {
+                write!(f, "connection closed: {cause}")
+            }
+            Error::ConnectionClosed { cause: None } => f.write_str("connection closed"),
         }
     }
 }
@@ -81,6 +98,7 @@ impl std::error::Error for Error {
             Error::Io(err) => Some(err),
             Error::Protocol(err) => Some(err),
             Error::Serde(err) => Some(err),
+            Error::ConnectionClosed { cause: Some(cause) } => Some(cause.as_ref()),
             _ => None,
         }
     }

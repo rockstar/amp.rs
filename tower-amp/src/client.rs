@@ -31,10 +31,16 @@ use crate::{Command, Error};
 ///
 /// Requests the peer sends to this client are refused with the `UNHANDLED`
 /// error code.
+///
+/// Once the connection has ended, every call fails with
+/// [`Error::ConnectionClosed`], which carries what ended it: an I/O error,
+/// or a box from the peer that broke the protocol. A connection the peer
+/// closed cleanly has no cause.
 #[derive(Clone)]
 pub struct Client {
     outgoing: mpsc::Sender<Outgoing>,
     next_ask: Arc<AtomicU64>,
+    cause: Arc<Cause>,
 }
 
 struct Outgoing {
@@ -44,6 +50,11 @@ struct Outgoing {
 
 /// Calls waiting for a reply, keyed by ask.
 type Pending = HashMap<Vec<u8>, oneshot::Sender<Result<AmpBox, Error>>>;
+
+/// What ended the connection, recorded by [`run`] before it lets go of
+/// anything that fails a call. `None` while the connection is up, and once
+/// it has ended cleanly.
+type Cause = Mutex<Option<Arc<Error>>>;
 
 impl Client {
     /// Starts a client over `io`, typically a connected `TcpStream`. The
@@ -67,10 +78,12 @@ impl Client {
         T: AsyncRead + AsyncWrite + Send + 'static,
     {
         let (outgoing, incoming) = mpsc::channel(16);
-        tokio::spawn(run(io, codec, incoming));
+        let cause = Arc::new(Mutex::new(None));
+        tokio::spawn(run(io, codec, incoming, cause.clone()));
         Client {
             outgoing,
             next_ask: Arc::new(AtomicU64::new(1)),
+            cause,
         }
     }
 
@@ -102,11 +115,22 @@ impl Client {
 
     async fn send(&self, request: Request) -> Result<AmpBox, Error> {
         let (reply, response) = oneshot::channel();
-        self.outgoing
+        // Either channel is gone only once the connection has ended, and
+        // `run` records why before it drops either of them.
+        if self
+            .outgoing
             .send(Outgoing { request, reply })
             .await
-            .map_err(|_| Error::ConnectionClosed)?;
-        response.await.map_err(|_| Error::ConnectionClosed)?
+            .is_err()
+        {
+            return Err(self.closed());
+        }
+        response.await.unwrap_or_else(|_| Err(self.closed()))
+    }
+
+    /// The error for a call the connection ended on.
+    fn closed(&self) -> Error {
+        Error::closed(lock(&self.cause).clone())
     }
 }
 
@@ -134,7 +158,13 @@ impl Service<Request> for Client {
 /// buffer. The connection ends when either future does: the peer closed it
 /// or broke the protocol, a write failed, or every clone of the client is
 /// gone.
-async fn run<T>(io: T, codec: AmpCodec, mut outgoing: mpsc::Receiver<Outgoing>)
+///
+/// A call learns that the connection ended when the sender of its reply is
+/// dropped, and then reads `cause` for why, so every failure here is
+/// recorded in `cause` before the future it happened in returns. Everything
+/// holding a reply sender, `pending`, the other future, and the queue behind
+/// `outgoing`, is dropped later than that.
+async fn run<T>(io: T, codec: AmpCodec, mut outgoing: mpsc::Receiver<Outgoing>, cause: Arc<Cause>)
 where
     T: AsyncRead + AsyncWrite,
 {
@@ -146,9 +176,18 @@ where
     // than the `tokio::sync` version, ensures we can't mess that up.
     let pending: Mutex<Pending> = Mutex::new(HashMap::new());
     let (refusals, mut refused) = mpsc::channel::<AmpBox>(16);
+    let end = |err: Error| *lock(&cause) = Some(Arc::new(err));
 
     let read = async {
-        while let Some(Ok(amp_box)) = stream.next().await {
+        loop {
+            let amp_box = match stream.next().await {
+                Some(Ok(amp_box)) => amp_box,
+                // Reading failed, or the peer sent something that is not a
+                // box.
+                Some(Err(err)) => return end(err.into()),
+                // The peer closed the connection.
+                None => return,
+            };
             match Message::from_box(amp_box) {
                 Ok(Message::Answer(answer)) => {
                     if let Some(reply) = lock(&pending).remove(&answer.answer) {
@@ -174,14 +213,15 @@ where
                         continue;
                     };
                     if refusals.send(amp_box).await.is_err() {
-                        break;
+                        // The writer is gone, and recorded why.
+                        return;
                     }
                 }
-                // The peer sent a box that is not a message.
-                Err(_) => break,
+                // The peer sent a box that is neither a request nor a
+                // response.
+                Err(err) => return end(err.into()),
             }
         }
-        // The peer closed the connection or sent something that is not a box.
     };
     let write = async {
         loop {
@@ -189,7 +229,7 @@ where
                 next = outgoing.recv() => {
                     let Some(Outgoing { request, reply }) = next else {
                         // Every clone of the client is gone.
-                        break;
+                        return;
                     };
                     let ask = request.ask.clone();
                     let amp_box = match request.into_box() {
@@ -199,28 +239,25 @@ where
                             continue;
                         }
                     };
-                    match ask {
+                    // A call waits in `pending` for its answer; a
+                    // notification is answered as soon as it is written.
+                    let notification = match ask {
                         Some(ask) => {
-                            lock(&pending).insert(ask.clone(), reply);
-                            if let Err(err) = sink.send(amp_box).await {
-                                if let Some(reply) = lock(&pending).remove(&ask) {
-                                    let _ = reply.send(Err(err.into()));
-                                }
-                                break;
-                            }
+                            lock(&pending).insert(ask, reply);
+                            None
                         }
-                        None => {
-                            if let Err(err) = sink.send(amp_box).await {
-                                let _ = reply.send(Err(err.into()));
-                                break;
-                            }
-                            let _ = reply.send(Ok(AmpBox::new()));
-                        }
+                        None => Some(reply),
+                    };
+                    if let Err(err) = sink.send(amp_box).await {
+                        return end(err.into());
+                    }
+                    if let Some(reply) = notification {
+                        let _ = reply.send(Ok(AmpBox::new()));
                     }
                 }
                 Some(refusal) = refused.recv() => {
-                    if sink.send(refusal).await.is_err() {
-                        break;
+                    if let Err(err) = sink.send(refusal).await {
+                        return end(err.into());
                     }
                 }
             }
@@ -230,12 +267,12 @@ where
         () = read => {}
         () = write => {}
     }
-    // Dropping `pending` fails every call still waiting with
-    // `Error::ConnectionClosed`.
+    // Dropping `pending` and `outgoing` fails every call still waiting, and
+    // each finds `cause` already recorded.
 }
 
-/// Locks `pending`. A poisoned lock only means a task panicked while holding
-/// it, which nothing here can do, so the map is still sound to use.
+/// Locks `mutex`. A poisoned lock only means a task panicked while holding
+/// it, which nothing here can do, so the value is still sound to use.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()

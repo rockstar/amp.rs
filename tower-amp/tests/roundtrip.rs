@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use amp_protocol::{AmpBox, Request};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tower::{Service, ServiceBuilder};
 use tower_amp::{command, AmpCodec, Client, Error, Handle, HandleWith, Router};
 
@@ -187,6 +188,17 @@ where
     Client::new(client_io)
 }
 
+/// Whether `result` failed because the peer closed the connection: cleanly,
+/// or with an I/O error from writing to it after it closed, whichever the
+/// client noticed first.
+fn peer_closed<T>(result: &Result<T, Error>) -> bool {
+    matches!(
+        result,
+        Err(Error::ConnectionClosed { cause })
+            if cause.as_deref().is_none_or(|cause| matches!(cause, Error::Io(_)))
+    )
+}
+
 #[tokio::test]
 async fn calls_a_command() {
     let client = connect(router());
@@ -302,10 +314,7 @@ async fn a_closed_connection_fails_calls() {
     drop(server_io);
     let client = Client::new(client_io);
     let failed = client.call(&Sum { a: 1, b: 2 }).await;
-    assert!(matches!(
-        failed,
-        Err(Error::ConnectionClosed) | Err(Error::Io(_))
-    ));
+    assert!(peer_closed(&failed), "{failed:?}");
 }
 
 #[tokio::test]
@@ -419,10 +428,7 @@ async fn server_rejects_a_box_over_its_frame_limit() {
     let failed = tokio::time::timeout(Duration::from_secs(2), client.call(&Echo { payload }))
         .await
         .expect("the server buffered the oversized box instead of rejecting it");
-    assert!(matches!(
-        failed,
-        Err(Error::ConnectionClosed) | Err(Error::Io(_))
-    ));
+    assert!(peer_closed(&failed), "{failed:?}");
     assert!(matches!(
         server.await.unwrap(),
         Err(Error::Protocol(amp_protocol::Error::FrameTooLong {
@@ -443,8 +449,51 @@ async fn client_rejects_an_answer_over_its_frame_limit() {
     let failed = tokio::time::timeout(Duration::from_secs(2), client.call(&Echo { payload }))
         .await
         .expect("the client buffered the oversized answer instead of rejecting it");
-    assert!(matches!(
-        failed,
-        Err(Error::ConnectionClosed) | Err(Error::Io(_))
-    ));
+    assert!(
+        matches!(
+            &failed,
+            Err(Error::ConnectionClosed { cause: Some(cause) })
+                if matches!(
+                    **cause,
+                    Error::Protocol(amp_protocol::Error::FrameTooLong { limit: 1024 })
+                )
+        ),
+        "{failed:?}"
+    );
+}
+
+/// A peer that breaks the protocol ends the connection, and every call on
+/// it, whether waiting at the time or made afterwards, reports what the peer
+/// did rather than only that the connection closed.
+#[tokio::test]
+async fn a_malformed_box_fails_calls_with_the_cause() {
+    let (client_io, mut peer) = tokio::io::duplex(4096);
+    let client = Client::new(client_io);
+    // A key length of 256, longer than a key may be.
+    peer.write_all(b"\x01\x00").await.unwrap();
+
+    let failed = client.call(&Sum { a: 1, b: 2 }).await;
+    assert_key_too_long(&failed);
+    let later = client.call(&Sum { a: 3, b: 4 }).await;
+    assert_key_too_long(&later);
+    let err = later.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "connection closed: protocol error: key is 256 bytes, longer than the limit of 255"
+    );
+    assert!(std::error::Error::source(&err).is_some());
+}
+
+fn assert_key_too_long<T: std::fmt::Debug>(result: &Result<T, Error>) {
+    assert!(
+        matches!(
+            result,
+            Err(Error::ConnectionClosed { cause: Some(cause) })
+                if matches!(
+                    **cause,
+                    Error::Protocol(amp_protocol::Error::KeyTooLong { len: 256 })
+                )
+        ),
+        "{result:?}"
+    );
 }

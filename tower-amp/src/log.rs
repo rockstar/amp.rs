@@ -29,7 +29,7 @@ mod with_tracing {
         }
     }
 
-    /// A command whose handler panicked, or was cancelled, with `reason`.
+    /// A command whose handler panicked, with `reason`.
     pub(crate) fn command_panicked(command: &[u8], ask: Option<&[u8]>, reason: &str) {
         let command = String::from_utf8_lossy(command);
         let ask = self::ask(ask);

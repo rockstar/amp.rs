@@ -1,10 +1,12 @@
+use std::any::Any;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::pin;
 use std::sync::Arc;
 
 use amp_protocol::codec::AmpCodec;
 use amp_protocol::{AmpBox, Answer, ErrorResponse, Message, Request};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::Framed;
@@ -398,48 +400,40 @@ async fn respond<S>(
     let _ = responses.send(response).await;
 }
 
-/// Calls `service` with `request` on a task of its own, so that a handler
-/// that panics takes down only that task. The caller survives to answer
-/// the request, which would otherwise wait on the peer forever. The outer
-/// error is what the handler had to say for itself when it did not finish.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+/// Calls `service` with `request`, catching a panic in the handler so that
+/// the caller survives to answer the request, which would otherwise wait on
+/// the peer forever. The outer error is what the handler had to say for
+/// itself when it panicked. On wasm32-unknown-unknown a panic aborts the
+/// whole module before it can be caught, so there this is just the call.
 async fn call<S>(mut service: S, request: Request) -> Result<Result<AmpBox, Error>, String>
 where
     S: Service<Request, Response = AmpBox> + Send + 'static,
     S::Error: Into<Error>,
     S::Future: Send,
 {
-    let call = tokio::spawn(async move {
+    // The service is not touched again after a panic, so whatever state the
+    // panic left it in is never seen.
+    AssertUnwindSafe(async move {
         let service = service.ready().await.map_err(Into::into)?;
         service.call(request).await.map_err(Into::into)
-    });
-    call.await.map_err(|err| match err.try_into_panic() {
-        Ok(payload) => match payload.downcast_ref::<&str>() {
-            Some(message) => format!("command panicked: {message}"),
-            None => match payload.downcast_ref::<String>() {
-                Some(message) => format!("command panicked: {message}"),
-                None => "command panicked".to_string(),
-            },
-        },
-        Err(_) => "command was cancelled".to_string(),
     })
+    .catch_unwind()
+    .await
+    .map_err(|payload| panic_message(&*payload))
 }
 
-/// Calls `service` with `request`. There is no tokio runtime to isolate a
-/// panicking handler on, and no need: a panic on this target aborts the
-/// whole module.
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-async fn call<S>(mut service: S, request: Request) -> Result<Result<AmpBox, Error>, String>
-where
-    S: Service<Request, Response = AmpBox> + Send + 'static,
-    S::Error: Into<Error>,
-    S::Future: Send,
-{
-    Ok(async move {
-        let service = service.ready().await.map_err(Into::into)?;
-        service.call(request).await.map_err(Into::into)
+/// The log line for a handler's panic: its message, which `panic!` leaves as
+/// a `&str` or a `String` depending on whether it had arguments, or nothing
+/// for a payload of another type.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+    match message {
+        Some(message) => format!("command panicked: {message}"),
+        None => "command panicked".to_string(),
     }
-    .await)
 }
 
 /// Builds the error box for `ask`. A code or description longer than a box

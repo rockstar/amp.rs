@@ -187,14 +187,26 @@ four-field struct and a 10,000-entry map:
 cargo bench -p serde_amp
 ```
 
+`tower-amp` has one for calls through a served connection over an in-memory
+pipe, one at a time and pipelined, reported as calls per second as well as
+time:
+
+```
+cargo bench -p tower-amp
+```
+
 The hooks compile them but do not run them, since timings are too noisy to
 gate a commit. Run them by hand before and after touching `AmpBox::decode`,
-the codec, or how `AmpBox` stores and looks up pairs, and compare. The chunked
+the codec, how `AmpBox` stores and looks up pairs, or how a connection reads,
+dispatches and answers a request, and compare. The chunked
 decode case is the one that has regressed before: each call must only look at
 bytes the previous call did not, or a large box takes seconds instead of
 milliseconds. The `to_box` cases pull in opposite directions: inserting scans
 the existing pairs, which is quadratic in the large case but beats hashing in
 the small one, so an index that speeds up the first must not slow the second.
+The sequential calls case shows anything added to a call's critical path; the
+pipelined case shows only what does not overlap with the other calls in
+flight, so a cost that moves between them has not gone away.
 
 Releasing
 --

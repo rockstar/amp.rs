@@ -58,6 +58,7 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
+divan = "0.1"
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 tower = { workspace = true, features = ["timeout", "limit"] }
@@ -78,6 +79,12 @@ tokio = { workspace = true, features = ["process", "rt-multi-thread", "signal"] 
 # Compiles the `#[command]` cases under tests/ui and checks the compiler's
 # output, which needs cargo and so cannot run inside WebAssembly.
 trybuild = "1"
+
+# The bench drives a server, which does not build on WebAssembly; nothing
+# builds benches there.
+[[bench]]
+name = "calls"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

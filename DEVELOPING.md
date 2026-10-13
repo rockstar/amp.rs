@@ -110,7 +110,7 @@ it by hand, with Node installed:
 
 ```
 cargo install wasm-pack                   # or: brew install wasm-pack
-wasm-pack test --node tower-amp -- --all-features --test client
+wasm-pack test --node tower-amp --all-features --test client
 ```
 
 Only that one test file runs there: the others need a server, and the unit

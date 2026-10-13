@@ -76,6 +76,8 @@ jobs:
   # alone: the other tests need a server, and the unit tests a tokio runtime.
   # wasm-pack installs the wasm-bindgen-test-runner matching Cargo.lock and
   # runs the tests in Node. Not a prek hook, since it needs Node and wasm-pack.
+  # No `--` before the cargo flags: wasm-pack would pass everything after it
+  # to the test binary instead, and cargo would then build the examples too.
   test-browser:
     name: Test tower-amp's client on wasm32-unknown-unknown
     runs-on: ubuntu-latest
@@ -88,7 +90,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-pack
-      - run: wasm-pack test --node tower-amp -- --all-features --test client
+      - run: wasm-pack test --node tower-amp --all-features --test client
   msrv:
     name: Check workspace on the minimum supported Rust version
     runs-on: ubuntu-latest

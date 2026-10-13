@@ -9,7 +9,7 @@ use proc_macro2::Span;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{DeriveInput, LitStr, Token, Type, parse_macro_input};
+use syn::{Data, DeriveInput, LitStr, Token, Type, parse_macro_input};
 
 /// Declares the struct it is attached to as a command's arguments.
 ///
@@ -21,6 +21,19 @@ use syn::{DeriveInput, LitStr, Token, Type, parse_macro_input};
 pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
     let input = parse_macro_input!(item as DeriveInput);
+
+    // A command's arguments are a box on the wire, which only a struct
+    // serializes to. Catch anything else here rather than at runtime.
+    let keyword = match &input.data {
+        Data::Struct(_) => None,
+        Data::Enum(data) => Some(data.enum_token.span),
+        Data::Union(data) => Some(data.union_token.span),
+    };
+    if let Some(span) = keyword {
+        return syn::Error::new(span, "`#[command]` must be attached to a struct")
+            .to_compile_error()
+            .into();
+    }
 
     let ident = &input.ident;
     let name = args

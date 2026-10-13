@@ -24,6 +24,19 @@
 /// `name = "..."`. The response defaults to `()`, an empty box on the wire,
 /// for a command with nothing to report.
 ///
+/// Arguments travel as a box, a flat set of keys, so the attribute only
+/// accepts structs. An enum or union is rejected at compile time:
+///
+/// ```compile_fail
+/// use tower_amp::command;
+///
+/// #[command]
+/// enum Divide {
+///     Exact,
+///     Rounded,
+/// }
+/// ```
+///
 /// The schema is what a client and server share. A server implements
 /// [`Handle`](crate::Handle) or [`HandleWith`](crate::HandleWith) on the
 /// struct as well, and needs `Deserialize` on it and `Serialize` on the

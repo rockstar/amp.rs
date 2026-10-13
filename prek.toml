@@ -31,13 +31,21 @@ entry = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 types_or = ["rust", "toml"]
 pass_filenames = false
 
-# Library targets only: the examples and tests need TCP and a tokio runtime.
-# Needs `rustup target add wasm32-unknown-unknown`.
+# Library targets only: the examples and tests need TCP and a multi-threaded
+# tokio runtime. Needs `rustup target add wasm32-unknown-unknown wasm32-wasip2`.
 [[repos.hooks]]
-id = "cargo-clippy-wasm"
+id = "cargo-clippy-wasm32-unknown-unknown"
 name = "cargo clippy (wasm32-unknown-unknown)"
 language = "system"
 entry = "cargo clippy --workspace --all-features --target wasm32-unknown-unknown -- -D warnings"
+types_or = ["rust", "toml"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-clippy-wasm32-wasip2"
+name = "cargo clippy (wasm32-wasip2)"
+language = "system"
+entry = "cargo clippy --workspace --all-features --target wasm32-wasip2 -- -D warnings"
 types_or = ["rust", "toml"]
 pass_filenames = false
 
@@ -47,6 +55,17 @@ name = "cargo test"
 language = "system"
 entry = "cargo test --workspace --all-features"
 types_or = ["rust", "toml", "markdown"]
+pass_filenames = false
+
+# Needs wasmtime (see DEVELOPING.md); `.cargo/config.toml` names it as the
+# runner. Unit and integration tests only: the examples need TCP, and
+# doctests only run on the host.
+[[repos.hooks]]
+id = "cargo-test-wasm32-wasip2"
+name = "cargo test (wasm32-wasip2)"
+language = "system"
+entry = "cargo test --workspace --all-features --target wasm32-wasip2 --tests"
+types_or = ["rust", "toml"]
 pass_filenames = false
 
 [[repos.hooks]]

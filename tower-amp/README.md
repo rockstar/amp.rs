@@ -138,19 +138,24 @@ it is answered, from your own `tokio::time::timeout` or `select!`, is safe
 in the same way: the call is forgotten, and if its request had not been
 written yet it is not sent.
 
-In the browser
+WebAssembly
 --
 
-The client builds for `wasm32-unknown-unknown`, for a page that calls
-commands on a server over a WebSocket, through a `wasm-bindgen` bridge or
-any other framework that runs futures in a browser. `Client::new` takes
-anything that implements tokio's `AsyncRead` and `AsyncWrite`, which several
-WebSocket crates for the browser provide, and the connection is driven on
-the page's event loop. `with_timeout` works, on the browser's timer.
+The client builds for `wasm32-unknown-unknown` and `wasm32-wasip2`. The
+server does not, since tokio has no networking on WebAssembly. `Client::new`
+takes anything that implements tokio's `AsyncRead` and `AsyncWrite`, so the
+connection is whatever the host gives you: in a browser, a WebSocket through
+one of the crates that adapt it to those traits; under WASI, a socket from
+the host wrapped the same way.
 
-The I/O type need not be `Send` there, since the browser has one thread, and
-the client's futures are not `Send` either. The server is not available, as
-a browser cannot listen for connections.
+In a browser the connection is driven on the page's event loop, through
+`wasm-bindgen-futures`, and `with_timeout` uses the browser's timer. The I/O
+type need not be `Send` there, since the browser has one thread, and the
+client's futures are not `Send` either.
+
+Under WASI the client behaves as it does natively: the connection is driven
+by a task on the current tokio runtime, which must be a current-thread one,
+and `with_timeout` uses tokio's timer.
 
 Examples
 --

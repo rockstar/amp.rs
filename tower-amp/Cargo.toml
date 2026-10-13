@@ -23,17 +23,22 @@ amp-protocol = { path = "../amp-protocol", version = "0.1", features = ["tokio"]
 futures-util = { workspace = true, features = ["sink"] }
 serde = { workspace = true }
 serde_amp = { path = "../serde_amp", version = "0.3" }
-# Only the tokio features that build on wasm32-unknown-unknown go here; see
-# the target tables below.
+# Only the tokio features that build on every WebAssembly target go here;
+# see the target tables below.
 tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tower-amp-macros = { path = "../tower-amp-macros", version = "0.1" }
 
-# Everywhere but wasm32-unknown-unknown, a connection is driven by a task on
-# the tokio runtime and the server listens on TCP.
-[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+# tokio has no networking on WebAssembly, so the server only builds
+# elsewhere.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = ["net", "rt", "time"] }
+
+# On WASI (wasm32-wasip2) tokio's runtime and timers work, so a connection is
+# driven as it is natively. Only the client builds there.
+[target.'cfg(all(target_family = "wasm", target_os = "wasi"))'.dependencies]
+tokio = { workspace = true, features = ["rt", "time"] }
 
 # On wasm32-unknown-unknown there is no tokio runtime, so a connection is
 # driven on the host's event loop and a timeout is a host timer. Only the
@@ -44,5 +49,10 @@ wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tower = { workspace = true, features = ["timeout", "limit"] }
+
+# The tests run on wasm32-wasip2 too, where tokio has no multi-threaded
+# runtime.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }

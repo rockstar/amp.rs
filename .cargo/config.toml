@@ -1,0 +1,4 @@
+# How `cargo test --target wasm32-wasip2` runs a test binary. See the
+# WebAssembly section of DEVELOPING.md.
+[target.wasm32-wasip2]
+runner = "wasmtime"

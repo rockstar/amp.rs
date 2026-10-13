@@ -30,18 +30,34 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
   wasm:
-    name: Check workspace on wasm32-unknown-unknown
+    name: Check workspace on ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      matrix:
+        target: [wasm32-unknown-unknown, wasm32-wasip2]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      # Library targets only: the examples and tests need TCP and a
+      # multi-threaded tokio runtime, which WebAssembly does not have.
+      - run: cargo clippy --workspace --all-features --target ${{ matrix.target }} -- -D warnings
+  test-wasi:
+    name: Test workspace on wasm32-wasip2
     runs-on: ubuntu-latest
     needs: build
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
-          components: clippy
-      # Library targets only: the examples and tests need TCP and a tokio
-      # runtime, neither of which exists in a browser.
-      - run: cargo clippy --workspace --all-features --target wasm32-unknown-unknown -- -D warnings
+          targets: wasm32-wasip2
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+      # Unit and integration tests only: the examples need TCP, and doctests
+      # only run on the host. The runner is set in .cargo/config.toml.
+      - run: cargo test --workspace --all-features --target wasm32-wasip2 --tests
   msrv:
     name: Check workspace on the minimum supported Rust version
     runs-on: ubuntu-latest

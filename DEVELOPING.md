@@ -16,13 +16,14 @@ Pre-commit hooks
 
 Formatting, build, clippy, test, semver, and WebAssembly checks run as git
 pre-commit hooks via [prek](https://prek.j178.dev), configured in
-[prek.toml](prek.toml). Install prek and the wasm target, then enable the
-hook once per clone:
+[prek.toml](prek.toml). Install prek, the wasm targets, and
+[wasmtime](https://wasmtime.dev), then enable the hook once per clone:
 
 ```
 cargo install prek                        # or: brew install prek
 cargo install cargo-semver-checks --locked # or: cargo binstall cargo-semver-checks
-rustup target add wasm32-unknown-unknown
+rustup target add wasm32-unknown-unknown wasm32-wasip2
+brew install wasmtime                     # or: curl https://wasmtime.dev/install.sh -sSf | bash
 prek install
 ```
 
@@ -77,24 +78,54 @@ WebAssembly
 --
 
 `tower-amp`'s client builds for `wasm32-unknown-unknown`, the target a
-browser runs, so CI and the hooks check the library targets of the whole
-workspace there:
+browser runs, and `wasm32-wasip2`, the WASI target, so CI and the hooks check
+the library targets of the whole workspace on both, and run the tests of the
+whole workspace on WASI under wasmtime:
 
 ```
 cargo clippy --workspace --all-features --target wasm32-unknown-unknown -- -D warnings
+cargo clippy --workspace --all-features --target wasm32-wasip2 -- -D warnings
+cargo test --workspace --all-features --target wasm32-wasip2 --tests
 ```
 
-Only the library targets are checked, since the examples and tests need TCP
-and a tokio runtime. The server is compiled out on that target for the same
-reason, and `Cargo.toml` enables the tokio features that need a runtime only
-elsewhere; tokio fails to build for wasm32-unknown-unknown with any other
-feature, so a new tokio feature goes in the target-specific table unless it is
-one of `io-util`, `macros`, `rt`, `sync`, or `time`. Everything that differs
-by target in the client is a small `#[cfg]`'d helper (`spawn`, `timeout`, the
-`Send` bound on the I/O type, and the `Service` future type), so a change to
-the client should only ever need one of those to change. Nothing runs the
-tests in a browser, so a change to the connection's logic still gets its
-coverage from the native tests.
+[.cargo/config.toml](.cargo/config.toml) names wasmtime as the runner for
+that target, so `cargo test` invokes it on each test binary. `--tests`
+leaves out the examples, which need TCP; doctests are skipped on any
+non-host target anyway. A panic aborts a wasm test binary, so one failing
+test there takes the rest of its binary down with it; run the failing test
+alone to see its message. The tests in `tower-amp/tests/roundtrip.rs` drive
+a served connection, so that file is compiled out on wasm, and
+`tower-amp/tests/client.rs` covers the client against a hand-rolled peer
+instead. A test that needs both sides goes in the first; one that only
+needs the client goes in the second, and must not spawn, since on
+`wasm32-unknown-unknown` there is no runtime to spawn on.
+
+Nothing runs the tests in a browser. That would take Node and the
+`wasm-bindgen-test` runner, and swapping `#[tokio::test]` for
+`#[wasm_bindgen_test]` on that target, since there is no tokio runtime to
+block on there.
+
+The server is compiled out on every WebAssembly target: tokio refuses to
+build its `net` feature, or `fs`, `io-std`, `process`, `rt-multi-thread`,
+and `signal`, for any wasm target. `Cargo.toml` therefore enables those only
+off wasm, in a `[target.'cfg(not(target_family = "wasm"))']` table, and the
+same split applies to the dev-dependencies; a new tokio feature goes there
+unless it is one of `io-util`, `macros`, `rt`, `sync`, or `time`. (With
+`--cfg tokio_unstable` and Rust 1.97 or newer, a server does run on
+`wasm32-wasip2` under wasmtime with sockets enabled. It is left out because
+that cfg would then be required of every consumer building for WASI, client
+or not.)
+
+The two wasm targets differ in whether tokio's runtime can run. Under WASI it
+can, so `wasm32-wasip2` gets `rt` and `time` and the client works as it does
+natively. In a browser it cannot, so on `wasm32-unknown-unknown` the client
+spawns through `wasm-bindgen-futures` and times out through `gloo-timers`.
+Everything that differs there is a small `#[cfg]`'d helper in `client.rs`
+(`spawn`, `timeout`, the `Send` bound on the I/O type, and the `Service`
+future type), keyed on `all(target_arch = "wasm32", target_os = "unknown")`,
+so a change to the client should only ever need one of those to change.
+Only the WASI tests run, so a change to the browser-only helpers is checked
+by clippy alone; test the browser path by hand in a page.
 
 Benchmarks
 --

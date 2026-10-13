@@ -1,5 +1,8 @@
 //! A client and a served connection joined by an in-memory pipe.
 
+// There is no server on WebAssembly; `client.rs` covers the client there.
+#![cfg(not(target_family = "wasm"))]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;

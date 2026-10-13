@@ -7,9 +7,9 @@ mod command;
 mod error;
 mod handle;
 mod router;
-// A server listens on TCP and spawns on the tokio runtime, neither of which
-// exists on wasm32-unknown-unknown; only the client builds there.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+// A server listens on TCP, and tokio has no networking on WebAssembly; only
+// the client builds there.
+#[cfg(not(target_family = "wasm"))]
 mod server;
 
 /// The box type that carries a command's arguments and results, re-exported
@@ -29,7 +29,7 @@ pub use command::Command;
 pub use error::Error;
 pub use handle::{Handle, HandleWith};
 pub use router::Router;
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(not(target_family = "wasm"))]
 pub use server::{serve, serve_connection, serve_connection_with_codec, serve_with_codec};
 /// Declares a struct as a command's arguments. See [`Command`].
 pub use tower_amp_macros::command;

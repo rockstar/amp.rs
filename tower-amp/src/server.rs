@@ -1,4 +1,5 @@
 use std::io;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +11,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinError;
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tower::{Service, ServiceExt};
 
 use crate::Error;
@@ -33,14 +36,16 @@ const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 /// drops its connection before it is accepted, or an accept that fails
 /// because the process is briefly out of file descriptors, is skipped and
 /// the loop carries on; anything else, such as the listener being closed,
-/// ends `serve` with that error. An error on one connection ends that
-/// connection. With the `tracing` feature, a skipped accept error and a
-/// connection's error are logged; without it they are discarded, and
-/// calling [`serve_connection`] from your own accept loop is the way to
-/// observe the latter.
+/// ends `serve` with that error, once the connections already accepted
+/// have finished the requests they had received. An error on one
+/// connection ends that connection. With the `tracing` feature, a skipped
+/// accept error and a connection's error are logged; without it they are
+/// discarded, and calling [`serve_connection`] from your own accept loop is
+/// the way to observe the latter.
 ///
 /// Each connection uses a default [`AmpCodec`], which refuses a box longer
-/// than 16 MiB; [`serve_with_codec`] takes another.
+/// than 16 MiB; [`serve_with_codec`] takes another. [`serve_with_shutdown`]
+/// is the same server with a way to stop it.
 pub async fn serve<S>(listener: TcpListener, service: S) -> Result<(), Error>
 where
     S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
@@ -63,25 +68,106 @@ where
     S::Error: Into<Error>,
     S::Future: Send,
 {
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
+    serve_with_codec_and_shutdown(listener, service, codec, std::future::pending()).await
+}
+
+/// [`serve`] until `signal` completes, answering the requests in flight
+/// before returning.
+///
+/// Once `signal` completes the listener is closed, so a peer that connects
+/// from then on is refused, and every connection stops reading requests.
+/// A request already received is still handled and its reply written; each
+/// connection closes once the last of its requests is answered, and
+/// `serve_with_shutdown` returns `Ok(())` once every connection has closed.
+/// A request the peer had sent but the connection had not yet read is lost
+/// with the connection, which the peer sees as a call failed by the
+/// connection closing; the same goes for one that arrives afterwards.
+///
+/// A handler that never finishes holds shutdown open: nothing here gives up
+/// on a request. Wrap the call in [`tokio::time::timeout`] if that matters.
+/// Dropping the future, which the timeout does, still tells the connections
+/// to stop reading and answer what they have, but no longer waits for them.
+///
+/// An accept error that ends [`serve`] ends this the same way: the
+/// connections finish what they have received and the error is returned.
+///
+/// Each connection uses a default [`AmpCodec`];
+/// [`serve_with_codec_and_shutdown`] takes another.
+pub async fn serve_with_shutdown<S, F>(
+    listener: TcpListener,
+    service: S,
+    signal: F,
+) -> Result<(), Error>
+where
+    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
+    S::Error: Into<Error>,
+    S::Future: Send,
+    F: Future<Output = ()>,
+{
+    serve_with_codec_and_shutdown(listener, service, AmpCodec::new(), signal).await
+}
+
+/// [`serve_with_shutdown`] with the codec every connection is framed by,
+/// for setting the largest box a peer may send with
+/// [`AmpCodec::with_max_frame_length`].
+pub async fn serve_with_codec_and_shutdown<S, F>(
+    listener: TcpListener,
+    service: S,
+    codec: AmpCodec,
+    signal: F,
+) -> Result<(), Error>
+where
+    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
+    S::Error: Into<Error>,
+    S::Future: Send,
+    F: Future<Output = ()>,
+{
+    let shutdown = CancellationToken::new();
+    // If this future is dropped instead of returning, say by a timeout on
+    // it, the connections are still told to stop reading and finish up.
+    let _cancel_on_drop = shutdown.clone().drop_guard();
+    let connections = TaskTracker::new();
+    let mut signal = pin!(signal);
+    let result = loop {
+        // `biased` so that the signal is seen even while peers keep the
+        // listener ready. Neither branch is polled again after it completes.
+        let accepted = tokio::select! {
+            biased;
+            () = &mut signal => break Ok(()),
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((stream, _)) => {
+                let service = service.clone();
+                let shutdown = shutdown.clone();
+                connections.spawn(async move {
+                    if let Err(err) = serve_connection_until(stream, service, codec, shutdown).await
+                    {
+                        log::connection_failed(&err);
+                    }
+                });
+            }
             Err(err) => match retry_after(&err) {
                 Some(delay) => {
                     log::accept_skipped(&err);
-                    tokio::time::sleep(delay).await;
-                    continue;
+                    tokio::select! {
+                        biased;
+                        () = &mut signal => break Ok(()),
+                        () = tokio::time::sleep(delay) => {}
+                    }
                 }
-                None => return Err(err.into()),
+                None => break Err(err.into()),
             },
-        };
-        let service = service.clone();
-        tokio::spawn(async move {
-            if let Err(err) = serve_connection_with_codec(stream, service, codec).await {
-                log::connection_failed(&err);
-            }
-        });
-    }
+        }
+    };
+    // The listener goes first so that a peer connecting from now on is
+    // refused rather than left in the backlog until the last connection is
+    // done, and the connections are told to stop before this waits on them.
+    drop(listener);
+    shutdown.cancel();
+    connections.close();
+    connections.wait().await;
+    result
 }
 
 /// How the accept loop treats an error from `accept`: `Some(delay)` means
@@ -167,6 +253,25 @@ where
     S::Error: Into<Error>,
     S::Future: Send,
 {
+    serve_connection_until(io, service, codec, CancellationToken::new()).await
+}
+
+/// [`serve_connection_with_codec`] until `shutdown` is cancelled, after which
+/// the connection reads no more requests, and returns once those it had
+/// already received are answered. A request the peer sent and this side had
+/// not read by then is lost with the connection.
+async fn serve_connection_until<T, S>(
+    io: T,
+    service: S,
+    codec: AmpCodec,
+    shutdown: CancellationToken,
+) -> Result<(), Error>
+where
+    T: AsyncRead + AsyncWrite,
+    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
+    S::Error: Into<Error>,
+    S::Future: Send,
+{
     let (mut sink, mut stream) = Framed::new(io, codec).split();
     let (responses, mut pending) = mpsc::channel::<AmpBox>(16);
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
@@ -176,24 +281,40 @@ where
     // stopped reading while blocked on a write, neither would ever drain the
     // other's buffer.
     let read = async move {
-        while let Some(incoming) = stream.next().await {
-            match Message::from_box(incoming?)? {
+        loop {
+            // `biased` so that a shutdown is seen even while the peer keeps
+            // the stream ready. A `next` that loses to it is dropped with
+            // nothing read, since the frame stays in the codec's buffer.
+            let incoming = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                next = stream.next() => match next {
+                    Some(incoming) => incoming?,
+                    None => break,
+                },
+            };
+            match Message::from_box(incoming)? {
                 Message::Request(request) => {
                     // Waiting here, rather than spawning without bound, is
                     // what holds the peer to `MAX_IN_FLIGHT`. Replies are
                     // written by `write` below, which does not depend on
-                    // this loop, so waiting cannot deadlock.
-                    let permit = Arc::clone(&in_flight)
-                        .acquire_owned()
-                        .await
-                        .expect("the semaphore is never closed");
+                    // this loop, so waiting cannot deadlock. A shutdown
+                    // ends the wait, and the request with it.
+                    let permit = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break,
+                        permit = Arc::clone(&in_flight).acquire_owned() => {
+                            permit.expect("the semaphore is never closed")
+                        }
+                    };
                     tokio::spawn(respond(service.clone(), request, responses.clone(), permit));
                 }
                 Message::Answer(_) | Message::Error(_) => {}
             }
         }
-        // The peer is done sending. Dropping this sender lets the writer
-        // finish once every request already received has been answered.
+        // The peer is done sending, or this side is done reading. Dropping
+        // this sender lets the writer finish once every request already
+        // received has been answered.
         drop(responses);
         Ok::<_, Error>(())
     };

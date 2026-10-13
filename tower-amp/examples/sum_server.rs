@@ -57,6 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind("127.0.0.1:1234").await?;
     println!("listening on {}", listener.local_addr()?);
-    tower_amp::serve(listener, router).await?;
+    // Ctrl-C stops the server once the requests in flight are answered.
+    tower_amp::serve_with_shutdown(listener, router, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     Ok(())
 }

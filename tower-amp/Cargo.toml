@@ -40,6 +40,8 @@ tower-amp-macros = { path = "../tower-amp-macros", version = "0.1" }
 # elsewhere.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = ["net", "rt", "time"] }
+# `rt` is for the task tracker `serve` waits on at shutdown.
+tokio-util = { workspace = true, features = ["rt"] }
 # Only the server logs, so the `tracing` feature has nothing to pull in on
 # WebAssembly.
 tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
@@ -64,9 +66,10 @@ tower = { workspace = true, features = ["timeout", "limit"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 # The tests run on wasm32-wasip2 too, where tokio has no multi-threaded
-# runtime.
+# runtime. `signal` is for the examples and the README, which stop on
+# Ctrl-C.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 
 [package.metadata.docs.rs]
 all-features = true

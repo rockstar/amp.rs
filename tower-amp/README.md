@@ -197,6 +197,33 @@ longer than 16 MiB and closes rather than buffering without bound. Pass an
 `AmpCodec` to `serve_with_codec`, `serve_connection_with_codec`, or
 `Client::with_codec` to set another limit.
 
+Shutdown
+--
+
+`serve_with_shutdown` takes a future along with the listener and the service,
+and stops once it completes: the listener is closed, so a peer that connects
+from then on is refused, and each connection stops reading requests, answers
+the ones it already has, and closes. It returns once the last connection has
+closed.
+
+```rust,no_run
+# use tower_amp::Router;
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let router = Router::new();
+# let listener = tokio::net::TcpListener::bind("127.0.0.1:1234").await?;
+tower_amp::serve_with_shutdown(listener, router, async {
+    let _ = tokio::signal::ctrl_c().await;
+})
+.await?;
+# Ok(())
+# }
+```
+
+A handler that never finishes holds shutdown open, so wrap the call in
+`tokio::time::timeout` if that matters. `serve_with_codec_and_shutdown` takes
+a codec as well.
+
 Logging
 --
 
@@ -213,10 +240,10 @@ changes nothing on the wire.
 tower-amp = { version = "0.2", features = ["tracing"] }
 ```
 
-Not yet supported: commands the server initiates on a client, TLS, and
-graceful shutdown. A connection error inside `serve` ends that connection
-and is only logged; write the accept loop yourself with `serve_connection`
-to handle it. `serve` itself survives a peer that hangs up before it is
+Not yet supported: commands the server initiates on a client, and TLS. A
+connection error inside `serve` ends that connection and is only logged;
+write the accept loop yourself with `serve_connection` to handle it, at the
+cost of `serve_with_shutdown`, which has no connection-level counterpart. `serve` itself survives a peer that hangs up before it is
 accepted and a process briefly out of file descriptors, and returns only on
 an error that means the listener is no good.
 

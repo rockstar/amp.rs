@@ -220,6 +220,29 @@ impl Handle for Flaky {
     }
 }
 
+/// A command whose handler reports that it has started and then waits to
+/// be let go, so a test can hold a request in flight for as long as it
+/// needs without guessing at timing.
+#[derive(Serialize, Deserialize)]
+#[command]
+struct Hold {}
+
+/// Both sides of `Hold`. A `Notify` keeps a permit when nobody is waiting,
+/// so neither side has to get there first.
+#[derive(Clone, Default)]
+struct Gate {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl HandleWith<Gate> for Hold {
+    async fn handle(self, gate: Gate) -> Result<(), Error> {
+        gate.started.notify_one();
+        gate.release.notified().await;
+        Ok(())
+    }
+}
+
 fn router() -> Router {
     Router::new()
         .command::<Sum>()
@@ -753,6 +776,86 @@ async fn serve_accepts_connections_over_tcp() {
     let third = connect_tcp(addr).await;
     let total = third.call(&Sum { a: 5, b: 6 }).await.unwrap();
     assert_eq!(total.total, 11);
+}
+
+/// Connects to `addr` until the connection is refused, which it is once the
+/// listener is closed, and fails the test if that takes longer than a few
+/// seconds. A connection that is accepted in the meantime is dropped.
+async fn refused_eventually(addr: std::net::SocketAddr) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            // Lets the server act on a signal just sent before the first
+            // attempt. A SYN that reaches the listener as it closes gets no
+            // answer, and the retry a second later would be the test's time.
+            tokio::task::yield_now().await;
+            if tokio::net::TcpStream::connect(addr).await.is_err() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the listener was not closed");
+}
+
+/// `serve_with_shutdown` stops accepting as soon as the signal fires, still
+/// answers the request in flight, and returns once that connection closes.
+#[tokio::test]
+async fn shutdown_answers_the_requests_in_flight() {
+    let gate = Gate::default();
+    let router = Router::with_state(gate.clone())
+        .command::<Hold>()
+        .command::<Sum>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(tower_amp::serve_with_shutdown(listener, router, async {
+        let _ = stopped.await;
+    }));
+
+    let client = connect_tcp(addr).await;
+    let held = tokio::spawn({
+        let client = client.clone();
+        async move { client.call(&Hold {}).await }
+    });
+    gate.started.notified().await;
+
+    stop.send(()).unwrap();
+    refused_eventually(addr).await;
+    // The handler is still running, so the server cannot have returned.
+    assert!(!server.is_finished());
+
+    gate.release.notify_one();
+    held.await.unwrap().unwrap();
+    server.await.unwrap().unwrap();
+    // The connection closed with the server, so it takes no more requests.
+    let failed = client.call(&Sum { a: 1, b: 2 }).await;
+    assert!(peer_closed(&failed), "{failed:?}");
+}
+
+/// `serve_with_codec_and_shutdown` frames its connections with the codec
+/// and still stops on the signal, with nothing in flight to wait for.
+#[tokio::test]
+async fn shutdown_with_codec_keeps_the_frame_limit() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(tower_amp::serve_with_codec_and_shutdown(
+        listener,
+        router(),
+        AmpCodec::with_max_frame_length(1024),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+
+    let client = connect_tcp(addr).await;
+    let payload = "x".repeat(8_000);
+    let failed = client.call(&Echo { payload }).await;
+    assert!(peer_closed(&failed), "{failed:?}");
+
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    refused_eventually(addr).await;
 }
 
 /// `serve_with_codec` frames every connection it accepts with the codec it

@@ -30,6 +30,9 @@ pub use error::Error;
 pub use handle::{Handle, HandleWith};
 pub use router::Router;
 #[cfg(not(target_family = "wasm"))]
-pub use server::{serve, serve_connection, serve_connection_with_codec, serve_with_codec};
+pub use server::{
+    serve, serve_connection, serve_connection_with_codec, serve_with_codec,
+    serve_with_codec_and_shutdown, serve_with_shutdown,
+};
 /// Declares a struct as a command's arguments. See [`Command`].
 pub use tower_amp_macros::command;

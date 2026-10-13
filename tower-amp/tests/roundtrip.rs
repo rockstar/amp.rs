@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use amp_protocol::{AmpBox, Request};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tower::{Service, ServiceBuilder};
@@ -512,4 +513,75 @@ fn assert_key_too_long<T: std::fmt::Debug>(result: &Result<T, Error>) {
         ),
         "{result:?}"
     );
+}
+
+/// A call the peer is too slow to answer fails with `Timeout`, and the
+/// connection carries on: the answer that arrives later is discarded rather
+/// than confusing a later call.
+#[tokio::test]
+async fn a_slow_answer_times_out_and_is_later_discarded() {
+    let client = connect(router()).with_timeout(Duration::from_millis(20));
+    let failed = client.call(&Sleep { millis: 100 }).await;
+    assert!(matches!(failed, Err(Error::Timeout)), "{failed:?}");
+    assert_eq!(failed.unwrap_err().to_string(), "timed out");
+
+    let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
+    assert_eq!(total.total, 3);
+    // Let the late answer arrive, then make sure nothing is the worse for it.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let total = client.call(&Sum { a: 3, b: 4 }).await.unwrap();
+    assert_eq!(total.total, 7);
+}
+
+/// The limit belongs to the handle, so clones of one connection can have
+/// different limits, including none.
+#[tokio::test]
+async fn clones_take_their_own_timeout() {
+    let patient = connect(router());
+    let hasty = patient.clone().with_timeout(Duration::from_millis(20));
+    let (slow, failed) = tokio::join!(
+        patient.call(&Sleep { millis: 100 }),
+        hasty.call(&Sleep { millis: 100 }),
+    );
+    assert_eq!(slow.unwrap().millis, 100);
+    assert!(matches!(failed, Err(Error::Timeout)), "{failed:?}");
+}
+
+#[tokio::test]
+async fn the_service_form_honors_the_timeout() {
+    let mut client = connect(router()).with_timeout(Duration::from_millis(20));
+    let mut arguments = AmpBox::new();
+    arguments.insert("millis", "100").unwrap();
+    let request = Request::new("Sleep", arguments).with_ask("x");
+    let failed = Service::call(&mut client, request).await;
+    assert!(matches!(failed, Err(Error::Timeout)), "{failed:?}");
+}
+
+/// A request whose caller gave up while it was still queued behind a slow
+/// write is never sent. The pipe holds less than one request and the peer
+/// does not read until both calls have timed out, so the first request is
+/// stuck mid-write and the second is still queued when they time out.
+#[tokio::test]
+async fn an_abandoned_request_is_not_written() {
+    let (client_io, peer) = tokio::io::duplex(16);
+    let client = Client::new(client_io).with_timeout(Duration::from_millis(20));
+    let first = Echo {
+        payload: "first".into(),
+    };
+    let second = Echo {
+        payload: "second".into(),
+    };
+    let (first, second) = tokio::join!(client.call(&first), client.call(&second));
+    assert!(matches!(first, Err(Error::Timeout)), "{first:?}");
+    assert!(matches!(second, Err(Error::Timeout)), "{second:?}");
+    // Closing the client ends the connection once the writer is done.
+    drop(client);
+
+    let mut peer = tokio_util::codec::Framed::new(peer, AmpCodec::new());
+    let mut written = Vec::new();
+    while let Some(amp_box) = peer.next().await {
+        written.push(amp_box.unwrap());
+    }
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert_eq!(written[0].get("payload"), Some(&b"first"[..]));
 }

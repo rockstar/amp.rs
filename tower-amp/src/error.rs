@@ -35,6 +35,9 @@ pub enum Error {
         /// that was waiting on the connection.
         cause: Option<Arc<Error>>,
     },
+    /// The call was not answered within the client's timeout. See
+    /// [`Client::with_timeout`](crate::Client::with_timeout).
+    Timeout,
 }
 
 impl Error {
@@ -88,6 +91,7 @@ impl fmt::Display for Error {
                 write!(f, "connection closed: {cause}")
             }
             Error::ConnectionClosed { cause: None } => f.write_str("connection closed"),
+            Error::Timeout => f.write_str("timed out"),
         }
     }
 }

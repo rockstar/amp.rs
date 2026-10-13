@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use amp_protocol::codec::AmpCodec;
 use amp_protocol::{AmpBox, ErrorResponse, Message, Request};
@@ -24,6 +25,12 @@ use crate::{Command, Error};
 /// each answer to its request. The connection closes when the last clone is
 /// dropped.
 ///
+/// A call waits until it is answered or the connection ends, unless the
+/// client has a [`timeout`](Client::with_timeout). Dropping a call before it
+/// is answered, whether through the timeout or by the caller, forgets it: a
+/// reply that arrives later is discarded, and a request that had not yet been
+/// written is not sent.
+///
 /// A client is also a tower [`Service`] from a [`Request`] to the results
 /// box, which is the untyped form of [`call`](Client::call): a request with
 /// `_ask` waits for its answer, and one without is sent and resolves at once
@@ -41,15 +48,29 @@ use crate::{Command, Error};
 pub struct Client {
     outgoing: mpsc::Sender<Outgoing>,
     next_ask: Arc<AtomicU64>,
+    pending: Arc<Mutex<Pending>>,
     cause: Arc<Cause>,
+    timeout: Option<Duration>,
 }
 
+/// A request queued for the connection's writer.
 struct Outgoing {
     request: Request,
-    reply: oneshot::Sender<Result<AmpBox, Error>>,
+    /// Answered with an empty box once the request has been written. Only a
+    /// notification has one; a call's reply sender waits in [`Pending`] for
+    /// the peer's answer instead.
+    written: Option<oneshot::Sender<Result<AmpBox, Error>>>,
 }
 
 /// Calls waiting for a reply, keyed by ask.
+///
+/// A call registers itself here before its request is queued, so a reply can
+/// never arrive first, and removes itself if it is dropped before the reply
+/// arrives, so the map only holds calls somebody is still waiting on.
+///
+/// NOTE: this is a `std::sync::Mutex` by design! We don't want the mutex to
+/// be held across an await, and using the `std::sync` version, rather than
+/// the `tokio::sync` version, ensures we can't mess that up.
 type Pending = HashMap<Vec<u8>, oneshot::Sender<Result<AmpBox, Error>>>;
 
 /// What ended the connection, recorded by [`run`] before it lets go of
@@ -79,13 +100,40 @@ impl Client {
         T: AsyncRead + AsyncWrite + Send + 'static,
     {
         let (outgoing, incoming) = mpsc::channel(16);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
         let cause = Arc::new(Mutex::new(None));
-        tokio::spawn(run(io, codec, incoming, cause.clone()));
+        tokio::spawn(run(io, codec, incoming, pending.clone(), cause.clone()));
         Client {
             outgoing,
             next_ask: Arc::new(AtomicU64::new(1)),
+            pending,
             cause,
+            timeout: None,
         }
+    }
+
+    /// Fails any call or notification that has not completed within `limit`
+    /// with [`Error::Timeout`]. Without a limit, a call waits until it is
+    /// answered or the connection ends.
+    ///
+    /// The limit belongs to this handle and to clones taken from it
+    /// afterwards, so handles sharing one connection can have different
+    /// limits:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # use tower_amp::Client;
+    /// # async fn example(client: Client) {
+    /// let client = client.with_timeout(Duration::from_secs(5));
+    /// let patient = client.clone().with_timeout(Duration::from_secs(60));
+    /// # }
+    /// ```
+    ///
+    /// A reply that arrives after its call has timed out is discarded, and a
+    /// request whose caller gave up before it was written is not sent.
+    pub fn with_timeout(mut self, limit: Duration) -> Client {
+        self.timeout = Some(limit);
+        self
     }
 
     /// Calls the command that `arguments` belongs to and waits for its
@@ -116,25 +164,45 @@ impl Client {
     }
 
     /// Sends `request`, assigning its `_ask` if it has one, and waits for the
-    /// answer, or for the request to be written if it has none.
-    async fn send(&self, mut request: Request) -> Result<AmpBox, Error> {
-        // The ask only has to be unique on this connection, and the counter
-        // is the one place that can guarantee that, so whatever the caller
-        // set is replaced. Only its presence matters.
-        if request.ask.is_some() {
-            request.ask = Some(
-                self.next_ask
-                    .fetch_add(1, Ordering::Relaxed)
-                    .to_string()
-                    .into(),
-            );
+    /// answer, or for the request to be written if it has none, within the
+    /// client's timeout if it has one.
+    async fn send(&self, request: Request) -> Result<AmpBox, Error> {
+        let exchange = self.exchange(request);
+        match self.timeout {
+            Some(limit) => tokio::time::timeout(limit, exchange)
+                .await
+                .unwrap_or(Err(Error::Timeout)),
+            None => exchange.await,
         }
+    }
+
+    /// [`send`](Client::send) without the timeout.
+    async fn exchange(&self, mut request: Request) -> Result<AmpBox, Error> {
         let (reply, response) = oneshot::channel();
+        // A call waits in `pending` for its answer, and is removed from it
+        // when this future completes or is dropped. A notification's reply
+        // travels with the request, for the writer to answer.
+        let mut written = Some(reply);
+        let _waiting = request.ask.as_mut().map(|ask| {
+            // The ask only has to be unique on this connection, and the
+            // counter is the one place that can guarantee that, so whatever
+            // the caller set is replaced. Only its presence matters.
+            *ask = self
+                .next_ask
+                .fetch_add(1, Ordering::Relaxed)
+                .to_string()
+                .into();
+            lock(&self.pending).insert(ask.clone(), written.take().expect("one reply sender"));
+            Waiting {
+                ask: ask.clone(),
+                pending: &self.pending,
+            }
+        });
         // Either channel is gone only once the connection has ended, and
         // `run` records why before it drops either of them.
         if self
             .outgoing
-            .send(Outgoing { request, reply })
+            .send(Outgoing { request, written })
             .await
             .is_err()
         {
@@ -149,6 +217,20 @@ impl Client {
     }
 }
 
+/// A call's place in [`Pending`], given up when the call is dropped so that a
+/// caller that stops waiting, through a timeout or otherwise, leaves nothing
+/// behind. Removing a call that has already been answered is a no-op.
+struct Waiting<'a> {
+    ask: Vec<u8>,
+    pending: &'a Mutex<Pending>,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        lock(self.pending).remove(&self.ask);
+    }
+}
+
 /// The untyped form of [`Client::call`] and [`Client::notify`].
 ///
 /// A request with an `_ask` waits for its answer; one without is sent and
@@ -157,6 +239,9 @@ impl Client {
 /// be unique on this connection and only the client can guarantee that. A
 /// request forwarded from another connection can therefore keep the `_ask`
 /// it arrived with.
+///
+/// The client's [`timeout`](Client::with_timeout), if it has one, applies
+/// here too.
 impl Service<Request> for Client {
     type Response = AmpBox;
     type Error = Error;
@@ -185,19 +270,18 @@ impl Service<Request> for Client {
 /// A call learns that the connection ended when the sender of its reply is
 /// dropped, and then reads `cause` for why, so every failure here is
 /// recorded in `cause` before the future it happened in returns. Everything
-/// holding a reply sender, `pending`, the other future, and the queue behind
-/// `outgoing`, is dropped later than that.
-async fn run<T>(io: T, codec: AmpCodec, mut outgoing: mpsc::Receiver<Outgoing>, cause: Arc<Cause>)
-where
+/// holding a reply sender, the entries of `pending`, the other future, and
+/// the queue behind `outgoing`, is dropped later than that.
+async fn run<T>(
+    io: T,
+    codec: AmpCodec,
+    mut outgoing: mpsc::Receiver<Outgoing>,
+    pending: Arc<Mutex<Pending>>,
+    cause: Arc<Cause>,
+) where
     T: AsyncRead + AsyncWrite,
 {
     let (mut sink, mut stream) = Framed::new(io, codec).split();
-    // Calls waiting for a reply, keyed by ask. The writer registers a call
-    // before it writes the request, so a reply can never arrive first.
-    // NOTE: this is a `std::sync::Mutex` by design! We don't want the mutex
-    // to be held across an await, and using the `std::sync` version, rather
-    // than the `tokio::sync` version, ensures we can't mess that up.
-    let pending: Mutex<Pending> = Mutex::new(HashMap::new());
     let (refusals, mut refused) = mpsc::channel::<AmpBox>(16);
     let end = |err: Error| *lock(&cause) = Some(Arc::new(err));
 
@@ -212,6 +296,7 @@ where
                 None => return,
             };
             match Message::from_box(amp_box) {
+                // A reply nobody is waiting for any more is discarded.
                 Ok(Message::Answer(answer)) => {
                     if let Some(reply) = lock(&pending).remove(&answer.answer) {
                         let _ = reply.send(Ok(answer.results));
@@ -250,31 +335,37 @@ where
         loop {
             tokio::select! {
                 next = outgoing.recv() => {
-                    let Some(Outgoing { request, reply }) = next else {
+                    let Some(Outgoing { request, written }) = next else {
                         // Every clone of the client is gone.
                         return;
                     };
+                    // A request whose caller stopped waiting while it was
+                    // queued is not worth the peer's time.
+                    let abandoned = match &request.ask {
+                        Some(ask) => !lock(&pending).contains_key(ask),
+                        None => written.as_ref().is_none_or(|reply| reply.is_closed()),
+                    };
+                    if abandoned {
+                        continue;
+                    }
                     let ask = request.ask.clone();
                     let amp_box = match request.into_box() {
                         Ok(amp_box) => amp_box,
                         Err(err) => {
-                            let _ = reply.send(Err(err.into()));
+                            let reply = match ask {
+                                Some(ask) => lock(&pending).remove(&ask),
+                                None => written,
+                            };
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(err.into()));
+                            }
                             continue;
                         }
-                    };
-                    // A call waits in `pending` for its answer; a
-                    // notification is answered as soon as it is written.
-                    let notification = match ask {
-                        Some(ask) => {
-                            lock(&pending).insert(ask, reply);
-                            None
-                        }
-                        None => Some(reply),
                     };
                     if let Err(err) = sink.send(amp_box).await {
                         return end(err.into());
                     }
-                    if let Some(reply) = notification {
+                    if let Some(reply) = written {
                         let _ = reply.send(Ok(AmpBox::new()));
                     }
                 }
@@ -290,8 +381,10 @@ where
         () = read => {}
         () = write => {}
     }
-    // Dropping `pending` and `outgoing` fails every call still waiting, and
-    // each finds `cause` already recorded.
+    // Clearing `pending` and dropping `outgoing` fails every call still
+    // waiting, and each finds `cause` already recorded. The client still
+    // holds `pending`, so it has to be emptied rather than dropped.
+    lock(&pending).clear();
 }
 
 /// Locks `mutex`. A poisoned lock only means a task panicked while holding
@@ -300,4 +393,53 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::io::AsyncReadExt;
+
+    /// A client whose peer never answers, and the peer's end of the pipe.
+    fn silent_peer() -> (Client, tokio::io::DuplexStream) {
+        let (client_io, peer) = tokio::io::duplex(4096);
+        (Client::new(client_io), peer)
+    }
+
+    fn call() -> Request {
+        Request::new("Sleep", AmpBox::new()).with_ask("x")
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_call_leaves_pending_empty() {
+        let (client, _peer) = silent_peer();
+        let client = client.with_timeout(Duration::from_millis(20));
+        let failed = client.send(call()).await;
+        assert!(matches!(failed, Err(Error::Timeout)), "{failed:?}");
+        assert!(lock(&client.pending).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_call_leaves_pending_empty() {
+        let (client, _peer) = silent_peer();
+        let elapsed = tokio::time::timeout(Duration::from_millis(20), client.send(call())).await;
+        assert!(elapsed.is_err(), "the peer answered?");
+        assert!(lock(&client.pending).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_call_is_registered_until_answered() {
+        let (client, mut peer) = silent_peer();
+        let mut waiting = Box::pin(client.send(call()));
+        // Drive the call until its request has been written.
+        let mut buf = [0; 64];
+        tokio::select! {
+            _ = &mut waiting => panic!("answered by nobody"),
+            n = peer.read(&mut buf) => assert!(n.unwrap() > 0),
+        }
+        assert_eq!(lock(&client.pending).len(), 1);
+        drop(waiting);
+        assert!(lock(&client.pending).is_empty());
+    }
 }

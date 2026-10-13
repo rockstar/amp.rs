@@ -5,6 +5,8 @@
 //! the server rather than being repeated here; a client needs only the
 //! `#[command]` schema, not the `Handle` implementation.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tower_amp::{command, Client, Error};
@@ -35,7 +37,10 @@ struct Quotient {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::new(TcpStream::connect("127.0.0.1:1234").await?);
+    // A call that is not answered within five seconds fails with
+    // `Error::Timeout` instead of waiting on the server forever.
+    let client = Client::new(TcpStream::connect("127.0.0.1:1234").await?)
+        .with_timeout(Duration::from_secs(5));
 
     let total = client.call(&Sum { a: 13, b: 81 }).await?;
     println!("13 + 81 = {}", total.total);

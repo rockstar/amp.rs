@@ -22,7 +22,7 @@ amp-protocol = { path = "../amp-protocol", version = "0.1", features = ["tokio"]
 futures-util = { workspace = true, features = ["sink"] }
 serde = { workspace = true }
 serde_amp = { path = "../serde_amp", version = "0.3" }
-tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "macros"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tower-amp-macros = { path = "../tower-amp-macros", version = "0.1" }

@@ -124,6 +124,20 @@ A client is cheap to clone and every clone shares the connection, with any
 number of calls in flight at once. `notify` sends a command without asking
 for a reply.
 
+A call waits until it is answered or the connection ends. `with_timeout`
+puts a limit on that, after which the call fails with `Error::Timeout`:
+
+```rust,ignore
+let client = Client::new(stream).with_timeout(Duration::from_secs(5));
+```
+
+The limit belongs to the handle it was set on and the clones taken from it
+afterwards, so a clone can take a longer one for a slow command. A reply
+that arrives after its call timed out is discarded. Dropping a call before
+it is answered, from your own `tokio::time::timeout` or `select!`, is safe
+in the same way: the call is forgotten, and if its request had not been
+written yet it is not sent.
+
 Examples
 --
 

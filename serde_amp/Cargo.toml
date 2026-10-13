@@ -1,6 +1,6 @@
 [package]
 name = "serde_amp"
-version = "0.3.0"
+version = "0.3.1"
 description = "serde support for Asynchronous Messaging Protocol (AMP) boxes"
 keywords = ["serde", "serialization", "amp"]
 categories = ["encoding"]

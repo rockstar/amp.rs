@@ -1,6 +1,6 @@
 [package]
 name = "tower-amp-macros"
-version = "0.1.0"
+version = "0.1.1"
 description = "The #[command] attribute for tower-amp"
 keywords = ["amp", "tower", "macros"]
 categories = ["network-programming"]

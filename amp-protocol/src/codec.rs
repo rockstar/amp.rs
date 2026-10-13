@@ -18,15 +18,44 @@ use crate::{AmpBox, Error};
 /// let framed = Framed::new(stream, AmpCodec::new());
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// A box is read into memory in full before it is decoded, so the codec
+/// refuses one longer than its maximum frame length with
+/// [`Error::FrameTooLong`] rather than buffer without bound. The default
+/// limit is 16 MiB; [`with_max_frame_length`](AmpCodec::with_max_frame_length)
+/// sets another.
+#[derive(Clone, Copy, Debug)]
 pub struct AmpCodec {
-    _private: (),
+    max_frame_length: usize,
 }
 
+/// The frame length [`AmpCodec::new`] allows: 16 MiB, room for a box of a
+/// few hundred full-size values, which is far beyond any sensible packet.
+const DEFAULT_MAX_FRAME_LENGTH: usize = 16 * 1024 * 1024;
+
 impl AmpCodec {
-    /// Creates a codec.
+    /// Creates a codec with the default maximum frame length of 16 MiB.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a codec that rejects a box whose encoding is longer than
+    /// `max_frame_length` bytes, counting the key and value length prefixes
+    /// and the two-byte terminator. Decoding such a box fails with
+    /// [`Error::FrameTooLong`], as soon as that many bytes of it have
+    /// arrived without a terminator.
+    ///
+    /// Set this to the largest box the peer could legitimately send. Each
+    /// value is at most 65,535 bytes and each key at most 255, so the length
+    /// is bounded by the number of pairs a box carries.
+    pub fn with_max_frame_length(max_frame_length: usize) -> Self {
+        AmpCodec { max_frame_length }
+    }
+}
+
+impl Default for AmpCodec {
+    fn default() -> Self {
+        Self::with_max_frame_length(DEFAULT_MAX_FRAME_LENGTH)
     }
 }
 
@@ -37,8 +66,21 @@ impl Decoder for AmpCodec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<AmpBox>, Error> {
         match AmpBox::decode(src) {
             Ok((amp_box, consumed)) => {
+                if consumed > self.max_frame_length {
+                    return Err(Error::FrameTooLong {
+                        limit: self.max_frame_length,
+                    });
+                }
                 src.advance(consumed);
                 Ok(Some(amp_box))
+            }
+            // Every byte in `src` belongs to this box, since the ones before
+            // it were consumed. Once there are more than the limit, this box
+            // can never be accepted, so stop buffering it.
+            Err(Error::Incomplete) if src.len() > self.max_frame_length => {
+                Err(Error::FrameTooLong {
+                    limit: self.max_frame_length,
+                })
             }
             Err(Error::Incomplete) => Ok(None),
             Err(err) => Err(err),
@@ -68,6 +110,9 @@ mod test {
 
     const SUM_REQUEST: &[u8] =
         b"\x00\x04_ask\x00\x011\x00\x08_command\x00\x03Sum\x00\x01a\x00\x0213\x00\x01b\x00\x0281\x00\x00";
+
+    /// One encoded pair, four bytes long, with no terminator after it.
+    const PAIR: &[u8] = b"\x00\x01k\x00\x01v";
 
     #[test]
     fn decodes_boxes_as_bytes_arrive() {
@@ -114,5 +159,68 @@ mod test {
         let (amp_box, _) = AmpBox::decode(SUM_REQUEST).unwrap();
         codec.encode(amp_box, &mut buf).unwrap();
         assert_eq!(&buf[..], SUM_REQUEST);
+    }
+
+    #[test]
+    fn default_limit_is_16_mib() {
+        assert_eq!(AmpCodec::new().max_frame_length, 16 * 1024 * 1024);
+        assert_eq!(AmpCodec::default().max_frame_length, 16 * 1024 * 1024);
+    }
+
+    /// The attack: pairs keep arriving and the terminator never does. The
+    /// codec must give up once the buffer passes the limit instead of
+    /// asking for more.
+    #[test]
+    fn unterminated_box_past_the_limit_is_rejected() {
+        let limit = PAIR.len() * 3;
+        let mut codec = AmpCodec::with_max_frame_length(limit);
+        let mut buf = BytesMut::new();
+
+        for _ in 0..3 {
+            buf.extend_from_slice(PAIR);
+            assert!(codec.decode(&mut buf).unwrap().is_none());
+        }
+        assert_eq!(buf.len(), limit, "exactly the limit is still incomplete");
+
+        buf.extend_from_slice(&PAIR[..1]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(Error::FrameTooLong { limit: l }) if l == limit
+        ));
+    }
+
+    /// A box that arrives whole is held to the same limit as one that
+    /// trickles in.
+    #[test]
+    fn complete_box_past_the_limit_is_rejected() {
+        let mut codec = AmpCodec::with_max_frame_length(SUM_REQUEST.len() - 1);
+        let mut buf = BytesMut::from(SUM_REQUEST);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(Error::FrameTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn box_at_the_limit_is_accepted() {
+        let mut codec = AmpCodec::with_max_frame_length(SUM_REQUEST.len());
+        let mut buf = BytesMut::from(SUM_REQUEST);
+        assert!(codec.decode(&mut buf).unwrap().is_some());
+        assert!(buf.is_empty());
+    }
+
+    /// The limit is per box, not per buffer: several boxes that together
+    /// exceed it still decode one by one.
+    #[test]
+    fn limit_applies_to_each_box_not_the_buffer() {
+        let mut codec = AmpCodec::with_max_frame_length(SUM_REQUEST.len());
+        let mut buf = BytesMut::new();
+        for _ in 0..3 {
+            buf.extend_from_slice(SUM_REQUEST);
+        }
+        for _ in 0..3 {
+            assert!(codec.decode(&mut buf).unwrap().is_some());
+        }
+        assert!(buf.is_empty());
     }
 }

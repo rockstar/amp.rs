@@ -7,7 +7,7 @@ use std::time::Duration;
 use amp_protocol::{AmpBox, Request};
 use serde::{Deserialize, Serialize};
 use tower::{Service, ServiceBuilder};
-use tower_amp::{command, Client, Error, Handle, HandleWith, Router};
+use tower_amp::{command, AmpCodec, Client, Error, Handle, HandleWith, Router};
 
 #[derive(Serialize, Deserialize)]
 #[command(response = Total)]
@@ -392,4 +392,59 @@ async fn a_panicking_handler_is_answered_with_unknown() {
     // The connection must survive.
     let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
     assert_eq!(total.total, 3);
+}
+
+/// A peer that sends a box longer than the server allows gets its connection
+/// closed with the reason, rather than the server buffering it forever.
+#[tokio::test]
+async fn server_rejects_a_box_over_its_frame_limit() {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let codec = AmpCodec::with_max_frame_length(1024);
+    let server = tokio::spawn(tower_amp::serve_connection_with_codec(
+        server_io,
+        router(),
+        codec,
+    ));
+    let client = Client::new(client_io);
+
+    let small = client
+        .call(&Echo {
+            payload: "ok".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(small.payload, "ok");
+
+    let payload = "x".repeat(8_000);
+    let failed = tokio::time::timeout(Duration::from_secs(2), client.call(&Echo { payload }))
+        .await
+        .expect("the server buffered the oversized box instead of rejecting it");
+    assert!(matches!(
+        failed,
+        Err(Error::ConnectionClosed) | Err(Error::Io(_))
+    ));
+    assert!(matches!(
+        server.await.unwrap(),
+        Err(Error::Protocol(amp_protocol::Error::FrameTooLong {
+            limit: 1024
+        }))
+    ));
+}
+
+/// The client holds the peer to its limit too: an answer that is too long
+/// ends the connection and fails the call instead of waiting on it.
+#[tokio::test]
+async fn client_rejects_an_answer_over_its_frame_limit() {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    tokio::spawn(tower_amp::serve_connection(server_io, router()));
+    let client = Client::with_codec(client_io, AmpCodec::with_max_frame_length(1024));
+
+    let payload = "x".repeat(8_000);
+    let failed = tokio::time::timeout(Duration::from_secs(2), client.call(&Echo { payload }))
+        .await
+        .expect("the client buffered the oversized answer instead of rejecting it");
+    assert!(matches!(
+        failed,
+        Err(Error::ConnectionClosed) | Err(Error::Io(_))
+    ));
 }

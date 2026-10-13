@@ -30,6 +30,14 @@ pub enum Error {
     /// A box carried none of `_answer`, `_error`, or `_command`, so it is
     /// neither a request nor a response.
     UnrecognizedBox,
+    /// A box on a stream was longer than the codec allows. See
+    /// [`AmpCodec::with_max_frame_length`](crate::codec::AmpCodec::with_max_frame_length).
+    #[cfg(feature = "tokio")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+    FrameTooLong {
+        /// The limit in bytes.
+        limit: usize,
+    },
     /// The underlying stream failed.
     #[cfg(feature = "tokio")]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
@@ -59,6 +67,10 @@ impl fmt::Display for Error {
             ),
             Error::UnrecognizedBox => {
                 write!(f, "box has none of _answer, _error, or _command")
+            }
+            #[cfg(feature = "tokio")]
+            Error::FrameTooLong { limit } => {
+                write!(f, "box is longer than the limit of {limit} bytes")
             }
             #[cfg(feature = "tokio")]
             Error::Io(err) => write!(f, "i/o error: {err}"),

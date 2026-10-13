@@ -154,6 +154,11 @@ How it fits together
 Requests on one connection are handled concurrently, each on its own task,
 and answered in the order they finish, as the protocol allows.
 
+A box is read in full before it is handled, so a connection refuses one
+longer than 16 MiB and closes rather than buffering without bound. Pass an
+`AmpCodec` to `serve_with_codec`, `serve_connection_with_codec`, or
+`Client::with_codec` to set another limit.
+
 Not yet supported: commands the server initiates on a client, TLS, graceful
 shutdown, and tracing. A connection error inside `serve` ends that connection
 silently; write the accept loop yourself with `serve_connection` to see it.

@@ -48,12 +48,26 @@ type Pending = HashMap<Vec<u8>, oneshot::Sender<Result<AmpBox, Error>>>;
 impl Client {
     /// Starts a client over `io`, typically a connected `TcpStream`. The
     /// connection is driven by a task spawned on the current runtime.
+    ///
+    /// The connection uses a default [`AmpCodec`], which refuses a box
+    /// longer than 16 MiB and closes the connection; [`with_codec`](Client::with_codec)
+    /// takes another.
     pub fn new<T>(io: T) -> Client
     where
         T: AsyncRead + AsyncWrite + Send + 'static,
     {
+        Self::with_codec(io, AmpCodec::new())
+    }
+
+    /// [`new`](Client::new) with the codec the connection is framed by, for
+    /// setting the largest box the peer may send with
+    /// [`AmpCodec::with_max_frame_length`].
+    pub fn with_codec<T>(io: T, codec: AmpCodec) -> Client
+    where
+        T: AsyncRead + AsyncWrite + Send + 'static,
+    {
         let (outgoing, incoming) = mpsc::channel(16);
-        tokio::spawn(run(io, incoming));
+        tokio::spawn(run(io, codec, incoming));
         Client {
             outgoing,
             next_ask: Arc::new(AtomicU64::new(1)),
@@ -120,11 +134,11 @@ impl Service<Request> for Client {
 /// buffer. The connection ends when either future does: the peer closed it
 /// or broke the protocol, a write failed, or every clone of the client is
 /// gone.
-async fn run<T>(io: T, mut outgoing: mpsc::Receiver<Outgoing>)
+async fn run<T>(io: T, codec: AmpCodec, mut outgoing: mpsc::Receiver<Outgoing>)
 where
     T: AsyncRead + AsyncWrite,
 {
-    let (mut sink, mut stream) = Framed::new(io, AmpCodec::new()).split();
+    let (mut sink, mut stream) = Framed::new(io, codec).split();
     // Calls waiting for a reply, keyed by ask. The writer registers a call
     // before it writes the request, so a reply can never arrive first.
     // NOTE: this is a `std::sync::Mutex` by design! We don't want the mutex

@@ -16,7 +16,26 @@ use crate::Error;
 /// Returns only when accepting a connection fails. An error on one
 /// connection ends that connection and is discarded; call
 /// [`serve_connection`] from your own accept loop to observe those errors.
+///
+/// Each connection uses a default [`AmpCodec`], which refuses a box longer
+/// than 16 MiB; [`serve_with_codec`] takes another.
 pub async fn serve<S>(listener: TcpListener, service: S) -> Result<(), Error>
+where
+    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
+    S::Error: Into<Error>,
+    S::Future: Send,
+{
+    serve_with_codec(listener, service, AmpCodec::new()).await
+}
+
+/// [`serve`] with the codec every connection is framed by, for setting the
+/// largest box a peer may send with
+/// [`AmpCodec::with_max_frame_length`].
+pub async fn serve_with_codec<S>(
+    listener: TcpListener,
+    service: S,
+    codec: AmpCodec,
+) -> Result<(), Error>
 where
     S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
     S::Error: Into<Error>,
@@ -26,7 +45,7 @@ where
         let (stream, _) = listener.accept().await?;
         let service = service.clone();
         tokio::spawn(async move {
-            let _ = serve_connection(stream, service).await;
+            let _ = serve_connection_with_codec(stream, service, codec).await;
         });
     }
 }
@@ -44,6 +63,10 @@ where
 ///
 /// Returns once the peer closes the connection and every request already
 /// received has been answered, or with the error that ended the connection.
+/// A box longer than the codec allows is such an error, reported as
+/// [`Error::Protocol`] wrapping [`amp_protocol::Error::FrameTooLong`]. The
+/// default [`AmpCodec`] allows 16 MiB; [`serve_connection_with_codec`] takes
+/// another.
 pub async fn serve_connection<T, S>(io: T, service: S) -> Result<(), Error>
 where
     T: AsyncRead + AsyncWrite,
@@ -51,7 +74,24 @@ where
     S::Error: Into<Error>,
     S::Future: Send,
 {
-    let (mut sink, mut stream) = Framed::new(io, AmpCodec::new()).split();
+    serve_connection_with_codec(io, service, AmpCodec::new()).await
+}
+
+/// [`serve_connection`] with the codec the connection is framed by, for
+/// setting the largest box the peer may send with
+/// [`AmpCodec::with_max_frame_length`].
+pub async fn serve_connection_with_codec<T, S>(
+    io: T,
+    service: S,
+    codec: AmpCodec,
+) -> Result<(), Error>
+where
+    T: AsyncRead + AsyncWrite,
+    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
+    S::Error: Into<Error>,
+    S::Future: Send,
+{
+    let (mut sink, mut stream) = Framed::new(io, codec).split();
     let (responses, mut pending) = mpsc::channel::<AmpBox>(16);
 
     // Reading and writing are separate futures so that a write the peer is

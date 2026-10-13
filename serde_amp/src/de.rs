@@ -47,7 +47,7 @@ impl<'de> de::Deserializer<'de> for BoxDeserializer<'de> {
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         visitor.visit_map(BoxAccess {
             iter: self.amp_box.iter(),
-            value: None,
+            pair: None,
         })
     }
 
@@ -136,8 +136,9 @@ impl<'de> de::Deserializer<'de> for BoxDeserializer<'de> {
 /// from the bytes of an `AmpList` element.
 struct BoxAccess<'de, I> {
     iter: I,
-    /// The value belonging to the key most recently handed out.
-    value: Option<&'de [u8]>,
+    /// The key most recently handed out and its value, until the value is
+    /// read.
+    pair: Option<(&'de [u8], &'de [u8])>,
 }
 
 impl<'de, I> de::MapAccess<'de> for BoxAccess<'de, I>
@@ -152,7 +153,7 @@ where
     ) -> Result<Option<K::Value>, Error> {
         match self.iter.next() {
             Some((key, value)) => {
-                self.value = Some(value);
+                self.pair = Some((key, value));
                 seed.deserialize(ValueDeserializer { bytes: key }).map(Some)
             }
             None => Ok(None),
@@ -160,11 +161,19 @@ where
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
-        let value = self
-            .value
+        let (key, value) = self
+            .pair
             .take()
             .ok_or_else(|| de::Error::custom("map value requested before its key"))?;
         seed.deserialize(ValueDeserializer { bytes: value })
+            .map_err(|err| match err {
+                Error::InvalidValue(expected) => Error::InvalidValueForKey {
+                    key: String::from_utf8_lossy(key).into_owned(),
+                    expected,
+                    value: value.to_vec(),
+                },
+                other => other,
+            })
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -441,7 +450,7 @@ impl<'de, 'c> ElementDeserializer<'de, 'c> {
         *self.consumed = consumed;
         visitor.visit_map(BoxAccess {
             iter: pairs.into_iter(),
-            value: None,
+            pair: None,
         })
     }
 }
@@ -574,11 +583,81 @@ mod test {
         assert_eq!(value::<i8>(b"-15").unwrap(), -15);
         assert_eq!(value::<u64>(b"2965537").unwrap(), 2_965_537);
         assert_eq!(value::<i128>(b"-1").unwrap(), -1);
-        assert!(matches!(value::<u8>(b"300"), Err(Error::InvalidValue(_))));
-        assert!(matches!(value::<u8>(b"-1"), Err(Error::InvalidValue(_))));
-        assert!(matches!(value::<i32>(b"xy"), Err(Error::InvalidValue(_))));
-        assert!(matches!(value::<i32>(b""), Err(Error::InvalidValue(_))));
-        assert!(matches!(value::<i32>(b"\xff"), Err(Error::InvalidValue(_))));
+        assert!(matches!(
+            value::<u8>(b"300"),
+            Err(Error::InvalidValueForKey { .. })
+        ));
+        assert!(matches!(
+            value::<u8>(b"-1"),
+            Err(Error::InvalidValueForKey { .. })
+        ));
+        assert!(matches!(
+            value::<i32>(b"xy"),
+            Err(Error::InvalidValueForKey { .. })
+        ));
+        assert!(matches!(
+            value::<i32>(b""),
+            Err(Error::InvalidValueForKey { .. })
+        ));
+        assert!(matches!(
+            value::<i32>(b"\xff"),
+            Err(Error::InvalidValueForKey { .. })
+        ));
+    }
+
+    /// A value that fails to parse reports the key it sat under, what was
+    /// expected, and the bytes found, so a client can tell which argument
+    /// was wrong.
+    #[test]
+    fn invalid_values_name_their_key() {
+        let err = value::<i32>(b"xy").unwrap_err();
+        assert!(matches!(
+            &err,
+            Error::InvalidValueForKey {
+                key,
+                expected: "an integer",
+                value,
+            } if key == "v" && value == b"xy"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "key \"v\": expected an integer, got \"xy\""
+        );
+
+        // Bytes that are not UTF-8 are shown lossily, and a long value is
+        // cut short.
+        assert_eq!(
+            value::<i32>(b"\xff").unwrap_err().to_string(),
+            "key \"v\": expected an integer, got \"\u{fffd}\""
+        );
+        let long = "x".repeat(100);
+        assert_eq!(
+            value::<i32>(long.as_bytes()).unwrap_err().to_string(),
+            format!(
+                "key \"v\": expected an integer, got {:?}...",
+                "x".repeat(64)
+            )
+        );
+
+        // An element inside a list of boxes reports its own key, not the
+        // key of the list.
+        #[derive(Deserialize, Debug)]
+        struct Item {
+            #[allow(dead_code)]
+            inner: u8,
+        }
+        assert!(matches!(
+            value::<Vec<Item>>(b"\x00\x05inner\x00\x02xy\x00\x00"),
+            Err(Error::InvalidValueForKey { key, .. }) if key == "inner"
+        ));
+
+        // A map key has no key of its own.
+        let mut amp_box = AmpBox::new();
+        amp_box.insert("x", "1").unwrap();
+        assert!(matches!(
+            from_box::<BTreeMap<u32, String>>(&amp_box),
+            Err(Error::InvalidValue("an unsigned integer"))
+        ));
     }
 
     #[test]
@@ -591,7 +670,10 @@ mod test {
         assert_eq!(value::<f64>(b"inf").unwrap(), f64::INFINITY);
         assert_eq!(value::<f64>(b"-inf").unwrap(), f64::NEG_INFINITY);
         assert!(value::<f64>(b"nan").unwrap().is_nan());
-        assert!(matches!(value::<f64>(b"ten"), Err(Error::InvalidValue(_))));
+        assert!(matches!(
+            value::<f64>(b"ten"),
+            Err(Error::InvalidValueForKey { .. })
+        ));
     }
 
     #[test]
@@ -600,7 +682,7 @@ mod test {
         assert!(!value::<bool>(b"False").unwrap());
         assert!(matches!(
             value::<bool>(b"true"),
-            Err(Error::InvalidValue(_))
+            Err(Error::InvalidValueForKey { .. })
         ));
     }
 
@@ -613,10 +695,16 @@ mod test {
         assert_eq!(value::<char>("\u{e9}".as_bytes()).unwrap(), '\u{e9}');
         assert!(matches!(
             value::<String>(b"\xff"),
-            Err(Error::InvalidValue(_))
+            Err(Error::InvalidValueForKey { .. })
         ));
-        assert!(matches!(value::<char>(b"ab"), Err(Error::InvalidValue(_))));
-        assert!(matches!(value::<char>(b""), Err(Error::InvalidValue(_))));
+        assert!(matches!(
+            value::<char>(b"ab"),
+            Err(Error::InvalidValueForKey { .. })
+        ));
+        assert!(matches!(
+            value::<char>(b""),
+            Err(Error::InvalidValueForKey { .. })
+        ));
     }
 
     #[test]
@@ -669,7 +757,7 @@ mod test {
                 amp_box.insert("s", b"\xff".to_vec()).unwrap();
                 amp_box
             }),
-            Err(Error::InvalidValue(_))
+            Err(Error::InvalidValueForKey { .. })
         ));
     }
 
@@ -825,11 +913,11 @@ mod test {
     fn malformed_lists_are_errors_not_panics() {
         assert!(matches!(
             value::<Vec<u8>>(b"\x00"),
-            Err(Error::InvalidValue(_))
+            Err(Error::InvalidValueForKey { .. })
         ));
         assert!(matches!(
             value::<Vec<u8>>(b"\x00\x051"),
-            Err(Error::InvalidValue(_))
+            Err(Error::InvalidValueForKey { .. })
         ));
         #[derive(Deserialize, Debug)]
         struct Item {

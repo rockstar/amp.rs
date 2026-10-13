@@ -16,9 +16,18 @@ pub enum Error {
     /// The value has no representation in AMP. The payload says which kind of
     /// value, for example a nested struct or an enum variant carrying data.
     Unsupported(&'static str),
-    /// A value on the wire could not be read as the requested type. The
-    /// payload says what was expected.
+    /// A value with no key of its own, such as a map key, could not be read
+    /// as the requested type. The payload says what was expected.
     InvalidValue(&'static str),
+    /// The value under `key` could not be read as the requested type.
+    InvalidValueForKey {
+        /// The key, converted lossily from UTF-8.
+        key: String,
+        /// What the value was expected to be.
+        expected: &'static str,
+        /// The value's raw bytes.
+        value: Vec<u8>,
+    },
 }
 
 impl ser::Error for Error {
@@ -41,8 +50,30 @@ impl fmt::Display for Error {
             Error::NotABox => f.write_str("a box must be a struct or map at the top level"),
             Error::Unsupported(what) => write!(f, "{what} cannot be represented in AMP"),
             Error::InvalidValue(expected) => write!(f, "expected {expected}"),
+            Error::InvalidValueForKey {
+                key,
+                expected,
+                value,
+            } => {
+                write!(f, "key {key:?}: expected {expected}, got ")?;
+                write_truncated(f, value)
+            }
         }
     }
+}
+
+/// Writes `value` as quoted text, lossily, cut short so that a large value
+/// does not swamp the message.
+fn write_truncated(f: &mut fmt::Formatter<'_>, value: &[u8]) -> fmt::Result {
+    const LIMIT: usize = 64;
+    let text = String::from_utf8_lossy(value);
+    let mut chars = text.chars();
+    let shown: String = chars.by_ref().take(LIMIT).collect();
+    write!(f, "{shown:?}")?;
+    if chars.next().is_some() {
+        f.write_str("...")?;
+    }
+    Ok(())
 }
 
 impl std::error::Error for Error {

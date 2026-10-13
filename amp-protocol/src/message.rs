@@ -1,6 +1,6 @@
 use crate::{
     AmpBox, Error, KEY_ANSWER, KEY_ASK, KEY_COMMAND, KEY_ERROR, KEY_ERROR_CODE,
-    KEY_ERROR_DESCRIPTION, is_reserved_key,
+    KEY_ERROR_DESCRIPTION, RESERVED_KEYS, is_reserved_key,
 };
 
 /// A request to run a command.
@@ -57,12 +57,15 @@ impl Request {
     /// Splits a box into a request.
     ///
     /// Fails with [`Error::MissingKey`] if the box has no `_command`.
-    /// Everything other than `_command` and `_ask` becomes an argument.
+    /// Everything other than `_command` and `_ask` becomes an argument,
+    /// except that any other reserved key is dropped, as the reference
+    /// implementation ignores it.
     pub fn from_box(mut amp_box: AmpBox) -> Result<Self, Error> {
         let command = amp_box
             .remove(KEY_COMMAND)
             .ok_or(Error::MissingKey(KEY_COMMAND))?;
         let ask = amp_box.remove(KEY_ASK);
+        strip_reserved(&mut amp_box);
         Ok(Self {
             command,
             ask,
@@ -105,11 +108,13 @@ impl Answer {
     /// Splits a box into an answer.
     ///
     /// Fails with [`Error::MissingKey`] if the box has no `_answer`.
-    /// Everything else becomes a result.
+    /// Everything else becomes a result, except that any other reserved key
+    /// is dropped, as the reference implementation ignores it.
     pub fn from_box(mut amp_box: AmpBox) -> Result<Self, Error> {
         let answer = amp_box
             .remove(KEY_ANSWER)
             .ok_or(Error::MissingKey(KEY_ANSWER))?;
+        strip_reserved(&mut amp_box);
         Ok(Self {
             answer,
             results: amp_box,
@@ -245,10 +250,17 @@ fn reject_reserved(amp_box: AmpBox) -> Result<AmpBox, Error> {
     }
 }
 
+/// Removes every reserved key, so a box read off the wire never hands one to
+/// the caller as an argument or result.
+fn strip_reserved(amp_box: &mut AmpBox) {
+    for key in RESERVED_KEYS {
+        amp_box.remove(key);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::RESERVED_KEYS;
 
     fn args() -> AmpBox {
         AmpBox::from_pairs([("a", "13"), ("b", "81")]).unwrap()
@@ -299,6 +311,67 @@ mod test {
             Request::new("Sum", arguments).into_box(),
             Err(Error::ReservedKey(key)) if key == b"_answer"
         ));
+    }
+
+    #[test]
+    fn request_from_box_strips_reserved_keys() {
+        let amp_box = AmpBox::from_pairs([
+            ("_command", "Sum"),
+            ("_ask", "1"),
+            ("_error_code", "UNKNOWN"),
+            ("a", "1"),
+        ])
+        .unwrap();
+        let request = Request::from_box(amp_box).unwrap();
+        assert_eq!(request.command, b"Sum");
+        assert_eq!(request.ask.as_deref(), Some(&b"1"[..]));
+        assert_eq!(request.arguments, AmpBox::from_pairs([("a", "1")]).unwrap());
+        let mut pairs: Vec<_> = request
+            .into_box()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            [
+                (b"_ask".to_vec(), b"1".to_vec()),
+                (b"_command".to_vec(), b"Sum".to_vec()),
+                (b"a".to_vec(), b"1".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn answer_from_box_strips_reserved_keys() {
+        let amp_box = AmpBox::from_pairs([
+            ("_answer", "1"),
+            ("_command", "Sum"),
+            ("_error_description", "nope"),
+            ("total", "94"),
+        ])
+        .unwrap();
+        let answer = Answer::from_box(amp_box).unwrap();
+        assert_eq!(answer.answer, b"1");
+        assert_eq!(
+            answer.results,
+            AmpBox::from_pairs([("total", "94")]).unwrap()
+        );
+        let mut pairs: Vec<_> = answer
+            .into_box()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            [
+                (b"_answer".to_vec(), b"1".to_vec()),
+                (b"total".to_vec(), b"94".to_vec()),
+            ]
+        );
     }
 
     #[test]

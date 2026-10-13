@@ -70,6 +70,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # Ctrl-C.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+# Compiles the `#[command]` cases under tests/ui and checks the compiler's
+# output, which needs cargo and so cannot run inside WebAssembly.
+trybuild = "1"
 
 [package.metadata.docs.rs]
 all-features = true

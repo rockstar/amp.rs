@@ -220,6 +220,37 @@ impl Handle for Flaky {
     }
 }
 
+/// Answers with a result whose key is reserved for the protocol, which no
+/// handler should do, but which the server must survive.
+#[derive(Serialize, Deserialize)]
+#[command(response = Reserved)]
+struct Hijack {}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Reserved {
+    #[serde(rename = "_ask")]
+    ask: String,
+}
+
+impl Handle for Hijack {
+    async fn handle(self) -> Result<Reserved, Error> {
+        Ok(Reserved {
+            ask: "stolen".into(),
+        })
+    }
+}
+
+/// Another command that claims the name `Sum` on the wire.
+#[derive(Serialize, Deserialize)]
+#[command(name = "Sum", response = Total)]
+struct SecondSum {}
+
+impl Handle for SecondSum {
+    async fn handle(self) -> Result<Total, Error> {
+        Ok(Total { total: 0 })
+    }
+}
+
 /// A command whose handler reports that it has started and then waits to
 /// be let go, so a test can hold a request in flight for as long as it
 /// needs without guessing at timing.
@@ -367,6 +398,57 @@ async fn middleware_errors_reach_the_peer_as_unknown() {
     assert_eq!(total.total, 3);
 }
 
+/// A handler's own error must come back out of the boxed error type that
+/// middleware wraps it in, with its code intact, rather than being read as
+/// some other error and answered as `UNKNOWN`.
+#[tokio::test]
+async fn handler_errors_pass_through_middleware_unchanged() {
+    let service = ServiceBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .service(router());
+    let client = connect(service);
+    let failed = client
+        .call(&Divide {
+            numerator: 1,
+            denominator: 0,
+        })
+        .await;
+    assert!(
+        matches!(
+            failed,
+            Err(Error::Command { ref code, ref description })
+                if code == "ZERO_DIVISION" && description == "cannot divide by zero"
+        ),
+        "{failed:?}"
+    );
+}
+
+/// Results that use a reserved key cannot go on the wire as an answer. The
+/// peer still gets a reply, as `UNKNOWN`, and the connection carries on.
+#[tokio::test]
+async fn results_with_a_reserved_key_are_answered_with_unknown() {
+    let client = connect(Router::new().command::<Hijack>().command::<Sum>());
+    let failed = tokio::time::timeout(Duration::from_secs(2), client.call(&Hijack {}))
+        .await
+        .expect("no answer: the unsendable results were dropped");
+    assert!(
+        matches!(
+            failed,
+            Err(Error::Command { ref code, ref description })
+                if code == "UNKNOWN" && description == "internal error"
+        ),
+        "{failed:?}"
+    );
+    let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
+    assert_eq!(total.total, 3);
+}
+
+#[test]
+#[should_panic(expected = "command \"Sum\" registered twice")]
+fn registering_a_command_name_twice_panics() {
+    Router::new().command::<Sum>().command::<SecondSum>();
+}
+
 #[tokio::test]
 async fn client_is_a_service() {
     let mut client = connect(router());
@@ -401,15 +483,6 @@ async fn the_client_assigns_every_ask() {
     let (slow, fast) = tokio::join!(slow, fast);
     slow.unwrap();
     assert_eq!(fast.unwrap().get("total"), Some(&b"3"[..]));
-}
-
-#[tokio::test]
-async fn a_closed_connection_fails_calls() {
-    let (client_io, server_io) = tokio::io::duplex(64);
-    drop(server_io);
-    let client = Client::new(client_io);
-    let failed = client.call(&Sum { a: 1, b: 2 }).await;
-    assert!(peer_closed(&failed), "{failed:?}");
 }
 
 #[tokio::test]

@@ -58,8 +58,13 @@ where
         }
     }
 
-    /// Serves the command `C`, replacing any earlier command with the same
-    /// name.
+    /// Serves the command `C`.
+    ///
+    /// # Panics
+    ///
+    /// If a command with the same name is already registered. Two commands
+    /// cannot share a name on the wire, and the second one silently winning
+    /// is a bug that is easier to find at startup than later.
     pub fn command<C>(mut self) -> Self
     where
         C: HandleWith<S> + DeserializeOwned + Send + 'static,
@@ -76,7 +81,9 @@ where
         };
         // The table is only shared once the router has been cloned, so this
         // copies nothing in the usual builder chain.
-        Arc::make_mut(&mut self.handlers).insert(C::NAME.as_bytes().to_vec(), Arc::new(handler));
+        let replaced = Arc::make_mut(&mut self.handlers)
+            .insert(C::NAME.as_bytes().to_vec(), Arc::new(handler));
+        assert!(replaced.is_none(), "command {:?} registered twice", C::NAME);
         self
     }
 }

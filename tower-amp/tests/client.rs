@@ -9,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::DuplexStream;
 use tokio_util::codec::Framed;
+use tower::Service;
 use tower_amp::{AmpCodec, Client, Error, command};
 
 #[derive(Serialize)]
@@ -116,12 +117,118 @@ async fn an_unanswered_call_times_out() {
     .await;
 }
 
+/// A client whose peer is the test itself, framed, so that a test can read
+/// exactly what the client wrote and write anything back.
+fn with_framed_peer() -> (Client, Framed<DuplexStream, AmpCodec>) {
+    let (client_io, peer_io) = tokio::io::duplex(4096);
+    let client = Client::new(client_io).with_timeout(Duration::from_millis(200));
+    (client, Framed::new(peer_io, AmpCodec::new()))
+}
+
+/// The next box the client writes. Fails rather than waits forever if the
+/// client writes nothing, so a broken branch fails the test instead of
+/// hanging it.
+async fn next_box(peer: &mut Framed<DuplexStream, AmpCodec>) -> AmpBox {
+    tokio::time::timeout(Duration::from_secs(2), peer.next())
+        .await
+        .expect("the client wrote nothing")
+        .expect("the client closed the connection")
+        .unwrap()
+}
+
+/// Everything the client writes before it closes the connection.
+async fn drain(peer: &mut Framed<DuplexStream, AmpCodec>) -> Vec<AmpBox> {
+    let mut written = Vec::new();
+    let all = async {
+        while let Some(amp_box) = peer.next().await {
+            written.push(amp_box.unwrap());
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(2), all)
+        .await
+        .expect("the client did not close the connection");
+    written
+}
+
 #[tokio::test]
 async fn a_notification_is_written_and_not_answered() {
-    with_peer(|client| async move {
-        client.notify(&Sum { a: 1, b: 1 }).await.unwrap();
+    let (client, mut peer) = with_framed_peer();
+    client.notify(&Sum { a: 1, b: 1 }).await.unwrap();
+    // Closing the client ends the connection once the writer is done, so
+    // the peer reads everything the client wrote and then end of stream.
+    drop(client);
+    let written = drain(&mut peer).await;
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert_eq!(written[0].get("_command"), Some(&b"Sum"[..]));
+    assert_eq!(written[0].get("a"), Some(&b"1"[..]));
+    assert!(!written[0].contains_key("_ask"), "{written:?}");
+}
+
+/// A request from the peer that wants an answer is refused as `UNHANDLED`.
+#[tokio::test]
+async fn a_request_from_the_peer_is_refused() {
+    let (client, mut peer) = with_framed_peer();
+    let request = Request::new("Sum", AmpBox::new()).with_ask("7");
+    peer.send(request.into_box().unwrap()).await.unwrap();
+    let refusal = next_box(&mut peer).await;
+    assert_eq!(refusal.get("_error"), Some(&b"7"[..]));
+    assert_eq!(refusal.get("_error_code"), Some(&b"UNHANDLED"[..]));
+    assert!(refusal.contains_key("_error_description"), "{refusal:?}");
+    // The connection is still good.
+    drop(peer);
+    let failed = client.call(&Sum { a: 1, b: 2 }).await;
+    assert!(
+        matches!(failed, Err(Error::ConnectionClosed { .. })),
+        "{failed:?}"
+    );
+}
+
+/// A request from the peer that wants no answer gets none: the refusal of
+/// the request with an `_ask` sent after it is the first thing written.
+#[tokio::test]
+async fn a_notification_from_the_peer_is_ignored() {
+    let (client, mut peer) = with_framed_peer();
+    let silent = Request::new("Sum", AmpBox::new());
+    peer.send(silent.into_box().unwrap()).await.unwrap();
+    let asked = Request::new("Sum", AmpBox::new()).with_ask("8");
+    peer.send(asked.into_box().unwrap()).await.unwrap();
+    let refusal = next_box(&mut peer).await;
+    assert_eq!(refusal.get("_error"), Some(&b"8"[..]));
+    // Nothing else was written on the notification's account.
+    drop(client);
+    assert!(drain(&mut peer).await.is_empty());
+}
+
+/// A request handed to the client as a service, whose arguments use a key
+/// the protocol reserves, fails without reaching the wire and without
+/// harming the connection.
+#[tokio::test]
+async fn a_request_with_a_reserved_argument_fails_locally() {
+    with_peer(|mut client| async move {
+        let mut arguments = AmpBox::new();
+        arguments.insert("_answer", "no").unwrap();
+        let request = Request::new("Sum", arguments.clone()).with_ask("x");
+        let failed = Service::call(&mut client, request).await;
+        assert_reserved(&failed, b"_answer");
+        // The same for a request that wants no answer.
+        let request = Request::new("Sum", arguments);
+        let failed = Service::call(&mut client, request).await;
+        assert_reserved(&failed, b"_answer");
+        // The connection is still good.
+        let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
+        assert_eq!(total, Total { total: 3 });
     })
     .await;
+}
+
+fn assert_reserved<T: std::fmt::Debug>(result: &Result<T, Error>, expected: &[u8]) {
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(amp_protocol::Error::ReservedKey(key))) if key == expected
+        ),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]

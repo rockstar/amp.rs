@@ -1,5 +1,19 @@
 # Publish one workspace crate to crates.io when its release tag is pushed.
-# Tags are named `<crate>-<version>`, for example `serde_amp-0.3.0`.
+# Tags are named `<crate>-<version>`, for example `serde_amp-0.3.0`, and are
+# normally created by ./release.sh (see DEVELOPING.md).
+#
+# Authentication uses crates.io Trusted Publishing, so no token is stored
+# here. It must be registered once per crate by a crate owner, at
+# https://crates.io/crates/<crate>/settings/new-trusted-publisher, with:
+#
+#   Repository owner    rockstar
+#   Repository name     amp.rs
+#   Workflow filename   release.yml
+#   Environment         release
+#
+# A brand-new crate cannot use trusted publishing for its very first release:
+# publish it once by hand with `cargo publish -p <crate>` and an API token,
+# then register it as above.
 name: release
 
 on:

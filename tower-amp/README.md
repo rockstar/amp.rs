@@ -1,7 +1,7 @@
 tower-amp
 ==
 
-![build-and-check](https://github.com/rockstar/serde_amp/actions/workflows/build-and-check.yml/badge.svg) ![crates.io](https://img.shields.io/crates/v/tower-amp.svg) ![docs.rs](https://docs.rs/tower-amp/badge.svg)
+![build-and-check](https://github.com/rockstar/amp.rs/actions/workflows/build-and-check.yml/badge.svg) ![crates.io](https://img.shields.io/crates/v/tower-amp.svg) ![docs.rs](https://docs.rs/tower-amp/badge.svg)
 
 Servers and clients for [Asynchronous Messaging Protocol](https://amp-protocol.net/)
 (AMP), the key/value remoting protocol from Twisted, built on

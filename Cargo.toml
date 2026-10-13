@@ -14,7 +14,7 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["Paul Hummer <paul@eventuallyanyway.com>"]
 license = "MIT"
-repository = "https://github.com/rockstar/serde_amp"
+repository = "https://github.com/rockstar/amp.rs"
 
 [workspace.dependencies]
 bytes = "1"

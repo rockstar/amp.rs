@@ -1,7 +1,7 @@
 serde_amp
 ==
 
-![build-and-check](https://github.com/rockstar/serde_amp/actions/workflows/build-and-check.yml/badge.svg) ![crates.io](https://img.shields.io/crates/v/serde_amp.svg) ![docs.rs](https://docs.rs/serde_amp/badge.svg)
+![build-and-check](https://github.com/rockstar/amp.rs/actions/workflows/build-and-check.yml/badge.svg) ![crates.io](https://img.shields.io/crates/v/serde_amp.svg) ![docs.rs](https://docs.rs/serde_amp/badge.svg)
 
 [serde](https://serde.rs) support for [Asynchronous Messaging Protocol](https://amp-protocol.net/)
 (AMP), the key/value remoting protocol from Twisted.

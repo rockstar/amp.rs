@@ -1,7 +1,7 @@
 amp-protocol
 ==
 
-![build-and-check](https://github.com/rockstar/serde_amp/actions/workflows/build-and-check.yml/badge.svg) ![crates.io](https://img.shields.io/crates/v/amp-protocol.svg) ![docs.rs](https://docs.rs/amp-protocol/badge.svg)
+![build-and-check](https://github.com/rockstar/amp.rs/actions/workflows/build-and-check.yml/badge.svg) ![crates.io](https://img.shields.io/crates/v/amp-protocol.svg) ![docs.rs](https://docs.rs/amp-protocol/badge.svg)
 
 The wire format and message types of [Asynchronous Messaging Protocol](https://amp-protocol.net/)
 (AMP), the key/value remoting protocol from Twisted.

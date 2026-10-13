@@ -1,7 +1,7 @@
 serde_amp
 ==
 
-![build-and-check](https://github.com/rockstar/serde_amp/actions/workflows/build-and-check.yml/badge.svg)
+![build-and-check](https://github.com/rockstar/amp.rs/actions/workflows/build-and-check.yml/badge.svg)
 
 Rust tooling for [Asynchronous Messaging Protocol](https://amp-protocol.net/)
 (AMP), the key/value remoting protocol from Twisted.

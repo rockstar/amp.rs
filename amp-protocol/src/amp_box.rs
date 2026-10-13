@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::{Error, MAX_KEY_LENGTH, MAX_VALUE_LENGTH};
 
 /// One AMP packet: an ordered collection of key/value pairs, each a byte
@@ -134,13 +136,14 @@ impl AmpBox {
     /// 255. A key that repeats within one box keeps the last value, matching
     /// the reference implementation.
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
-        let mut amp_box = Self::new();
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut keys = Keys::new();
         let mut pos = 0;
         loop {
             let key_len = read_u16(bytes, pos)?;
             pos += 2;
             if key_len == 0 {
-                return Ok((amp_box, pos));
+                return Ok((AmpBox { entries }, pos));
             }
             if key_len > MAX_KEY_LENGTH {
                 return Err(Error::KeyTooLong { len: key_len });
@@ -153,7 +156,118 @@ impl AmpBox {
             let value = read_slice(bytes, pos, value_len)?;
             pos += value_len;
 
-            amp_box.insert_unchecked(key.to_vec(), value.to_vec());
+            match keys.position(key) {
+                Some(index) => {
+                    let existing = &mut entries[index].1;
+                    existing.clear();
+                    existing.extend_from_slice(value);
+                }
+                None => {
+                    keys.push(key, entries.len());
+                    entries.push((key.to_vec(), value.to_vec()));
+                }
+            }
+        }
+    }
+}
+
+/// The keys seen so far while decoding a box, and where each one sits in the
+/// entries, so a repeated key can overwrite its value in place.
+///
+/// Boxes are usually a handful of pairs, for which a linear scan over key
+/// slices held on the stack beats hashing and costs no allocation. Once a box
+/// outgrows that, a hash index takes over so a large box costs one lookup per
+/// pair instead of a scan per pair.
+// The linear variant is a few hundred bytes larger than the map. It lives on
+// the stack for the length of one decode, and keeping it there is the point.
+#[allow(clippy::large_enum_variant)]
+enum Keys<'a> {
+    Linear {
+        keys: [&'a [u8]; LINEAR_SCAN_LIMIT],
+        len: usize,
+    },
+    Indexed(HashMap<&'a [u8], usize>),
+}
+
+/// The most keys worth scanning linearly before building a hash index.
+const LINEAR_SCAN_LIMIT: usize = 16;
+
+impl<'a> Keys<'a> {
+    fn new() -> Self {
+        Keys::Linear {
+            keys: [&[]; LINEAR_SCAN_LIMIT],
+            len: 0,
+        }
+    }
+
+    /// The index of the entry holding `key`, if it has been seen before.
+    fn position(&self, key: &[u8]) -> Option<usize> {
+        match self {
+            Keys::Linear { keys, len } => keys[..*len].iter().position(|k| *k == key),
+            Keys::Indexed(index) => index.get(key).copied(),
+        }
+    }
+
+    /// Records that `key` is held by the entry at `index`. Keys are pushed in
+    /// entry order, so in the linear form the position is the index.
+    fn push(&mut self, key: &'a [u8], index: usize) {
+        match self {
+            Keys::Linear { keys, len } if *len < LINEAR_SCAN_LIMIT => {
+                keys[*len] = key;
+                *len += 1;
+            }
+            Keys::Linear { keys, .. } => {
+                let mut map = HashMap::with_capacity(LINEAR_SCAN_LIMIT * 2);
+                map.extend(keys.iter().copied().zip(0..));
+                map.insert(key, index);
+                *self = Keys::Indexed(map);
+            }
+            Keys::Indexed(map) => {
+                map.insert(key, index);
+            }
+        }
+    }
+}
+
+/// Where a scan of the box at the front of a buffer stopped.
+#[cfg(feature = "tokio")]
+pub(crate) enum Frame {
+    /// The whole box, terminator included, is present and this long.
+    Complete(usize),
+    /// The box runs past the end of the buffer. This many bytes of it are
+    /// whole pairs, so a later scan can resume there once more arrive.
+    Incomplete(usize),
+}
+
+/// Walks the pairs of the box at the front of `bytes` without decoding or
+/// copying them, to find where it ends. Starts at `from`, which must be a
+/// pair boundary within that box: zero, or the position a previous
+/// [`Frame::Incomplete`] reported for the same buffer.
+///
+/// Fails with [`Error::KeyTooLong`] as [`AmpBox::decode`] would, so a
+/// malformed box is rejected as soon as the bad length prefix arrives.
+#[cfg(feature = "tokio")]
+pub(crate) fn scan_frame(bytes: &[u8], from: usize) -> Result<Frame, Error> {
+    let mut pos = from;
+    loop {
+        let start = pos;
+        let Ok(key_len) = read_u16(bytes, pos) else {
+            return Ok(Frame::Incomplete(start));
+        };
+        pos += 2;
+        if key_len == 0 {
+            return Ok(Frame::Complete(pos));
+        }
+        if key_len > MAX_KEY_LENGTH {
+            return Err(Error::KeyTooLong { len: key_len });
+        }
+        pos += key_len;
+        let Ok(value_len) = read_u16(bytes, pos) else {
+            return Ok(Frame::Incomplete(start));
+        };
+        pos += 2 + value_len;
+        if pos > bytes.len() {
+            return Ok(Frame::Incomplete(start));
         }
     }
 }
@@ -325,10 +439,111 @@ mod test {
         assert_eq!(amp_box.get("k"), Some(&b"2"[..]));
     }
 
+    /// Encodes one pair by hand, since `AmpBox` will not hold a duplicate.
+    fn pair(key: &str, value: &str) -> Vec<u8> {
+        let mut out = (key.len() as u16).to_be_bytes().to_vec();
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value.as_bytes());
+        out
+    }
+
+    /// A box with more keys than the linear scan covers switches to the hash
+    /// index part way through. Duplicates of keys seen before and after the
+    /// switch must both overwrite the earlier value in its original position.
+    #[test]
+    fn decode_keeps_last_duplicate_past_the_linear_scan_limit() {
+        let keys = LINEAR_SCAN_LIMIT * 3;
+        let last = format!("k{}", keys - 1);
+        let switch = format!("k{LINEAR_SCAN_LIMIT}");
+        let mut bytes = Vec::new();
+        for i in 0..keys {
+            bytes.extend(pair(&format!("k{i}"), "old"));
+        }
+        bytes.extend(pair("k0", "first"));
+        bytes.extend(pair(&switch, "at switch"));
+        bytes.extend(pair(&last, "last"));
+        bytes.extend([0, 0]);
+
+        let (amp_box, consumed) = AmpBox::decode(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(amp_box.len(), keys);
+        let order: Vec<_> = amp_box.iter().map(|(k, _)| k).collect();
+        let expected: Vec<_> = (0..keys).map(|i| format!("k{i}")).collect();
+        assert_eq!(
+            order,
+            expected.iter().map(String::as_bytes).collect::<Vec<_>>()
+        );
+        assert_eq!(amp_box.get("k0"), Some(&b"first"[..]));
+        assert_eq!(amp_box.get("k1"), Some(&b"old"[..]));
+        assert_eq!(amp_box.get(&switch), Some(&b"at switch"[..]));
+        assert_eq!(amp_box.get(&last), Some(&b"last"[..]));
+    }
+
     #[test]
     fn decode_accepts_non_utf8() {
         let (amp_box, _) = AmpBox::decode(b"\x00\x02\xff\xfe\x00\x02\x00\x01\x00\x00").unwrap();
         assert_eq!(amp_box.get(b"\xff\xfe"), Some(&b"\x00\x01"[..]));
+    }
+
+    /// The pair boundaries of `SUM_REQUEST`, excluding the terminator.
+    #[cfg(feature = "tokio")]
+    const SUM_REQUEST_PAIRS: [usize; 5] = [0, 9, 24, 31, 38];
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn scan_frame_finds_the_end_of_the_box() {
+        assert!(matches!(
+            scan_frame(SUM_REQUEST, 0),
+            Ok(Frame::Complete(40))
+        ));
+        assert!(matches!(
+            scan_frame(b"\x00\x00rest", 0),
+            Ok(Frame::Complete(2))
+        ));
+        let mut stream = SUM_REQUEST.to_vec();
+        stream.extend_from_slice(SUM_REQUEST);
+        assert!(matches!(scan_frame(&stream, 0), Ok(Frame::Complete(40))));
+    }
+
+    /// At every truncation the scan stops at the start of the pair that is
+    /// cut off, and resuming from any earlier boundary agrees with a scan
+    /// from the start.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn scan_frame_stops_at_the_last_whole_pair() {
+        for len in 0..SUM_REQUEST.len() {
+            let bytes = &SUM_REQUEST[..len];
+            let expected = SUM_REQUEST_PAIRS
+                .into_iter()
+                .rev()
+                .find(|&b| b <= len)
+                .unwrap();
+            for from in SUM_REQUEST_PAIRS.into_iter().filter(|&b| b <= expected) {
+                assert!(
+                    matches!(scan_frame(bytes, from), Ok(Frame::Incomplete(at)) if at == expected),
+                    "truncated to {len} bytes, scanning from {from}"
+                );
+            }
+        }
+        assert!(matches!(
+            scan_frame(SUM_REQUEST, 38),
+            Ok(Frame::Complete(40))
+        ));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn scan_frame_rejects_key_longer_than_255() {
+        let bytes = b"\x00\x01k\x00\x01v\x01\x00";
+        assert!(matches!(
+            scan_frame(bytes, 0),
+            Err(Error::KeyTooLong { len: 256 })
+        ));
+        assert!(matches!(
+            scan_frame(bytes, 6),
+            Err(Error::KeyTooLong { len: 256 })
+        ));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
+use crate::amp_box::{scan_frame, Frame};
 use crate::{AmpBox, Error};
 
 /// Splits a byte stream into boxes and writes boxes back out.
@@ -24,9 +25,19 @@ use crate::{AmpBox, Error};
 /// [`Error::FrameTooLong`] rather than buffer without bound. The default
 /// limit is 16 MiB; [`with_max_frame_length`](AmpCodec::with_max_frame_length)
 /// sets another.
+///
+/// While a box is still arriving, the codec remembers how much of it has
+/// already been checked, so each call scans only the new bytes and the box is
+/// decoded exactly once, when it is complete. That makes a codec specific to
+/// one stream: use a fresh one per connection, as [`Framed`] does.
+///
+/// [`Framed`]: tokio_util::codec::Framed
 #[derive(Clone, Copy, Debug)]
 pub struct AmpCodec {
     max_frame_length: usize,
+    /// How many bytes at the front of the buffer have been scanned and found
+    /// to be whole pairs of a box whose terminator has not arrived yet.
+    scanned: usize,
 }
 
 /// The frame length [`AmpCodec::new`] allows: 16 MiB, room for a box of a
@@ -49,7 +60,10 @@ impl AmpCodec {
     /// value is at most 65,535 bytes and each key at most 255, so the length
     /// is bounded by the number of pairs a box carries.
     pub fn with_max_frame_length(max_frame_length: usize) -> Self {
-        AmpCodec { max_frame_length }
+        AmpCodec {
+            max_frame_length,
+            scanned: 0,
+        }
     }
 }
 
@@ -64,27 +78,69 @@ impl Decoder for AmpCodec {
     type Error = Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<AmpBox>, Error> {
-        match AmpBox::decode(src) {
-            Ok((amp_box, consumed)) => {
-                if consumed > self.max_frame_length {
+        if self.scanned == 0 {
+            // Most boxes arrive whole, so decode in one pass when nothing of
+            // this box has been seen before. If it turns out to be incomplete
+            // the wasted work is bounded by the bytes already here, and later
+            // calls scan from where this one stopped instead of retrying, so
+            // a box that trickles in is still decoded only once in full.
+            match AmpBox::decode(src) {
+                Ok((amp_box, consumed)) => return self.accept(src, amp_box, consumed),
+                Err(Error::Incomplete) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        match scan_frame(src, self.scanned) {
+            Ok(Frame::Complete(len)) => {
+                self.scanned = 0;
+                if len > self.max_frame_length {
                     return Err(Error::FrameTooLong {
                         limit: self.max_frame_length,
                     });
                 }
-                src.advance(consumed);
-                Ok(Some(amp_box))
+                // The scan proved the box ends at `len`, so this decode sees
+                // exactly one complete box and cannot report it incomplete.
+                let (amp_box, consumed) = AmpBox::decode(&src[..len])?;
+                self.accept(src, amp_box, consumed)
             }
-            // Every byte in `src` belongs to this box, since the ones before
-            // it were consumed. Once there are more than the limit, this box
-            // can never be accepted, so stop buffering it.
-            Err(Error::Incomplete) if src.len() > self.max_frame_length => {
-                Err(Error::FrameTooLong {
-                    limit: self.max_frame_length,
-                })
+            Ok(Frame::Incomplete(scanned)) => {
+                // Every byte in `src` belongs to this box, since the ones
+                // before it were consumed. Once there are more than the
+                // limit, this box can never be accepted, so stop buffering it.
+                if src.len() > self.max_frame_length {
+                    self.scanned = 0;
+                    return Err(Error::FrameTooLong {
+                        limit: self.max_frame_length,
+                    });
+                }
+                self.scanned = scanned;
+                Ok(None)
             }
-            Err(Error::Incomplete) => Ok(None),
-            Err(err) => Err(err),
+            Err(err) => {
+                self.scanned = 0;
+                Err(err)
+            }
         }
+    }
+}
+
+impl AmpCodec {
+    /// Hands over a box decoded from the front of `src`, consuming its bytes,
+    /// unless it is longer than the limit.
+    fn accept(
+        &mut self,
+        src: &mut BytesMut,
+        amp_box: AmpBox,
+        consumed: usize,
+    ) -> Result<Option<AmpBox>, Error> {
+        self.scanned = 0;
+        if consumed > self.max_frame_length {
+            return Err(Error::FrameTooLong {
+                limit: self.max_frame_length,
+            });
+        }
+        src.advance(consumed);
+        Ok(Some(amp_box))
     }
 }
 
@@ -207,6 +263,67 @@ mod test {
         let mut buf = BytesMut::from(SUM_REQUEST);
         assert!(codec.decode(&mut buf).unwrap().is_some());
         assert!(buf.is_empty());
+    }
+
+    /// A large box that trickles in is checked incrementally: each call
+    /// scans only from the pair boundary where the last one stopped, and the
+    /// box is decoded once, when it is complete.
+    #[test]
+    fn chunked_box_is_scanned_incrementally() {
+        const PAIR_LEN: usize = 2 + 4 + 2 + 100;
+        let mut amp_box = AmpBox::new();
+        for i in 0..1000u32 {
+            amp_box
+                .insert(format!("k{i:03}"), vec![i as u8; 100])
+                .unwrap();
+        }
+        let bytes = amp_box.encode();
+
+        let mut codec = AmpCodec::new();
+        let mut buf = BytesMut::new();
+        let mut decoded = None;
+        // A chunk size that never lines up with a pair.
+        for chunk in bytes.chunks(97) {
+            buf.extend_from_slice(chunk);
+            match codec.decode(&mut buf).unwrap() {
+                Some(amp_box) => decoded = Some(amp_box),
+                None => {
+                    assert_eq!(codec.scanned % PAIR_LEN, 0, "scan stops at a pair boundary");
+                    assert!(
+                        buf.len() - codec.scanned < PAIR_LEN,
+                        "scan covers every whole pair"
+                    );
+                }
+            }
+        }
+        assert_eq!(decoded.unwrap(), amp_box);
+        assert!(buf.is_empty());
+        assert_eq!(codec.scanned, 0);
+    }
+
+    /// The scan position belongs to one box. It is dropped once that box is
+    /// decoded or rejected, so the next box starts from its first byte.
+    #[test]
+    fn scan_position_is_reset_after_a_box_or_an_error() {
+        let mut codec = AmpCodec::new();
+        let mut buf = BytesMut::new();
+
+        buf.extend_from_slice(&SUM_REQUEST[..12]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert_eq!(codec.scanned, 9, "the first pair is 9 bytes");
+        buf.extend_from_slice(&SUM_REQUEST[12..]);
+        assert!(codec.decode(&mut buf).unwrap().is_some());
+        assert_eq!(codec.scanned, 0);
+
+        buf.extend_from_slice(PAIR);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert_eq!(codec.scanned, PAIR.len());
+        buf.extend_from_slice(b"\x01\x00");
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(Error::KeyTooLong { len: 256 })
+        ));
+        assert_eq!(codec.scanned, 0);
     }
 
     /// The limit is per box, not per buffer: several boxes that together

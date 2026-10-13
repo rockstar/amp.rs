@@ -25,8 +25,15 @@ bytes = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 
 [dev-dependencies]
+divan = "0.1"
 # Only for the `codec` doctest, which shows `Framed` over a tokio stream.
 tokio = { workspace = true }
+
+[[bench]]
+name = "decode"
+harness = false
+# The bench drives the codec, so it only builds with the `tokio` feature.
+required-features = ["tokio"]
 
 [package.metadata.docs.rs]
 all-features = true

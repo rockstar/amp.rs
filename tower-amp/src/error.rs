@@ -7,8 +7,13 @@ use amp_protocol::ErrorResponse;
 ///
 /// A handler fails a command by returning [`Error::new`] with the code and
 /// description the peer should see, or by returning any other variant, which
-/// goes on the wire with the code `UNKNOWN`. A client receives the peer's
-/// code and description back as [`Error::Command`].
+/// goes on the wire with the code `UNKNOWN`. Of those, only
+/// [`Error::Deserialize`] takes its message with it, since it is about the
+/// peer's own request; the rest are answered with the description
+/// `internal error`, so that nothing about this side's internals reaches
+/// the peer. The error itself is logged when the `tracing` feature is on. A
+/// client receives the peer's code and description back as
+/// [`Error::Command`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -48,6 +53,11 @@ pub enum Error {
     Timeout,
 }
 
+/// The description a peer sees for an error that is about this side rather
+/// than its request. Only a server answers with an error.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) const INTERNAL_ERROR: &str = "internal error";
+
 impl Error {
     /// Fails a command with `code` and `description`.
     pub fn new(code: impl Into<String>, description: impl Into<String>) -> Self {
@@ -82,11 +92,19 @@ impl Error {
 
     /// The description that goes on the wire. Only a server answers with an
     /// error.
+    ///
+    /// A command error carries the description the handler chose, and a
+    /// deserialize error its message, which tells the peer its request did
+    /// not match the command's schema. Any other error is about this side,
+    /// not the request: an I/O error names hosts, a panic message says what
+    /// the handler was doing. A peer, who may be anyone, gets a fixed
+    /// description instead, and the error goes to the log.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn description(&self) -> String {
         match self {
             Error::Command { description, .. } => description.clone(),
-            other => other.to_string(),
+            Error::Deserialize(_) => self.to_string(),
+            _ => INTERNAL_ERROR.to_string(),
         }
     }
 }

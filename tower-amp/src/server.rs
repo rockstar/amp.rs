@@ -13,6 +13,7 @@ use tokio_util::codec::Framed;
 use tower::{Service, ServiceExt};
 
 use crate::Error;
+use crate::error::INTERNAL_ERROR;
 
 /// How many requests one connection may have in flight: received and not
 /// yet answered. Past this the connection stops reading until a reply has
@@ -33,8 +34,10 @@ const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 /// because the process is briefly out of file descriptors, is skipped and
 /// the loop carries on; anything else, such as the listener being closed,
 /// ends `serve` with that error. An error on one connection ends that
-/// connection and is discarded; call [`serve_connection`] from your own
-/// accept loop to observe those errors.
+/// connection. With the `tracing` feature, a skipped accept error and a
+/// connection's error are logged; without it they are discarded, and
+/// calling [`serve_connection`] from your own accept loop is the way to
+/// observe the latter.
 ///
 /// Each connection uses a default [`AmpCodec`], which refuses a box longer
 /// than 16 MiB; [`serve_with_codec`] takes another.
@@ -65,6 +68,7 @@ where
             Ok(accepted) => accepted,
             Err(err) => match retry_after(&err) {
                 Some(delay) => {
+                    log::accept_skipped(&err);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -73,7 +77,9 @@ where
         };
         let service = service.clone();
         tokio::spawn(async move {
-            let _ = serve_connection_with_codec(stream, service, codec).await;
+            if let Err(err) = serve_connection_with_codec(stream, service, codec).await {
+                log::connection_failed(&err);
+            }
         });
     }
 }
@@ -121,11 +127,15 @@ fn out_of_descriptors(err: &io::Error) -> bool {
 /// order they finish, as the protocol allows. At most 256 requests are in
 /// flight on a connection at once; past that it stops reading until one has
 /// been answered, which a peer sees as ordinary backpressure on its writes.
-/// A request without `_ask` gets no reply. A failed request is answered with the error's code and
-/// description, or with `UNKNOWN` for an error that has no code. A request
-/// whose handler panics is answered with `UNKNOWN` and the panic's message,
-/// and the connection carries on. Answers and errors the peer sends, which
-/// would belong to commands this side had called, are ignored.
+/// A request without `_ask` gets no reply. A failed request is answered with
+/// the error's code and description, or with `UNKNOWN` for an error that has
+/// no code; see [`Error`] for which of those carry their message to the peer.
+/// A request whose handler panics is answered with `UNKNOWN` and the
+/// description `internal error`, and the connection carries on. With the
+/// `tracing` feature, every failure is logged with the command's name, the
+/// error or the panic's message; without it, a failure the peer did not ask
+/// to hear about is discarded. Answers and errors the peer sends, which would
+/// belong to commands this side had called, are ignored.
 ///
 /// Returns once the peer closes the connection and every request already
 /// received has been answered, or with the error that ended the connection.
@@ -211,6 +221,7 @@ async fn respond<S>(
     S::Error: Into<Error>,
     S::Future: Send,
 {
+    let command = request.command.clone();
     let ask = request.ask.clone();
     // The service runs on a task of its own so that a handler that panics
     // takes down only that task. This one survives to answer the request,
@@ -220,8 +231,18 @@ async fn respond<S>(
         service.call(request).await.map_err(Into::into)
     });
     let result = match call.await {
-        Ok(result) => result,
-        Err(err) => Err(panicked(err)),
+        Ok(Ok(results)) => Ok(results),
+        Ok(Err(err)) => {
+            log::command_failed(&command, ask.as_deref(), &err);
+            Err(err)
+        }
+        Err(err) => {
+            // The panic's message is for the log only: it says what the
+            // handler was doing, which is this side's business, not the
+            // peer's.
+            log::command_panicked(&command, ask.as_deref(), &panicked(err));
+            Err(Error::new(ErrorResponse::UNKNOWN, INTERNAL_ERROR))
+        }
     };
     let Some(ask) = ask else {
         return;
@@ -229,18 +250,21 @@ async fn respond<S>(
     let response = match result {
         Ok(results) => match Answer::new(ask.clone(), results).into_box() {
             Ok(response) => response,
-            Err(err) => error_response(ask, &Error::Protocol(err)),
+            Err(err) => {
+                let err = Error::Protocol(err);
+                log::command_failed(&command, Some(&ask), &err);
+                error_response(ask, &err)
+            }
         },
         Err(err) => error_response(ask, &err),
     };
     let _ = responses.send(response).await;
 }
 
-/// The error a handler that did not finish is answered with. A panic's
-/// message, when it has one, goes in the description, since the peer has no
-/// other way to learn what went wrong.
-fn panicked(err: JoinError) -> Error {
-    let description = match err.try_into_panic() {
+/// What a handler that did not finish has to say for itself: the panic's
+/// message, when it has one.
+fn panicked(err: JoinError) -> String {
+    match err.try_into_panic() {
         Ok(payload) => match payload.downcast_ref::<&str>() {
             Some(message) => format!("command panicked: {message}"),
             None => match payload.downcast_ref::<String>() {
@@ -249,8 +273,7 @@ fn panicked(err: JoinError) -> Error {
             },
         },
         Err(_) => "command was cancelled".to_string(),
-    };
-    Error::new(ErrorResponse::UNKNOWN, description)
+    }
 }
 
 /// Builds the error box for `ask`. A code or description longer than a box
@@ -280,6 +303,207 @@ fn fit(s: &str) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// What a server has to say about failures the peer does not hear about in
+/// full. Each function is an event with the `tracing` feature, and nothing
+/// without it, so the callers need no `cfg`.
+#[cfg(feature = "tracing")]
+mod log {
+    use std::borrow::Cow;
+    use std::io;
+
+    use crate::Error;
+
+    /// The ask as a log field: the peer's own text, or `-` for a request
+    /// that wanted no reply.
+    fn ask(ask: Option<&[u8]>) -> Cow<'_, str> {
+        ask.map_or(Cow::Borrowed("-"), String::from_utf8_lossy)
+    }
+
+    /// A command whose service returned `err`. A command error is the
+    /// handler's own answer to the peer, so it is only of interest when
+    /// debugging; anything else is a failure the peer was told nothing
+    /// about, or told only that its request was malformed.
+    pub(super) fn command_failed(command: &[u8], ask: Option<&[u8]>, err: &Error) {
+        let command = String::from_utf8_lossy(command);
+        let ask = self::ask(ask);
+        match err {
+            Error::Command { .. } => {
+                tracing::debug!(%command, %ask, error = %err, "command failed")
+            }
+            _ => tracing::warn!(%command, %ask, error = %err, "command failed"),
+        }
+    }
+
+    /// A command whose handler panicked, or was cancelled, with `reason`.
+    pub(super) fn command_panicked(command: &[u8], ask: Option<&[u8]>, reason: &str) {
+        let command = String::from_utf8_lossy(command);
+        let ask = self::ask(ask);
+        tracing::error!(%command, %ask, "{reason}");
+    }
+
+    /// An error from `accept` that the accept loop carries on past.
+    pub(super) fn accept_skipped(err: &io::Error) {
+        tracing::warn!(error = %err, "could not accept a connection");
+    }
+
+    /// An error that ended one of `serve`'s connections.
+    pub(super) fn connection_failed(err: &Error) {
+        tracing::warn!(error = %err, "connection failed");
+    }
+}
+
+#[cfg(not(feature = "tracing"))]
+mod log {
+    use std::io;
+
+    use crate::Error;
+
+    pub(super) fn command_failed(_: &[u8], _: Option<&[u8]>, _: &Error) {}
+    pub(super) fn command_panicked(_: &[u8], _: Option<&[u8]>, _: &str) {}
+    pub(super) fn accept_skipped(_: &io::Error) {}
+    pub(super) fn connection_failed(_: &Error) {}
+}
+
+/// What the `tracing` feature logs. This lives with the unit tests rather
+/// than in `tests/`, since it needs a process of its own: tracing caches
+/// each callsite's interest the first time it is hit, from whichever
+/// thread hits it, and a test in another thread with no subscriber would
+/// cache "never" for the callsites this test wants to see.
+#[cfg(all(test, feature = "tracing"))]
+mod log_test {
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    use tower::service_fn;
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    use super::*;
+    use crate::Client;
+
+    /// Collects what the subscriber writes.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+
+    impl Log {
+        fn lines(&self) -> Vec<String> {
+            let bytes = self.0.lock().unwrap();
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(String::from)
+                .collect()
+        }
+    }
+
+    impl Write for Log {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Log {
+        type Writer = Log;
+
+        fn make_writer(&'a self) -> Log {
+            self.clone()
+        }
+    }
+
+    /// A service whose every command fails in its own way: `Boom` panics,
+    /// `Flaky` fails with an error about this side, and anything else fails
+    /// with the handler's own error.
+    fn service() -> impl Service<
+        Request,
+        Response = AmpBox,
+        Error = Error,
+        Future = impl Future<Output = Result<AmpBox, Error>> + Send,
+    > + Clone
+    + Send
+    + 'static {
+        service_fn(|request: Request| async move {
+            match request.command.as_slice() {
+                b"Boom" => panic!("handler bug"),
+                b"Flaky" => Err(Error::Io(io::Error::other(
+                    "db at 10.0.0.7:5432 refused the connection",
+                ))),
+                _ => Err(Error::new("ZERO_DIVISION", "cannot divide by zero")),
+            }
+        })
+    }
+
+    /// The test runs on a current-thread runtime, so the subscriber set for
+    /// its thread also sees the events from the tasks the server spawns.
+    #[tokio::test]
+    async fn failures_are_logged() {
+        let log = Log::default();
+        let _guard = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(LevelFilter::DEBUG)
+            .finish()
+            .set_default();
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server_io, service()));
+        let mut client = Client::new(client_io);
+        for command in ["Boom", "Flaky", "Divide"] {
+            let request = Request::new(command, AmpBox::new()).with_ask("x");
+            Service::call(&mut client, request).await.unwrap_err();
+        }
+
+        let lines = log.lines();
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[0].contains("ERROR"), "{lines:#?}");
+        assert!(lines[0].contains("command=Boom"), "{lines:#?}");
+        assert!(
+            lines[0].contains("command panicked: handler bug"),
+            "{lines:#?}"
+        );
+        assert!(lines[1].contains("WARN"), "{lines:#?}");
+        assert!(lines[1].contains("command=Flaky"), "{lines:#?}");
+        assert!(lines[1].contains("10.0.0.7:5432"), "{lines:#?}");
+        // A handler's own error is the peer's business, so it is only of
+        // interest when debugging.
+        assert!(lines[2].contains("DEBUG"), "{lines:#?}");
+        assert!(lines[2].contains("command=Divide"), "{lines:#?}");
+        assert!(lines[2].contains("ZERO_DIVISION"), "{lines:#?}");
+    }
+
+    /// A request that wants no reply is still logged when it fails, since
+    /// the log is the only place its failure can go.
+    #[tokio::test]
+    async fn failed_notifications_are_logged() {
+        let log = Log::default();
+        let _guard = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish()
+            .set_default();
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server_io, service()));
+        let mut client = Client::new(client_io);
+        let request = Request::new("Flaky", AmpBox::new());
+        Service::call(&mut client, request).await.unwrap();
+        // A notification is answered before it is handled, so give the
+        // server a moment. The subscriber is on this thread, so there is
+        // no other thread to wait on.
+        tokio::task::yield_now().await;
+
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].contains("WARN"), "{lines:#?}");
+        assert!(lines[0].contains("command=Flaky"), "{lines:#?}");
+        assert!(lines[0].contains("ask=-"), "{lines:#?}");
+    }
 }
 
 #[cfg(test)]

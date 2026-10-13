@@ -58,9 +58,11 @@ handler returns `()`, which is an empty box on the wire.
 
 A request for a command the router does not know is answered with the
 `UNHANDLED` error code. `Error::new` goes to the peer as its code and
-description; any other error, including arguments that fail to parse, goes
-as `UNKNOWN` with the error's message. A handler that panics is answered the
-same way, with the panic's message, and the connection stays up.
+description. Arguments that fail to parse go as `UNKNOWN` with the parse
+error, which is what tells the peer its schema is wrong. Any other error,
+and a handler that panics, is answered with `UNKNOWN` and the description
+`internal error`: what went wrong is this side's business, and goes to the
+log instead. The connection stays up either way.
 
 Commands that share state implement `HandleWith` for the state type instead,
 and the router is built with `Router::with_state`:
@@ -195,12 +197,28 @@ longer than 16 MiB and closes rather than buffering without bound. Pass an
 `AmpCodec` to `serve_with_codec`, `serve_connection_with_codec`, or
 `Client::with_codec` to set another limit.
 
-Not yet supported: commands the server initiates on a client, TLS, graceful
-shutdown, and tracing. A connection error inside `serve` ends that connection
-silently; write the accept loop yourself with `serve_connection` to see it.
-`serve` itself survives a peer that hangs up before it is accepted and a
-process briefly out of file descriptors, and returns only on an error that
-means the listener is no good.
+Logging
+--
+
+The `tracing` feature logs, through the
+[tracing](https://crates.io/crates/tracing) crate, what a server would
+otherwise discard: a command that fails with anything but the handler's own
+error, with the command's name, the ask and the error; a handler that
+panics, with the panic's message; an accept error that `serve` skipped; and
+a connection error that ended one of its connections. A handler's own
+error, which the peer is told in full, is logged at `debug`. The feature
+changes nothing on the wire.
+
+```toml
+tower-amp = { version = "0.2", features = ["tracing"] }
+```
+
+Not yet supported: commands the server initiates on a client, TLS, and
+graceful shutdown. A connection error inside `serve` ends that connection
+and is only logged; write the accept loop yourself with `serve_connection`
+to handle it. `serve` itself survives a peer that hangs up before it is
+accepted and a process briefly out of file descriptors, and returns only on
+an error that means the listener is no good.
 
 License
 --

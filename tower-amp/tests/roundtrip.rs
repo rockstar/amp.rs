@@ -206,6 +206,20 @@ impl Handle for Boom {
     }
 }
 
+/// Fails with an error about this side's own trouble, of the kind that
+/// names things a peer has no business learning.
+#[derive(Serialize, Deserialize)]
+#[command]
+struct Flaky {}
+
+impl Handle for Flaky {
+    async fn handle(self) -> Result<(), Error> {
+        Err(Error::Io(std::io::Error::other(
+            "db at 10.0.0.7:5432 refused the connection",
+        )))
+    }
+}
+
 fn router() -> Router {
     Router::new()
         .command::<Sum>()
@@ -471,7 +485,8 @@ async fn over_long_error_description_is_truncated() {
 }
 
 /// A handler that panics must still be answered, as `UNKNOWN`, and must not
-/// take the connection down with it.
+/// take the connection down with it. The panic's message says what the
+/// handler was doing, which stays on this side.
 #[tokio::test]
 async fn a_panicking_handler_is_answered_with_unknown() {
     let client = connect(Router::new().command::<Boom>().command::<Sum>());
@@ -481,11 +496,25 @@ async fn a_panicking_handler_is_answered_with_unknown() {
     assert!(matches!(
         failed,
         Err(Error::Command { code, description })
-            if code == "UNKNOWN" && description.contains("handler bug")
+            if code == "UNKNOWN" && description == "internal error"
     ));
     // The connection must survive.
     let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
     assert_eq!(total.total, 3);
+}
+
+/// An error that is about this side rather than the request, such as an
+/// I/O error, is answered as `UNKNOWN` without its message, which may name
+/// hosts and other internals.
+#[tokio::test]
+async fn internal_errors_do_not_reach_the_peer() {
+    let client = connect(Router::new().command::<Flaky>());
+    let failed = client.call(&Flaky {}).await;
+    assert!(matches!(
+        failed,
+        Err(Error::Command { code, description })
+            if code == "UNKNOWN" && description == "internal error"
+    ));
 }
 
 /// A peer that sends a box longer than the server allows gets its connection

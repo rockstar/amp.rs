@@ -100,10 +100,21 @@ instead. A test that needs both sides goes in the first; one that only
 needs the client goes in the second, and must not spawn, since on
 `wasm32-unknown-unknown` there is no runtime to spawn on.
 
-Nothing runs the tests in a browser. That would take Node and the
-`wasm-bindgen-test` runner, and swapping `#[tokio::test]` for
-`#[wasm_bindgen_test]` on that target, since there is no tokio runtime to
-block on there.
+CI also runs `tower-amp/tests/client.rs` on `wasm32-unknown-unknown`, in
+Node, where there is no tokio runtime to block on: each test there is a
+`#[wasm_bindgen_test]` instead of a `#[tokio::test]`, through a pair of
+`cfg_attr`s, and the file's own timeouts wait on the host's timer. This is
+not a hook, since it needs Node and [wasm-pack](https://github.com/wasm-bindgen/wasm-pack),
+which installs the `wasm-bindgen-test-runner` matching `Cargo.lock`. To run
+it by hand, with Node installed:
+
+```
+cargo install wasm-pack                   # or: brew install wasm-pack
+wasm-pack test --node tower-amp -- --all-features --test client
+```
+
+Only that one test file runs there: the others need a server, and the unit
+tests in `client.rs` a tokio runtime.
 
 The server is compiled out on every WebAssembly target: tokio refuses to
 build its `net` feature, or `fs`, `io-std`, `process`, `rt-multi-thread`,
@@ -124,8 +135,8 @@ Everything that differs there is a small `#[cfg]`'d helper in `client.rs`
 (`spawn`, `timeout`, the `Send` bound on the I/O type, and the `Service`
 future type), keyed on `all(target_arch = "wasm32", target_os = "unknown")`,
 so a change to the client should only ever need one of those to change.
-Only the WASI tests run, so a change to the browser-only helpers is checked
-by clippy alone; test the browser path by hand in a page.
+The client tests above exercise `spawn` and `timeout` on that target, the
+latter through `an_unanswered_call_times_out`.
 
 Twisted interoperability
 --

@@ -65,6 +65,11 @@ tower = { workspace = true, features = ["timeout", "limit"] }
 # Only for the test that asserts what the `tracing` feature logs.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
+# On wasm32-unknown-unknown there is no tokio runtime to block on, so
+# tests/client.rs runs under wasm-bindgen-test there; see DEVELOPING.md.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 # The tests run on wasm32-wasip2 too, where tokio has no multi-threaded
 # runtime. `signal` is for the examples and the README, which stop on
 # Ctrl-C.

@@ -1,6 +1,8 @@
 //! A client and a hand-rolled peer joined by an in-memory pipe, so that the
 //! client is tested without the server. This is the only test of a
-//! connection that runs on WebAssembly, where there is no server.
+//! connection that runs on WebAssembly, where there is no server. On
+//! wasm32-unknown-unknown there is no tokio runtime either, so there the
+//! tests run under wasm-bindgen-test and wait on the host's timer.
 
 use std::time::Duration;
 
@@ -82,7 +84,11 @@ where
     }
 }
 
-#[tokio::test]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
 async fn calls_a_command() {
     with_peer(|client| async move {
         let total = client.call(&Sum { a: 40, b: 2 }).await.unwrap();
@@ -91,7 +97,11 @@ async fn calls_a_command() {
     .await;
 }
 
-#[tokio::test]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
 async fn receives_the_peers_error() {
     with_peer(|client| async move {
         match client.call(&Fail {}).await {
@@ -105,7 +115,11 @@ async fn receives_the_peers_error() {
     .await;
 }
 
-#[tokio::test]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
 async fn an_unanswered_call_times_out() {
     with_peer(|client| async move {
         let failed = client.call(&Silence {}).await;
@@ -125,11 +139,25 @@ fn with_framed_peer() -> (Client, Framed<DuplexStream, AmpCodec>) {
     (client, Framed::new(peer_io, AmpCodec::new()))
 }
 
+/// Waits for `future` for at most `limit`; `None` if the limit was reached
+/// first. The timer is tokio's, or on wasm32-unknown-unknown the host's,
+/// since there is no tokio runtime to drive one there.
+async fn timeout<F: Future>(limit: Duration, future: F) -> Option<F::Output> {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let sleep = tokio::time::sleep(limit);
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let sleep = gloo_timers::future::sleep(limit);
+    tokio::select! {
+        output = future => Some(output),
+        () = sleep => None,
+    }
+}
+
 /// The next box the client writes. Fails rather than waits forever if the
 /// client writes nothing, so a broken branch fails the test instead of
 /// hanging it.
 async fn next_box(peer: &mut Framed<DuplexStream, AmpCodec>) -> AmpBox {
-    tokio::time::timeout(Duration::from_secs(2), peer.next())
+    timeout(Duration::from_secs(2), peer.next())
         .await
         .expect("the client wrote nothing")
         .expect("the client closed the connection")
@@ -144,13 +172,17 @@ async fn drain(peer: &mut Framed<DuplexStream, AmpCodec>) -> Vec<AmpBox> {
             written.push(amp_box.unwrap());
         }
     };
-    tokio::time::timeout(Duration::from_secs(2), all)
+    timeout(Duration::from_secs(2), all)
         .await
         .expect("the client did not close the connection");
     written
 }
 
-#[tokio::test]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
 async fn a_notification_is_written_and_not_answered() {
     let (client, mut peer) = with_framed_peer();
     client.notify(&Sum { a: 1, b: 1 }).await.unwrap();
@@ -165,7 +197,11 @@ async fn a_notification_is_written_and_not_answered() {
 }
 
 /// A request from the peer that wants an answer is refused as `UNHANDLED`.
-#[tokio::test]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
 async fn a_request_from_the_peer_is_refused() {
     let (client, mut peer) = with_framed_peer();
     let request = Request::new("Sum", AmpBox::new()).with_ask("7");
@@ -185,7 +221,11 @@ async fn a_request_from_the_peer_is_refused() {
 
 /// A request from the peer that wants no answer gets none: the refusal of
 /// the request with an `_ask` sent after it is the first thing written.
-#[tokio::test]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
 async fn a_notification_from_the_peer_is_ignored() {
     let (client, mut peer) = with_framed_peer();
     let silent = Request::new("Sum", AmpBox::new());
@@ -202,7 +242,11 @@ async fn a_notification_from_the_peer_is_ignored() {
 /// A request handed to the client as a service, whose arguments use a key
 /// the protocol reserves, fails without reaching the wire and without
 /// harming the connection.
-#[tokio::test]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
 async fn a_request_with_a_reserved_argument_fails_locally() {
     with_peer(|mut client| async move {
         let mut arguments = AmpBox::new();
@@ -231,7 +275,11 @@ fn assert_reserved<T: std::fmt::Debug>(result: &Result<T, Error>, expected: &[u8
     );
 }
 
-#[tokio::test]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
 async fn a_closed_connection_fails_calls() {
     let (client_io, peer_io) = tokio::io::duplex(4096);
     let client = Client::new(client_io);

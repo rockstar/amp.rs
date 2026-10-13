@@ -12,7 +12,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tower::{Service, ServiceBuilder};
-use tower_amp::{AmpCodec, Client, Error, Handle, HandleWith, Router, command};
+use tower_amp::{AmpCodec, Client, Connection, Error, Handle, HandleWith, Router, command};
 
 #[derive(Serialize, Deserialize)]
 #[command(response = Total)]
@@ -274,6 +274,25 @@ impl HandleWith<Gate> for Hold {
     }
 }
 
+/// Answered by asking the peer that sent it to do the sum: a command that
+/// goes the other way on the same connection, inside a handler.
+#[derive(Serialize, Deserialize)]
+#[command(response = Total)]
+struct Relay {
+    a: i64,
+    b: i64,
+}
+
+impl HandleWith<Client> for Relay {
+    async fn handle(self, peer: Client) -> Result<Total, Error> {
+        peer.call(&Sum {
+            a: self.a,
+            b: self.b,
+        })
+        .await
+    }
+}
+
 fn router() -> Router {
     Router::new()
         .command::<Sum>()
@@ -303,6 +322,70 @@ fn peer_closed<T>(result: &Result<T, Error>) -> bool {
         Err(Error::ConnectionClosed { cause })
             if cause.as_deref().is_none_or(|cause| matches!(cause, Error::Io(_)))
     )
+}
+
+/// The served side has no `Sum` of its own: the only way to answer `Relay`
+/// is to call `Sum` on the peer that asked, which serves it, while that
+/// peer's own call is still waiting.
+#[tokio::test]
+async fn a_handler_calls_a_command_on_the_peer_that_asked() {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let served = Connection::new(server_io);
+    let peer = served.client();
+    tokio::spawn(served.serve(Router::with_state(peer).command::<Relay>()));
+    let calling = Connection::new(client_io);
+    let client = calling.client();
+    tokio::spawn(calling.serve(Router::new().command::<Sum>()));
+
+    let total = client.call(&Relay { a: 13, b: 81 }).await.unwrap();
+    assert_eq!(total, Total { total: 94 });
+}
+
+/// A served connection is kept open by whoever drives it, not by its
+/// handles: it goes on serving after the last one is dropped, and ends
+/// when the peer closes it.
+#[tokio::test]
+async fn a_served_connection_outlives_its_handles() {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let connection = Connection::new(server_io);
+    drop(connection.client());
+    let server = tokio::spawn(connection.serve(router()));
+
+    let client = Client::new(client_io);
+    let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
+    assert_eq!(total.total, 3);
+    drop(client);
+    server.await.unwrap().unwrap();
+}
+
+/// Whoever drives a served connection gets the error that ended it, and a
+/// handle that outlives it gets the same error as the cause, both for a
+/// call that was waiting and for one made afterwards.
+#[tokio::test]
+async fn a_handle_outlives_the_connection_with_its_cause() {
+    let (mut client_io, server_io) = tokio::io::duplex(4096);
+    let connection = Connection::new(server_io);
+    let peer = connection.client();
+    let server = tokio::spawn(connection.serve(router()));
+    let waiting = tokio::spawn({
+        let peer = peer.clone();
+        async move { peer.call(&Sum { a: 1, b: 2 }).await }
+    });
+
+    // A key length of 256, longer than a key may be.
+    client_io.write_all(b"\x01\x00").await.unwrap();
+    let failed = server.await.unwrap();
+    assert!(
+        matches!(
+            failed,
+            Err(Error::Protocol(amp_protocol::Error::KeyTooLong {
+                len: 256
+            }))
+        ),
+        "{failed:?}"
+    );
+    assert_key_too_long(&waiting.await.unwrap());
+    assert_key_too_long(&peer.call(&Sum { a: 3, b: 4 }).await);
 }
 
 #[tokio::test]

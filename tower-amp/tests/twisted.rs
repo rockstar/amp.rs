@@ -1,6 +1,7 @@
 //! Interoperability with Twisted, the reference implementation of AMP: this
 //! crate's server against Twisted's client, and this crate's client against
-//! Twisted's server. The Python side is `tests/twisted/peer.py`.
+//! Twisted's server, with each side calling a command on the other inside
+//! a handler. The Python side is `tests/twisted/peer.py`.
 //!
 //! These tests need a Python with Twisted installed, so they are ignored by
 //! default and run only in CI, or by hand with
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
-use tower_amp::{Client, Error, Handle, Router, command};
+use tower_amp::{Client, Connection, Error, Handle, HandleWith, Router, command};
 
 #[derive(Serialize, Deserialize)]
 #[command(response = Total)]
@@ -64,6 +65,25 @@ impl Handle for Divide {
     }
 }
 
+/// Answered by asking the peer that sent it to do the sum, which is how
+/// Twisted's responder for it works too.
+#[derive(Serialize, Deserialize)]
+#[command(response = Total)]
+struct Relay {
+    a: i64,
+    b: i64,
+}
+
+impl HandleWith<Client> for Relay {
+    async fn handle(self, peer: Client) -> Result<Total, Error> {
+        peer.call(&Sum {
+            a: self.a,
+            b: self.b,
+        })
+        .await
+    }
+}
+
 /// `peer.py` run with `args`, with its output captured for the test's
 /// report and the process killed when the test is done with it.
 fn peer(args: &[&str]) -> Command {
@@ -80,15 +100,27 @@ fn peer(args: &[&str]) -> Command {
     command
 }
 
-/// Twisted's client calls this server's commands and checks every answer
-/// itself; the exit status says whether it was satisfied.
+/// Twisted's client calls this server's commands, among them `Relay`,
+/// which this server answers by calling `Sum` on Twisted's client, and
+/// checks every answer itself; the exit status says whether it was
+/// satisfied.
 #[tokio::test]
 #[ignore = "needs a Python with Twisted; run with --ignored"]
 async fn twisted_client_calls_this_server() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let router = Router::new().command::<Sum>().command::<Divide>();
-    tokio::spawn(tower_amp::serve(listener, router));
+    // Each connection's router holds a handle to its own peer, for `Relay`.
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let connection = Connection::new(stream);
+            let router = Router::with_state(connection.client())
+                .command::<Sum>()
+                .command::<Divide>()
+                .command::<Relay>();
+            tokio::spawn(connection.serve(router));
+        }
+    });
 
     let client = peer(&["client", &port.to_string()]).spawn().unwrap();
     let output = tokio::time::timeout(Duration::from_secs(30), client.wait_with_output())
@@ -105,7 +137,8 @@ async fn twisted_client_calls_this_server() {
 }
 
 /// This client calls the commands of a Twisted server and checks each
-/// answer against what Twisted's own responders return.
+/// answer against what Twisted's own responders return. For `Relay`, the
+/// Twisted server calls `Sum` back on this client, which serves it.
 #[tokio::test]
 #[ignore = "needs a Python with Twisted; run with --ignored"]
 async fn this_client_calls_a_twisted_server() {
@@ -122,7 +155,9 @@ async fn this_client_calls_a_twisted_server() {
         .unwrap_or_else(|_| panic!("not a port: {line:?}"));
 
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let client = Client::new(stream).with_timeout(Duration::from_secs(30));
+    let connection = Connection::new(stream);
+    let client = connection.client().with_timeout(Duration::from_secs(30));
+    tokio::spawn(connection.serve(Router::new().command::<Sum>()));
 
     let total = client.call(&Sum { a: 13, b: 81 }).await.unwrap();
     assert_eq!(total, Total { total: 94 });
@@ -144,4 +179,6 @@ async fn this_client_calls_a_twisted_server() {
         matches!(failed, Err(Error::Command { ref code, .. }) if code == "ZERO_DIVISION"),
         "{failed:?}"
     );
+    let total = client.call(&Relay { a: 13, b: 81 }).await.unwrap();
+    assert_eq!(total, Total { total: 94 });
 }

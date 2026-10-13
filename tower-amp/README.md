@@ -144,15 +144,56 @@ it is answered, from your own `tokio::time::timeout` or `select!`, is safe
 in the same way: the call is forgotten, and if its request had not been
 written yet it is not sent.
 
+Both directions
+--
+
+AMP is symmetric: either side of a connection may call commands on the
+other. `Client::new` only calls and `serve` only answers; a `Connection`
+does both. It hands out `Client` handles for the connection and takes a
+service for the peer's requests, so a handler that needs to call the peer
+that asked gets a handle through the router's state:
+
+```rust,ignore
+impl HandleWith<Client> for Relay {
+    async fn handle(self, peer: Client) -> Result<Total, Error> {
+        peer.call(&Sum { a: self.a, b: self.b }).await
+    }
+}
+
+let connection = Connection::new(stream);
+let router = Router::with_state(connection.client()).command::<Relay>();
+connection.serve(router).await?;
+```
+
+A client that answers the commands its server sends is the same thing with
+the roles swapped: take a handle, then serve the connection on a task of
+its own.
+
+```rust,ignore
+let connection = Connection::new(stream);
+let client = connection.client();
+tokio::spawn(connection.serve(Router::new().command::<Notify>()));
+```
+
+`Connection::serve` runs until the peer closes the connection, or returns
+the error that ended it. Dropping the handles does not end it; dropping the
+`serve` future does. A call on a handle that outlives the connection fails
+with `Error::ConnectionClosed`, carrying a copy of that error. `serve` and
+`serve_with_shutdown` take one service for every connection, so a server
+whose handlers call back accepts connections itself and builds a
+`Connection` and a router for each, as the `kv_server` example does.
+
 WebAssembly
 --
 
-The client builds for `wasm32-unknown-unknown` and `wasm32-wasip2`. The
-server does not, since tokio has no networking on WebAssembly. `Client::new`
-takes anything that implements tokio's `AsyncRead` and `AsyncWrite`, so the
-connection is whatever the host gives you: in a browser, a WebSocket through
-one of the crates that adapt it to those traits; under WASI, a socket from
-the host wrapped the same way.
+The client and `Connection` build for `wasm32-unknown-unknown` and
+`wasm32-wasip2`, so a client in a browser can answer the commands its
+server sends. The server does not build there, since tokio has no
+networking on WebAssembly. `Client::new` and `Connection::new` take
+anything that implements tokio's `AsyncRead` and `AsyncWrite`, so the
+connection is whatever the host gives you: in a browser, a WebSocket
+through one of the crates that adapt it to those traits; under WASI, a
+socket from the host wrapped the same way.
 
 In a browser the connection is driven on the page's event loop, through
 `wasm-bindgen-futures`, and `with_timeout` uses the browser's timer. The I/O
@@ -172,8 +213,12 @@ The `examples` directory has runnable programs:
   commands as the client in Twisted's AMP documentation.
 * `client` calls it.
 * `kv_server` is a key/value store: commands sharing state, optional
-  arguments, list results, a command with no results, tower middleware, and
-  an accept loop that reports connection errors.
+  arguments, list results, a command with no results, tower middleware, an
+  accept loop that reports connection errors, and a `Subscribe` command
+  after which the server pushes every change to that client as a command
+  on its own connection.
+* `kv_watcher` subscribes to it, sets a key, and prints the changes the
+  server pushes, so it serves commands on the connection it calls on.
 
 How it fits together
 --
@@ -232,7 +277,7 @@ Logging
 --
 
 The `tracing` feature logs, through the
-[tracing](https://crates.io/crates/tracing) crate, what a server would
+[tracing](https://crates.io/crates/tracing) crate, what a connection would
 otherwise discard: a command that fails with anything but the handler's own
 error, with the command's name, the ask and the error; a handler that
 panics, with the panic's message; an accept error that `serve` skipped; and
@@ -244,7 +289,7 @@ changes nothing on the wire.
 tower-amp = { version = "0.2", features = ["tracing"] }
 ```
 
-Not yet supported: commands the server initiates on a client, and TLS. A
+Not yet supported: TLS. A
 connection error inside `serve` ends that connection and is only logged;
 write the accept loop yourself with `serve_connection` to handle it, at the
 cost of `serve_with_shutdown`, which has no connection-level counterpart,

@@ -54,8 +54,7 @@ pub enum Error {
 }
 
 /// The description a peer sees for an error that is about this side rather
-/// than its request. Only a server answers with an error.
-#[cfg(not(target_family = "wasm"))]
+/// than its request.
 pub(crate) const INTERNAL_ERROR: &str = "internal error";
 
 impl Error {
@@ -73,7 +72,7 @@ impl Error {
         Error::ConnectionClosed { cause }
     }
 
-    /// The error for a request naming a command the router does not know.
+    /// The error for a request naming a command this side does not serve.
     pub(crate) fn unhandled(command: &[u8]) -> Self {
         Error::new(
             ErrorResponse::UNHANDLED,
@@ -81,8 +80,7 @@ impl Error {
         )
     }
 
-    /// The code that goes on the wire. Only a server answers with an error.
-    #[cfg(not(target_family = "wasm"))]
+    /// The code that goes on the wire.
     pub(crate) fn code(&self) -> &str {
         match self {
             Error::Command { code, .. } => code,
@@ -90,8 +88,7 @@ impl Error {
         }
     }
 
-    /// The description that goes on the wire. Only a server answers with an
-    /// error.
+    /// The description that goes on the wire.
     ///
     /// A command error carries the description the handler chose, and a
     /// deserialize error its message, which tells the peer its request did
@@ -99,13 +96,50 @@ impl Error {
     /// not the request: an I/O error names hosts, a panic message says what
     /// the handler was doing. A peer, who may be anyone, gets a fixed
     /// description instead, and the error goes to the log.
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn description(&self) -> String {
         match self {
             Error::Command { description, .. } => description.clone(),
             Error::Deserialize(_) => self.to_string(),
             _ => INTERNAL_ERROR.to_string(),
         }
+    }
+
+    /// A second copy of an error that ended a connection, for the client
+    /// handles of a connection whose driver gets the original.
+    ///
+    /// Only an I/O error or a protocol error ends a connection. A protocol
+    /// error is plain data. An I/O error is rebuilt from its OS error code
+    /// when it has one, which keeps its kind and message, and otherwise
+    /// from its kind and message, which loses only its source. Anything
+    /// else keeps its message.
+    pub(crate) fn duplicate(&self) -> Error {
+        use amp_protocol::Error as Protocol;
+
+        match self {
+            Error::Io(err) => Error::Io(duplicate_io(err)),
+            Error::Protocol(err) => Error::Protocol(match err {
+                Protocol::EmptyKey => Protocol::EmptyKey,
+                Protocol::KeyTooLong { len } => Protocol::KeyTooLong { len: *len },
+                Protocol::ValueTooLong { len } => Protocol::ValueTooLong { len: *len },
+                Protocol::Incomplete => Protocol::Incomplete,
+                Protocol::MissingKey(key) => Protocol::MissingKey(key),
+                Protocol::ReservedKey(key) => Protocol::ReservedKey(key.clone()),
+                Protocol::UnrecognizedBox => Protocol::UnrecognizedBox,
+                Protocol::FrameTooLong { limit } => Protocol::FrameTooLong { limit: *limit },
+                Protocol::Io(err) => Protocol::Io(duplicate_io(err)),
+                // A variant amp-protocol has since added.
+                other => Protocol::Io(std::io::Error::other(other.to_string())),
+            }),
+            other => Error::Io(std::io::Error::other(other.to_string())),
+        }
+    }
+}
+
+/// See [`Error::duplicate`].
+fn duplicate_io(err: &std::io::Error) -> std::io::Error {
+    match err.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::new(err.kind(), err.to_string()),
     }
 }
 

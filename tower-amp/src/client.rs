@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, Ready, ready};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -7,23 +7,24 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use amp_protocol::codec::AmpCodec;
-use amp_protocol::{AmpBox, ErrorResponse, Message, Request};
-use futures_util::{SinkExt, StreamExt};
+use amp_protocol::{AmpBox, Request};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 use tower::Service;
 
-use crate::{Command, Error};
+use crate::connection::{Owner, spawn};
+use crate::{Command, Connection, Error};
 
 /// Calls commands on a peer over one connection.
 ///
 /// A client is cheap to clone, and every clone shares the connection. Calls
 /// from any number of tasks may be in flight at once; the protocol matches
-/// each answer to its request. The connection closes when the last clone is
-/// dropped.
+/// each answer to its request. A connection made by [`Client::new`] closes
+/// when the last clone is dropped; one driven by a [`Connection`] lives as
+/// long as that future does.
 ///
 /// A call waits until it is answered or the connection ends, unless the
 /// client has a [`timeout`](Client::with_timeout). Dropping a call before it
@@ -37,8 +38,9 @@ use crate::{Command, Error};
 /// with an empty box. The client assigns every `_ask` itself; see the
 /// [`Service`] impl.
 ///
-/// Requests the peer sends to this client are refused with the `UNHANDLED`
-/// error code.
+/// Requests the peer sends to a client made by [`Client::new`] are refused
+/// with the `UNHANDLED` error code. A [`Connection`] serves them instead,
+/// and hands out clients for the same connection.
 ///
 /// Once the connection has ended, every call fails with
 /// [`Error::ConnectionClosed`], which carries what ended it: an I/O error,
@@ -48,18 +50,18 @@ use crate::{Command, Error};
 pub struct Client {
     outgoing: mpsc::Sender<Outgoing>,
     next_ask: Arc<AtomicU64>,
-    pending: Arc<Mutex<Pending>>,
-    cause: Arc<Cause>,
+    pub(crate) pending: Arc<Mutex<Pending>>,
+    pub(crate) cause: Arc<Cause>,
     timeout: Option<Duration>,
 }
 
 /// A request queued for the connection's writer.
-struct Outgoing {
-    request: Request,
+pub(crate) struct Outgoing {
+    pub(crate) request: Request,
     /// Answered with an empty box once the request has been written. Only a
     /// notification has one; a call's reply sender waits in [`Pending`] for
     /// the peer's answer instead.
-    written: Option<oneshot::Sender<Result<AmpBox, Error>>>,
+    pub(crate) written: Option<oneshot::Sender<Result<AmpBox, Error>>>,
 }
 
 /// Calls waiting for a reply, keyed by ask.
@@ -71,12 +73,12 @@ struct Outgoing {
 /// NOTE: this is a `std::sync::Mutex` by design! We don't want the mutex to
 /// be held across an await, and using the `std::sync` version, rather than
 /// the `tokio::sync` version, ensures we can't mess that up.
-type Pending = HashMap<Vec<u8>, oneshot::Sender<Result<AmpBox, Error>>>;
+pub(crate) type Pending = HashMap<Vec<u8>, oneshot::Sender<Result<AmpBox, Error>>>;
 
-/// What ended the connection, recorded by [`run`] before it lets go of
-/// anything that fails a call. `None` while the connection is up, and once
-/// it has ended cleanly.
-type Cause = Mutex<Option<Arc<Error>>>;
+/// What ended the connection, recorded by [`Connection::run`] before it
+/// lets go of anything that fails a call. `None` while the connection is
+/// up, and once it has ended cleanly.
+pub(crate) type Cause = Mutex<Option<Arc<Error>>>;
 
 /// The constructors, with the bound on the I/O type passed in: the task that
 /// drives the connection may move between threads on the tokio runtime, so
@@ -90,7 +92,11 @@ macro_rules! constructors {
             /// stream, such as a WebSocket adapter. The connection is driven
             /// by a task spawned on the current tokio runtime, or on
             /// wasm32-unknown-unknown on the host's event loop through
-            /// `wasm-bindgen-futures`.
+            /// `wasm-bindgen-futures`, and closes when the last clone of
+            /// the client is dropped.
+            ///
+            /// Requests the peer sends are refused. For a connection that
+            /// answers them as well, see [`Connection`].
             ///
             /// Set `TCP_NODELAY` on a `TcpStream` before passing it, with
             /// `stream.set_nodelay(true)`. Each request is written as it is
@@ -116,17 +122,16 @@ macro_rules! constructors {
             where
                 T: $($bound)+,
             {
-                let (outgoing, incoming) = mpsc::channel(16);
-                let pending = Arc::new(Mutex::new(HashMap::new()));
-                let cause = Arc::new(Mutex::new(None));
-                spawn(run(io, codec, incoming, pending.clone(), cause.clone()));
-                Client {
-                    outgoing,
-                    next_ask: Arc::new(AtomicU64::new(1)),
-                    pending,
-                    cause,
-                    timeout: None,
-                }
+                let connection = Connection::with_codec(io, codec);
+                let client = connection.client();
+                // What ended the connection reaches the client through
+                // `cause`, so the error returned here has nobody to go to.
+                spawn(async move {
+                    let _ = connection
+                        .run(Refuse, CancellationToken::new(), Owner::Handles)
+                        .await;
+                });
+                client
             }
         }
     };
@@ -138,6 +143,20 @@ constructors!(AsyncRead + AsyncWrite + Send + 'static);
 constructors!(AsyncRead + AsyncWrite + 'static);
 
 impl Client {
+    /// A client with nothing driving its connection yet, and the receiving
+    /// end of its request queue, for a [`Connection`] to drive.
+    pub(crate) fn detached() -> (Client, mpsc::Receiver<Outgoing>) {
+        let (outgoing, incoming) = mpsc::channel(16);
+        let client = Client {
+            outgoing,
+            next_ask: Arc::new(AtomicU64::new(1)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            cause: Arc::new(Mutex::new(None)),
+            timeout: None,
+        };
+        (client, incoming)
+    }
+
     /// Fails any call or notification that has not completed within `limit`
     /// with [`Error::Timeout`]. Without a limit, a call waits until it is
     /// answered or the connection ends.
@@ -290,147 +309,23 @@ impl Service<Request> for Client {
     }
 }
 
-/// Drives the connection: writes outgoing requests, matches incoming
-/// responses to them, and refuses incoming requests.
-///
-/// Reading and writing are separate futures so that a write the peer is slow
-/// to accept never stops this side from reading. If both sides stopped
-/// reading while blocked on a write, neither would ever drain the other's
-/// buffer. The connection ends when either future does: the peer closed it
-/// or broke the protocol, a write failed, or every clone of the client is
-/// gone.
-///
-/// A call learns that the connection ended when the sender of its reply is
-/// dropped, and then reads `cause` for why, so every failure here is
-/// recorded in `cause` before the future it happened in returns. Everything
-/// holding a reply sender, the entries of `pending`, the other future, and
-/// the queue behind `outgoing`, is dropped later than that.
-async fn run<T>(
-    io: T,
-    codec: AmpCodec,
-    mut outgoing: mpsc::Receiver<Outgoing>,
-    pending: Arc<Mutex<Pending>>,
-    cause: Arc<Cause>,
-) where
-    T: AsyncRead + AsyncWrite,
-{
-    let (mut sink, mut stream) = Framed::new(io, codec).split();
-    let (refusals, mut refused) = mpsc::channel::<AmpBox>(16);
-    let end = |err: Error| *lock(&cause) = Some(Arc::new(err));
+/// The service of a connection made by [`Client::new`]: refuses every
+/// request the peer sends with the `UNHANDLED` error code.
+#[derive(Clone)]
+struct Refuse;
 
-    let read = async {
-        loop {
-            let amp_box = match stream.next().await {
-                Some(Ok(amp_box)) => amp_box,
-                // Reading failed, or the peer sent something that is not a
-                // box.
-                Some(Err(err)) => return end(err.into()),
-                // The peer closed the connection.
-                None => return,
-            };
-            match Message::from_box(amp_box) {
-                // A reply nobody is waiting for any more is discarded.
-                Ok(Message::Answer(answer)) => {
-                    if let Some(reply) = lock(&pending).remove(&answer.answer) {
-                        let _ = reply.send(Ok(answer.results));
-                    }
-                }
-                Ok(Message::Error(error)) => {
-                    if let Some(reply) = lock(&pending).remove(&error.error) {
-                        let _ = reply.send(Err(Error::new(
-                            String::from_utf8_lossy(&error.code),
-                            String::from_utf8_lossy(&error.description),
-                        )));
-                    }
-                }
-                Ok(Message::Request(request)) => {
-                    let Some(refusal) = request.error(
-                        ErrorResponse::UNHANDLED,
-                        "this client does not handle commands",
-                    ) else {
-                        continue;
-                    };
-                    let Ok(amp_box) = refusal.into_box() else {
-                        continue;
-                    };
-                    if refusals.send(amp_box).await.is_err() {
-                        // The writer is gone, and recorded why.
-                        return;
-                    }
-                }
-                // The peer sent a box that is neither a request nor a
-                // response.
-                Err(err) => return end(err.into()),
-            }
-        }
-    };
-    let write = async {
-        loop {
-            tokio::select! {
-                next = outgoing.recv() => {
-                    let Some(Outgoing { request, written }) = next else {
-                        // Every clone of the client is gone.
-                        return;
-                    };
-                    // A request whose caller stopped waiting while it was
-                    // queued is not worth the peer's time.
-                    let abandoned = match &request.ask {
-                        Some(ask) => !lock(&pending).contains_key(ask),
-                        None => written.as_ref().is_none_or(|reply| reply.is_closed()),
-                    };
-                    if abandoned {
-                        continue;
-                    }
-                    let ask = request.ask.clone();
-                    let amp_box = match request.into_box() {
-                        Ok(amp_box) => amp_box,
-                        Err(err) => {
-                            let reply = match ask {
-                                Some(ask) => lock(&pending).remove(&ask),
-                                None => written,
-                            };
-                            if let Some(reply) = reply {
-                                let _ = reply.send(Err(err.into()));
-                            }
-                            continue;
-                        }
-                    };
-                    if let Err(err) = sink.send(amp_box).await {
-                        return end(err.into());
-                    }
-                    if let Some(reply) = written {
-                        let _ = reply.send(Ok(AmpBox::new()));
-                    }
-                }
-                Some(refusal) = refused.recv() => {
-                    if let Err(err) = sink.send(refusal).await {
-                        return end(err.into());
-                    }
-                }
-            }
-        }
-    };
-    tokio::select! {
-        () = read => {}
-        () = write => {}
+impl Service<Request> for Refuse {
+    type Response = AmpBox;
+    type Error = Error;
+    type Future = Ready<Result<AmpBox, Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Poll::Ready(Ok(()))
     }
-    // Clearing `pending` and dropping `outgoing` fails every call still
-    // waiting, and each finds `cause` already recorded. The client still
-    // holds `pending`, so it has to be emptied rather than dropped.
-    lock(&pending).clear();
-}
 
-/// Spawns the task that drives a connection on the current tokio runtime.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-fn spawn(task: impl Future<Output = ()> + Send + 'static) {
-    tokio::spawn(task);
-}
-
-/// Spawns the task that drives a connection on the host's event loop, since
-/// there is no tokio runtime to spawn it on in WebAssembly.
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-fn spawn(task: impl Future<Output = ()> + 'static) {
-    wasm_bindgen_futures::spawn_local(task);
+    fn call(&mut self, request: Request) -> Self::Future {
+        ready(Err(Error::unhandled(&request.command)))
+    }
 }
 
 /// Waits for `future` for at most `limit`; `None` if the limit was reached
@@ -457,7 +352,7 @@ async fn timeout<F: Future>(limit: Duration, future: F) -> Option<F::Output> {
 
 /// Locks `mutex`. A poisoned lock only means a task panicked while holding
 /// it, which nothing here can do, so the value is still sound to use.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

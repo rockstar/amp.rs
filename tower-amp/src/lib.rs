@@ -4,8 +4,10 @@
 
 mod client;
 mod command;
+mod connection;
 mod error;
 mod handle;
+mod log;
 mod router;
 // A server listens on TCP, and tokio has no networking on WebAssembly; only
 // the client builds there.
@@ -26,6 +28,7 @@ pub use amp_protocol::Request;
 pub use amp_protocol::codec::AmpCodec;
 pub use client::Client;
 pub use command::Command;
+pub use connection::Connection;
 pub use error::Error;
 pub use handle::{Handle, HandleWith};
 pub use router::Router;

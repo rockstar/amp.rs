@@ -19,9 +19,10 @@ include = [
 ]
 
 [features]
-# Logs what a server would otherwise discard: a failed or panicking command,
-# an accept error `serve` skipped, and a connection error that ended one of
-# its connections. Nothing is sent to the peer that was not sent without it.
+# Logs what a connection would otherwise discard: a failed or panicking
+# command, an accept error `serve` skipped, and a connection error that
+# ended one of its connections. Nothing is sent to the peer that was not
+# sent without it.
 tracing = ["dep:tracing"]
 
 [dependencies]
@@ -35,6 +36,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tower-amp-macros = { path = "../tower-amp-macros", version = "0.1" }
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
 
 # tokio has no networking on WebAssembly, so the server only builds
 # elsewhere.
@@ -42,9 +44,6 @@ tower-amp-macros = { path = "../tower-amp-macros", version = "0.1" }
 tokio = { workspace = true, features = ["net", "rt", "time"] }
 # `rt` is for the task tracker `serve` waits on at shutdown.
 tokio-util = { workspace = true, features = ["rt"] }
-# Only the server logs, so the `tracing` feature has nothing to pull in on
-# WebAssembly.
-tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
 
 # On WASI (wasm32-wasip2) tokio's runtime and timers work, so a connection is
 # driven as it is natively. Only the client builds there.

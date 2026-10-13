@@ -12,18 +12,27 @@ use serde::{Deserialize, Serialize};
 use tokio::io::DuplexStream;
 use tokio_util::codec::Framed;
 use tower::Service;
-use tower_amp::{AmpCodec, Client, Error, command};
+use tower_amp::{AmpCodec, Client, Connection, Error, Handle, Router, command};
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[command(response = Total)]
 struct Sum {
     a: i64,
     b: i64,
 }
 
-#[derive(Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct Total {
     total: i64,
+}
+
+/// Served when the peer calls `Sum` on a [`Connection`].
+impl Handle for Sum {
+    async fn handle(self) -> Result<Total, Error> {
+        Ok(Total {
+            total: self.a + self.b,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -273,6 +282,50 @@ fn assert_reserved<T: std::fmt::Debug>(result: &Result<T, Error>, expected: &[u8
         ),
         "{result:?}"
     );
+}
+
+/// A connection with a service answers the peer's requests and still makes
+/// calls of its own, both on the same connection. The connection is driven
+/// on the test's own task, since WebAssembly may have no runtime to spawn
+/// it on.
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
+async fn a_connection_answers_the_peer_and_calls_it() {
+    let (io, peer_io) = tokio::io::duplex(4096);
+    let connection = Connection::new(io);
+    let client = connection.client().with_timeout(Duration::from_millis(200));
+    let mut peer = Framed::new(peer_io, AmpCodec::new());
+    let test = async move {
+        // The peer asks, and the connection's router answers.
+        let mut arguments = AmpBox::new();
+        arguments.insert("a", "1").unwrap();
+        arguments.insert("b", "2").unwrap();
+        let request = Request::new("Sum", arguments).with_ask("7");
+        peer.send(request.into_box().unwrap()).await.unwrap();
+        let answer = next_box(&mut peer).await;
+        assert_eq!(answer.get("_answer"), Some(&b"7"[..]));
+        assert_eq!(answer.get("total"), Some(&b"3"[..]));
+
+        // The connection asks, and the peer answers.
+        let answering = async {
+            let amp_box = next_box(&mut peer).await;
+            let Ok(Message::Request(request)) = Message::from_box(amp_box) else {
+                panic!("the connection wrote something other than a request");
+            };
+            peer.send(respond(&request).unwrap()).await.unwrap();
+        };
+        let (total, ()) = tokio::join!(client.call(&Sum { a: 40, b: 2 }), answering);
+        assert_eq!(total.unwrap(), Total { total: 42 });
+    };
+    tokio::select! {
+        () = test => {}
+        ended = connection.serve(Router::new().command::<Sum>()) => {
+            panic!("the connection ended before the test: {ended:?}")
+        }
+    }
 }
 
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]

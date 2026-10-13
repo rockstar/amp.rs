@@ -95,10 +95,11 @@ non-host target anyway. A panic aborts a wasm test binary, so one failing
 test there takes the rest of its binary down with it; run the failing test
 alone to see its message. The tests in `tower-amp/tests/roundtrip.rs` drive
 a served connection, so that file is compiled out on wasm, and
-`tower-amp/tests/client.rs` covers the client against a hand-rolled peer
-instead. A test that needs both sides goes in the first; one that only
-needs the client goes in the second, and must not spawn, since on
-`wasm32-unknown-unknown` there is no runtime to spawn on.
+`tower-amp/tests/client.rs` covers the client, and a `Connection` that
+serves, against a hand-rolled peer instead. A test that needs both sides
+goes in the first; one that only needs the client goes in the second, and
+must not spawn, since on `wasm32-unknown-unknown` there is no runtime to
+spawn on.
 
 CI also runs `tower-amp/tests/client.rs` on `wasm32-unknown-unknown`, in
 Node, where there is no tokio runtime to block on: each test there is a
@@ -131,12 +132,15 @@ The two wasm targets differ in whether tokio's runtime can run. Under WASI it
 can, so `wasm32-wasip2` gets `rt` and `time` and the client works as it does
 natively. In a browser it cannot, so on `wasm32-unknown-unknown` the client
 spawns through `wasm-bindgen-futures` and times out through `gloo-timers`.
-Everything that differs there is a small `#[cfg]`'d helper in `client.rs`
-(`spawn`, `timeout`, the `Send` bound on the I/O type, and the `Service`
-future type), keyed on `all(target_arch = "wasm32", target_os = "unknown")`,
-so a change to the client should only ever need one of those to change.
-The client tests above exercise `spawn` and `timeout` on that target, the
-latter through `an_unanswered_call_times_out`.
+Everything that differs there is a small `#[cfg]`'d helper, keyed on
+`all(target_arch = "wasm32", target_os = "unknown")`: in `connection.rs`,
+`spawn` and `call`, which elsewhere runs a handler on a task of its own to
+survive its panic; in `client.rs`, `timeout`, the `Send` bound on the I/O
+type, and the `Service` future type. A change to the client or the
+connection should only ever need one of those to change. The client tests
+above exercise `spawn` and `timeout` on that target, the latter through
+`an_unanswered_call_times_out`, and `call` through
+`a_connection_answers_the_peer_and_calls_it`.
 
 Twisted interoperability
 --
@@ -145,7 +149,9 @@ AMP's reference implementation is Twisted's, and the point of these crates
 is to talk to it, so `tower-amp/tests/twisted.rs` runs this crate's server
 against Twisted's client and this crate's client against Twisted's server,
 over TCP on loopback. The Python side is `tower-amp/tests/twisted/peer.py`,
-whose commands are the `Sum` and `Divide` from Twisted's AMP documentation.
+whose commands are the `Sum` and `Divide` from Twisted's AMP documentation,
+and `Relay`, which each side answers by calling `Sum` on the other, so that
+both runs also cover a command going the other way on the same connection.
 
 The tests are marked `#[ignore]`, since they need a Python with Twisted
 installed, so `cargo test` and the hooks skip them and only CI runs them.

@@ -1,28 +1,17 @@
 use std::io;
 use std::pin::pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 use amp_protocol::codec::AmpCodec;
-use amp_protocol::{AmpBox, Answer, ErrorResponse, Message, Request};
-use futures_util::{SinkExt, StreamExt};
+use amp_protocol::{AmpBox, Request};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio::task::JoinError;
-use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tower::{Service, ServiceExt};
+use tower::Service;
 
-use crate::Error;
-use crate::error::INTERNAL_ERROR;
-
-/// How many requests one connection may have in flight: received and not
-/// yet answered. Past this the connection stops reading until a reply has
-/// been queued, so a peer that sends requests without reading the replies
-/// is held to this much memory rather than as much as it cares to send.
-const MAX_IN_FLIGHT: usize = 256;
+use crate::connection::Owner;
+use crate::{Connection, Error, log};
 
 /// How long the accept loop waits after `accept` fails for want of a file
 /// descriptor, so that it neither spins nor gives up while the process is
@@ -232,7 +221,8 @@ fn out_of_descriptors(err: &io::Error) -> bool {
 /// `tracing` feature, every failure is logged with the command's name, the
 /// error or the panic's message; without it, a failure the peer did not ask
 /// to hear about is discarded. Answers and errors the peer sends, which would
-/// belong to commands this side had called, are ignored.
+/// belong to commands this side had called, are ignored: this side calls
+/// none. A [`Connection`] serves the peer and calls commands on it.
 ///
 /// `io` need not be a socket, so nothing is done to its options. An accept
 /// loop of your own should set `TCP_NODELAY` on each `TcpStream`, as
@@ -288,219 +278,9 @@ where
     S::Error: Into<Error>,
     S::Future: Send,
 {
-    let (mut sink, mut stream) = Framed::new(io, codec).split();
-    let (responses, mut pending) = mpsc::channel::<AmpBox>(16);
-    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
-
-    // Reading and writing are separate futures so that a write the peer is
-    // slow to accept never stops this side from reading. If both sides
-    // stopped reading while blocked on a write, neither would ever drain the
-    // other's buffer.
-    let read = async move {
-        loop {
-            // `biased` so that a shutdown is seen even while the peer keeps
-            // the stream ready. A `next` that loses to it is dropped with
-            // nothing read, since the frame stays in the codec's buffer.
-            let incoming = tokio::select! {
-                biased;
-                () = shutdown.cancelled() => break,
-                next = stream.next() => match next {
-                    Some(incoming) => incoming?,
-                    None => break,
-                },
-            };
-            match Message::from_box(incoming)? {
-                Message::Request(request) => {
-                    // Waiting here, rather than spawning without bound, is
-                    // what holds the peer to `MAX_IN_FLIGHT`. Replies are
-                    // written by `write` below, which does not depend on
-                    // this loop, so waiting cannot deadlock. A shutdown
-                    // ends the wait, and the request with it.
-                    let permit = tokio::select! {
-                        biased;
-                        () = shutdown.cancelled() => break,
-                        permit = Arc::clone(&in_flight).acquire_owned() => {
-                            permit.expect("the semaphore is never closed")
-                        }
-                    };
-                    tokio::spawn(respond(service.clone(), request, responses.clone(), permit));
-                }
-                Message::Answer(_) | Message::Error(_) => {}
-            }
-        }
-        // The peer is done sending, or this side is done reading. Dropping
-        // this sender lets the writer finish once every request already
-        // received has been answered.
-        drop(responses);
-        Ok::<_, Error>(())
-    };
-    let write = async move {
-        while let Some(response) = pending.recv().await {
-            sink.send(response).await?;
-        }
-        Ok::<_, Error>(())
-    };
-    tokio::try_join!(read, write)?;
-    Ok(())
-}
-
-/// Runs one request through the service and queues its response, if the
-/// request wants one. The permit is the request's share of the connection's
-/// in-flight limit, released when this returns: once the response is queued,
-/// or at once for a request that wants none.
-async fn respond<S>(
-    mut service: S,
-    request: Request,
-    responses: mpsc::Sender<AmpBox>,
-    _permit: OwnedSemaphorePermit,
-) where
-    S: Service<Request, Response = AmpBox> + Send + 'static,
-    S::Error: Into<Error>,
-    S::Future: Send,
-{
-    let command = request.command.clone();
-    let ask = request.ask.clone();
-    // The service runs on a task of its own so that a handler that panics
-    // takes down only that task. This one survives to answer the request,
-    // which would otherwise wait on the peer forever.
-    let call = tokio::spawn(async move {
-        let service = service.ready().await.map_err(Into::into)?;
-        service.call(request).await.map_err(Into::into)
-    });
-    let result = match call.await {
-        Ok(Ok(results)) => Ok(results),
-        Ok(Err(err)) => {
-            log::command_failed(&command, ask.as_deref(), &err);
-            Err(err)
-        }
-        Err(err) => {
-            // The panic's message is for the log only: it says what the
-            // handler was doing, which is this side's business, not the
-            // peer's.
-            log::command_panicked(&command, ask.as_deref(), &panicked(err));
-            Err(Error::new(ErrorResponse::UNKNOWN, INTERNAL_ERROR))
-        }
-    };
-    let Some(ask) = ask else {
-        return;
-    };
-    let response = match result {
-        Ok(results) => match Answer::new(ask.clone(), results).into_box() {
-            Ok(response) => response,
-            Err(err) => {
-                let err = Error::Protocol(err);
-                log::command_failed(&command, Some(&ask), &err);
-                error_response(ask, &err)
-            }
-        },
-        Err(err) => error_response(ask, &err),
-    };
-    let _ = responses.send(response).await;
-}
-
-/// What a handler that did not finish has to say for itself: the panic's
-/// message, when it has one.
-fn panicked(err: JoinError) -> String {
-    match err.try_into_panic() {
-        Ok(payload) => match payload.downcast_ref::<&str>() {
-            Some(message) => format!("command panicked: {message}"),
-            None => match payload.downcast_ref::<String>() {
-                Some(message) => format!("command panicked: {message}"),
-                None => "command panicked".to_string(),
-            },
-        },
-        Err(_) => "command was cancelled".to_string(),
-    }
-}
-
-/// Builds the error box for `ask`. A code or description longer than a box
-/// value may be is cut down to fit, since the handler's error must be
-/// answered somehow and the alternative is a request the peer waits on
-/// forever.
-fn error_response(ask: Vec<u8>, err: &Error) -> AmpBox {
-    let description = err.description();
-    ErrorResponse::new(ask, fit(err.code()), fit(&description))
-        .into_box()
-        .expect("the ask came off the wire and the other fields were cut to fit")
-}
-
-/// The longest value a box may carry, as `amp_protocol` enforces it. The
-/// crate does not export the limit; `limit_matches_amp_protocol` below pins
-/// this copy to it.
-const MAX_VALUE_LENGTH: usize = 0xFFFF;
-
-/// Truncates `s` to the longest prefix that fits a box value without
-/// splitting a character.
-fn fit(s: &str) -> &str {
-    if s.len() <= MAX_VALUE_LENGTH {
-        return s;
-    }
-    let mut end = MAX_VALUE_LENGTH;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// What a server has to say about failures the peer does not hear about in
-/// full. Each function is an event with the `tracing` feature, and nothing
-/// without it, so the callers need no `cfg`.
-#[cfg(feature = "tracing")]
-mod log {
-    use std::borrow::Cow;
-    use std::io;
-
-    use crate::Error;
-
-    /// The ask as a log field: the peer's own text, or `-` for a request
-    /// that wanted no reply.
-    fn ask(ask: Option<&[u8]>) -> Cow<'_, str> {
-        ask.map_or(Cow::Borrowed("-"), String::from_utf8_lossy)
-    }
-
-    /// A command whose service returned `err`. A command error is the
-    /// handler's own answer to the peer, so it is only of interest when
-    /// debugging; anything else is a failure the peer was told nothing
-    /// about, or told only that its request was malformed.
-    pub(super) fn command_failed(command: &[u8], ask: Option<&[u8]>, err: &Error) {
-        let command = String::from_utf8_lossy(command);
-        let ask = self::ask(ask);
-        match err {
-            Error::Command { .. } => {
-                tracing::debug!(%command, %ask, error = %err, "command failed")
-            }
-            _ => tracing::warn!(%command, %ask, error = %err, "command failed"),
-        }
-    }
-
-    /// A command whose handler panicked, or was cancelled, with `reason`.
-    pub(super) fn command_panicked(command: &[u8], ask: Option<&[u8]>, reason: &str) {
-        let command = String::from_utf8_lossy(command);
-        let ask = self::ask(ask);
-        tracing::error!(%command, %ask, "{reason}");
-    }
-
-    /// An error from `accept` that the accept loop carries on past.
-    pub(super) fn accept_skipped(err: &io::Error) {
-        tracing::warn!(error = %err, "could not accept a connection");
-    }
-
-    /// An error that ended one of `serve`'s connections.
-    pub(super) fn connection_failed(err: &Error) {
-        tracing::warn!(error = %err, "connection failed");
-    }
-}
-
-#[cfg(not(feature = "tracing"))]
-mod log {
-    use std::io;
-
-    use crate::Error;
-
-    pub(super) fn command_failed(_: &[u8], _: Option<&[u8]>, _: &Error) {}
-    pub(super) fn command_panicked(_: &[u8], _: Option<&[u8]>, _: &str) {}
-    pub(super) fn accept_skipped(_: &io::Error) {}
-    pub(super) fn connection_failed(_: &Error) {}
+    Connection::with_codec(io, codec)
+        .run(service, shutdown, Owner::Driver)
+        .await
 }
 
 /// What the `tracing` feature logs. This lives with the unit tests rather
@@ -511,7 +291,7 @@ mod log {
 #[cfg(all(test, feature = "tracing"))]
 mod log_test {
     use std::io::Write;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use tower::service_fn;
     use tracing_subscriber::filter::LevelFilter;
@@ -678,39 +458,5 @@ mod test {
         ] {
             assert_eq!(retry_after(&err), None, "{err}");
         }
-    }
-
-    #[test]
-    fn limit_matches_amp_protocol() {
-        let mut amp_box = AmpBox::new();
-        amp_box.insert("k", vec![0; MAX_VALUE_LENGTH]).unwrap();
-        assert!(amp_box.insert("k", vec![0; MAX_VALUE_LENGTH + 1]).is_err());
-    }
-
-    #[test]
-    fn fit_keeps_what_fits() {
-        let short = "x".repeat(MAX_VALUE_LENGTH);
-        assert_eq!(fit(&short).len(), MAX_VALUE_LENGTH);
-        let long = "x".repeat(MAX_VALUE_LENGTH + 1);
-        assert_eq!(fit(&long).len(), MAX_VALUE_LENGTH);
-    }
-
-    #[test]
-    fn fit_does_not_split_a_character() {
-        // Two-byte characters, so the limit falls in the middle of one.
-        let long = "é".repeat(MAX_VALUE_LENGTH);
-        let fitted = fit(&long);
-        assert_eq!(fitted.len(), MAX_VALUE_LENGTH - 1);
-        assert!(fitted.chars().all(|c| c == 'é'));
-    }
-
-    #[test]
-    fn over_long_fields_still_make_a_box() {
-        let err = Error::new("X".repeat(70_000), "y".repeat(70_000));
-        let amp_box = error_response(b"1".to_vec(), &err);
-        let response = ErrorResponse::from_box(amp_box).unwrap();
-        assert_eq!(response.error, b"1");
-        assert_eq!(response.code.len(), MAX_VALUE_LENGTH);
-        assert_eq!(response.description.len(), MAX_VALUE_LENGTH);
     }
 }

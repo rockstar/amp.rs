@@ -1,7 +1,9 @@
 """The Twisted side of tower-amp's interoperability test.
 
 The commands are the `Sum` and `Divide` from Twisted's AMP documentation,
-which `examples/sum_server.rs` and `tests/twisted.rs` implement in Rust.
+which `examples/sum_server.rs` and `tests/twisted.rs` implement in Rust,
+plus `Relay`, which either side answers by calling `Sum` on the other: the
+proof that commands go both ways on one connection.
 
     peer.py client PORT   calls both commands on the server at PORT and
                           exits 0 if every answer is what Twisted expects
@@ -30,6 +32,11 @@ class Divide(amp.Command):
     errors = {ZeroDivisionError: b"ZERO_DIVISION"}
 
 
+class Relay(amp.Command):
+    arguments = [(b"a", amp.Integer()), (b"b", amp.Integer())]
+    response = [(b"total", amp.Integer())]
+
+
 class Math(amp.AMP):
     @Sum.responder
     def sum(self, a, b):
@@ -39,12 +46,20 @@ class Math(amp.AMP):
     def divide(self, numerator, denominator):
         return {"result": numerator / denominator}
 
+    @Relay.responder
+    def relay(self, a, b):
+        return self.callRemote(Sum, a=a, b=b)
+
 
 @defer.inlineCallbacks
 def call_everything(port):
-    proto = yield ClientCreator(reactor, amp.AMP).connectTCP("127.0.0.1", port)
+    # `Math` rather than a bare `amp.AMP`, so that the server can call `Sum`
+    # back on this client while answering `Relay`.
+    proto = yield ClientCreator(reactor, Math).connectTCP("127.0.0.1", port)
     total = yield proto.callRemote(Sum, a=13, b=81)
     assert total == {"total": 94}, total
+    total = yield proto.callRemote(Relay, a=5, b=6)
+    assert total == {"total": 11}, total
     quotient = yield proto.callRemote(Divide, numerator=1234, denominator=5)
     assert quotient == {"result": 246.8}, quotient
     try:

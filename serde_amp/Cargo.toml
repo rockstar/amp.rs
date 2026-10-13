@@ -22,4 +22,9 @@ amp-protocol = { path = "../amp-protocol", version = "0.1" }
 serde.workspace = true
 
 [dev-dependencies]
+divan = "0.1"
 serde = { workspace = true, features = ["derive"] }
+
+[[bench]]
+name = "to_box"
+harness = false

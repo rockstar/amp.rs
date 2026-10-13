@@ -26,7 +26,10 @@ type Handler<S> = dyn Fn(S, AmpBox) -> BoxFuture<Result<AmpBox, Error>> + Send +
 /// [`Handle`](crate::Handle); one made with [`Router::with_state`] serves
 /// commands that implement [`HandleWith`] for its state.
 pub struct Router<S = ()> {
-    handlers: HashMap<Vec<u8>, Arc<Handler<S>>>,
+    // Shared so that cloning the router, which `serve` does per connection
+    // and `serve_connection` does per request, bumps a refcount instead of
+    // copying the table and every command name in it.
+    handlers: Arc<HashMap<Vec<u8>, Arc<Handler<S>>>>,
     state: S,
 }
 
@@ -50,7 +53,7 @@ where
     /// Creates a router whose commands receive a clone of `state`.
     pub fn with_state(state: S) -> Self {
         Router {
-            handlers: HashMap::new(),
+            handlers: Arc::new(HashMap::new()),
             state,
         }
     }
@@ -71,8 +74,9 @@ where
                 Err(err) => Box::pin(ready(Err(err.into()))),
             }
         };
-        self.handlers
-            .insert(C::NAME.as_bytes().to_vec(), Arc::new(handler));
+        // The table is only shared once the router has been cloned, so this
+        // copies nothing in the usual builder chain.
+        Arc::make_mut(&mut self.handlers).insert(C::NAME.as_bytes().to_vec(), Arc::new(handler));
         self
     }
 }
@@ -80,7 +84,7 @@ where
 impl<S: Clone> Clone for Router<S> {
     fn clone(&self) -> Self {
         Router {
-            handlers: self.handlers.clone(),
+            handlers: Arc::clone(&self.handlers),
             state: self.state.clone(),
         }
     }

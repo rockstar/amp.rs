@@ -10,7 +10,7 @@ pub mod codec;
 mod error;
 mod message;
 
-pub use amp_box::AmpBox;
+pub use amp_box::{AmpBox, Iter};
 pub use error::Error;
 pub use message::{Answer, ErrorResponse, Message, Request};
 

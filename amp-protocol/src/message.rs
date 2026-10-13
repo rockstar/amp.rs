@@ -217,11 +217,11 @@ impl Message {
     /// `_command`, as in the reference implementation. A box with none of the
     /// three fails with [`Error::UnrecognizedBox`].
     pub fn from_box(amp_box: AmpBox) -> Result<Self, Error> {
-        if amp_box.get(KEY_ANSWER).is_some() {
+        if amp_box.contains_key(KEY_ANSWER) {
             Answer::from_box(amp_box).map(Message::Answer)
-        } else if amp_box.get(KEY_ERROR).is_some() {
+        } else if amp_box.contains_key(KEY_ERROR) {
             ErrorResponse::from_box(amp_box).map(Message::Error)
-        } else if amp_box.get(KEY_COMMAND).is_some() {
+        } else if amp_box.contains_key(KEY_COMMAND) {
             Request::from_box(amp_box).map(Message::Request)
         } else {
             Err(Error::UnrecognizedBox)

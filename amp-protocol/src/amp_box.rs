@@ -81,6 +81,12 @@ impl AmpBox {
             .map(|(_, v)| v.as_slice())
     }
 
+    /// Whether the box holds a pair under `key`.
+    pub fn contains_key<K: AsRef<[u8]>>(&self, key: K) -> bool {
+        let key = key.as_ref();
+        self.entries.iter().any(|(k, _)| k == key)
+    }
+
     /// Removes `key` and returns its value, if it was present.
     pub fn remove<K: AsRef<[u8]>>(&mut self, key: K) -> Option<Vec<u8>> {
         let key = key.as_ref();
@@ -99,10 +105,8 @@ impl AmpBox {
     }
 
     /// Iterates over the pairs in insertion order.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> {
-        self.entries
-            .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+    pub fn iter(&self) -> Iter<'_> {
+        Iter(self.entries.iter())
     }
 
     /// The number of bytes [`encode`](Self::encode) will produce.
@@ -307,6 +311,36 @@ impl IntoIterator for AmpBox {
     }
 }
 
+impl<'a> IntoIterator for &'a AmpBox {
+    type Item = (&'a [u8], &'a [u8]);
+    type IntoIter = Iter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Iterates over the pairs of an [`AmpBox`] in insertion order, as borrowed
+/// key and value slices.
+///
+/// Returned by [`AmpBox::iter`] and by iterating over `&AmpBox`.
+#[derive(Clone, Debug)]
+pub struct Iter<'a>(std::slice::Iter<'a, (Vec<u8>, Vec<u8>)>);
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(k, v)| (k.as_slice(), v.as_slice()))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl ExactSizeIterator for Iter<'_> {}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -337,10 +371,28 @@ mod test {
         assert_eq!(amp_box.get("a"), Some(&b"13"[..]));
         assert_eq!(amp_box.get(b"b"), Some(&b"81"[..]));
         assert_eq!(amp_box.get("missing"), None);
+        assert!(amp_box.contains_key("_ask"));
+        assert!(amp_box.contains_key(b"b"));
+        assert!(!amp_box.contains_key("missing"));
         assert_eq!(amp_box.remove("_ask"), Some(b"1".to_vec()));
         assert_eq!(amp_box.remove("_ask"), None);
         assert_eq!(amp_box.get("_ask"), None);
+        assert!(!amp_box.contains_key("_ask"));
         assert_eq!(amp_box.len(), 3);
+    }
+
+    #[test]
+    fn borrowed_iteration_matches_iter() {
+        let amp_box = sum_request();
+        let mut seen = Vec::new();
+        for (key, value) in &amp_box {
+            seen.push((key, value));
+        }
+        assert_eq!(seen, amp_box.iter().collect::<Vec<_>>());
+        assert_eq!(seen.len(), 4);
+        assert_eq!(amp_box.iter().len(), 4);
+        // The box is still usable after borrowed iteration.
+        assert_eq!(amp_box.get("a"), Some(&b"13"[..]));
     }
 
     #[test]

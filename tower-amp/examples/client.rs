@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
-use tower_amp::{command, Client, Error};
+use tower_amp::{Client, Error, command};
 
 #[derive(Serialize)]
 #[command(response = Total)]

@@ -99,7 +99,7 @@ impl AmpBox {
     }
 
     /// Iterates over the pairs in insertion order.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> + '_ {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> {
         self.entries
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))

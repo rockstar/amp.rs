@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
-use tower_amp::{command, Error, HandleWith, Router};
+use tower_amp::{Error, HandleWith, Router, command};
 
 /// The state every command receives. It is cloned per request, so it must
 /// be cheap to clone and must own its data through a shared handle.

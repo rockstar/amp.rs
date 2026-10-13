@@ -1,7 +1,7 @@
 //! A client and a served connection joined by an in-memory pipe.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use amp_protocol::{AmpBox, Request};
@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tower::{Service, ServiceBuilder};
-use tower_amp::{command, AmpCodec, Client, Error, Handle, HandleWith, Router};
+use tower_amp::{AmpCodec, Client, Error, Handle, HandleWith, Router, command};
 
 #[derive(Serialize, Deserialize)]
 #[command(response = Total)]

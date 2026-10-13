@@ -1,6 +1,6 @@
 use crate::{
-    is_reserved_key, AmpBox, Error, KEY_ANSWER, KEY_ASK, KEY_COMMAND, KEY_ERROR, KEY_ERROR_CODE,
-    KEY_ERROR_DESCRIPTION,
+    AmpBox, Error, KEY_ANSWER, KEY_ASK, KEY_COMMAND, KEY_ERROR, KEY_ERROR_CODE,
+    KEY_ERROR_DESCRIPTION, is_reserved_key,
 };
 
 /// A request to run a command.

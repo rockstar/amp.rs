@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tower_amp::{command, Error, Handle, Router};
+use tower_amp::{Error, Handle, Router, command};
 
 #[derive(Deserialize)]
 #[command(response = Total)]

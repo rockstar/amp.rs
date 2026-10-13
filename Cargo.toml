@@ -1,11 +1,17 @@
 [workspace]
-resolver = "2"
+# Resolver 3 (the 2024 default) skips dependency versions whose
+# `rust-version` is above ours when it can.
+resolver = "3"
 members = ["amp-protocol", "serde_amp", "tower-amp", "tower-amp-macros"]
 
 # Fields shared by every crate in the workspace. A crate opts in with
 # `<field>.workspace = true` in its own Cargo.toml.
 [workspace.package]
-edition = "2021"
+edition = "2024"
+# Minimum supported Rust version. The current floor is the 2024 edition
+# itself. CI checks every crate on exactly this toolchain, so bump it here
+# when a newer feature is needed, and note the bump in that crate's release.
+rust-version = "1.85"
 authors = ["Paul Hummer <paul@eventuallyanyway.com>"]
 license = "MIT"
 repository = "https://github.com/rockstar/serde_amp"

@@ -4,9 +4,9 @@
 //! the one to watch: it used to re-parse the buffer on every chunk, which
 //! made a large box take seconds instead of milliseconds.
 
-use amp_protocol::{codec::AmpCodec, AmpBox};
+use amp_protocol::{AmpBox, codec::AmpCodec};
 use bytes::BytesMut;
-use divan::{black_box, Bencher};
+use divan::{Bencher, black_box};
 use tokio_util::codec::Decoder;
 
 fn main() {

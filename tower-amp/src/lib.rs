@@ -9,11 +9,6 @@ mod handle;
 mod router;
 mod server;
 
-/// The codec a connection is framed by, re-exported from `amp-protocol` so
-/// that the frame-size limit can be set without depending on it directly.
-/// See [`serve_with_codec`], [`serve_connection_with_codec`], and
-/// [`Client::with_codec`].
-pub use amp_protocol::codec::AmpCodec;
 /// The box type that carries a command's arguments and results, re-exported
 /// from `amp-protocol` so that services use the version this crate was built
 /// against.
@@ -21,6 +16,11 @@ pub use amp_protocol::AmpBox;
 /// The request type that services accept, re-exported from `amp-protocol`
 /// for the same reason as [`AmpBox`].
 pub use amp_protocol::Request;
+/// The codec a connection is framed by, re-exported from `amp-protocol` so
+/// that the frame-size limit can be set without depending on it directly.
+/// See [`serve_with_codec`], [`serve_connection_with_codec`], and
+/// [`Client::with_codec`].
+pub use amp_protocol::codec::AmpCodec;
 pub use client::Client;
 pub use command::Command;
 pub use error::Error;

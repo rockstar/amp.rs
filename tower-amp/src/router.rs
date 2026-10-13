@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::future::{ready, Future};
+use std::future::{Future, ready};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use amp_protocol::{AmpBox, Request};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tower::Service;
 
 use crate::{Error, HandleWith};

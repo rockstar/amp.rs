@@ -6,6 +6,7 @@ keywords = ["amp", "tower", "tokio", "twisted", "rpc"]
 categories = ["network-programming", "asynchronous"]
 readme = "README.md"
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

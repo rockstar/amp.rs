@@ -5,7 +5,7 @@
 use bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::amp_box::{scan_frame, Frame};
+use crate::amp_box::{Frame, scan_frame};
 use crate::{AmpBox, Error};
 
 /// Splits a byte stream into boxes and writes boxes back out.

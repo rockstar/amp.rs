@@ -8,7 +8,7 @@ use proc_macro2::Span;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{parse_macro_input, DeriveInput, LitStr, Token, Type};
+use syn::{DeriveInput, LitStr, Token, Type, parse_macro_input};
 
 /// Declares the struct it is attached to as a command's arguments.
 ///

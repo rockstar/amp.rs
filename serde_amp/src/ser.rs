@@ -419,7 +419,7 @@ impl SeqBuilder {
             Value::Scalar(bytes) => {
                 self.set_kind(SeqKind::ListOf)?;
                 let len = u16::try_from(bytes.len()).map_err(|_| {
-                    Error::Unsupported("a sequence element longer than 65,535 bytes")
+                    Error::Protocol(amp_protocol::Error::ValueTooLong { len: bytes.len() })
                 })?;
                 self.out.extend_from_slice(&len.to_be_bytes());
                 self.out.extend_from_slice(&bytes);
@@ -820,9 +820,9 @@ mod test {
             to_box(&One {
                 v: vec![long.as_str()]
             }),
-            Err(Error::Unsupported(
-                "a sequence element longer than 65,535 bytes"
-            ))
+            Err(Error::Protocol(amp_protocol::Error::ValueTooLong {
+                len: 65_536
+            }))
         ));
     }
 }

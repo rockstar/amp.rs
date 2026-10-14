@@ -1,6 +1,6 @@
 [package]
 name = "tower-amp"
-version = "0.2.2"
+version = "0.3.0"
 description = "Build Asynchronous Messaging Protocol (AMP) servers and clients with tower and tokio"
 keywords = ["amp", "tower", "tokio", "twisted", "rpc"]
 categories = ["network-programming", "asynchronous"]
@@ -29,13 +29,13 @@ tracing = ["dep:tracing"]
 amp-protocol = { path = "../amp-protocol", version = "0.2.0", features = ["tokio"] }
 futures-util = { workspace = true, features = ["sink"] }
 serde = { workspace = true }
-serde_amp = { path = "../serde_amp", version = "0.3" }
+serde_amp = { path = "../serde_amp", version = "0.4" }
 # Only the tokio features that build on every WebAssembly target go here;
 # see the target tables below.
 tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
-tower-amp-macros = { path = "../tower-amp-macros", version = "0.1" }
+tower-amp-macros = { path = "../tower-amp-macros", version = "0.2" }
 tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
 
 # tokio has no networking on WebAssembly, so the server only builds

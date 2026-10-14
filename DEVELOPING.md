@@ -227,7 +227,31 @@ Releasing
 Each crate is released on its own, tagged `<crate>-<version>`. The script
 patch-bumps every crate that changed since its last tag, releases as-is any
 crate whose version was already bumped by hand (because `cargo semver-checks`
-demanded it), commits the bumps, tags, and pushes. Pushing a tag starts the
+demanded it), commits the bumps, tags, and pushes. Before bumping anything it
+runs [semwave](https://crates.io/crates/semwave), which needs the nightly
+toolchain:
+
+```
+cargo install semwave --locked
+rustup toolchain install nightly
+```
+
+A hand bump of one crate obliges a bump of every crate that exposes its types
+in a public API: `serde_amp` and `tower-amp` re-export `amp-protocol` types,
+so a consumer of `serde_amp = "0.3"` must never get `amp-protocol` 0.2's
+`AmpBox` from a `cargo update`. `cargo semver-checks` does not notice, since
+it compares each crate's own items only. semwave diffs the crate versions
+since the last release, walks the workspace dependency graph, and names each
+public item that leaks a bumped crate's types. Bump the crates it lists by
+hand (their `Cargo.toml` dependency on the sibling too) until it is quiet;
+CI runs the same check on every push. It reads the manifests from git, so
+commit a bump before checking it by hand:
+
+```
+semwave --source "$(git describe --tags --abbrev=0)" --target HEAD
+```
+
+Pushing a tag starts the
 [release workflow](.github/workflows/release.yml), which publishes that crate
 to crates.io and then creates a GitHub release for the tag. The script refuses
 to run unless `main` is clean, identical to `origin/main`, and green in CI; it

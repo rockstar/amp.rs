@@ -285,7 +285,7 @@ where
 
 /// [`serve`] with the codec every connection is framed by.
 #[deprecated(
-    since = "0.2.3",
+    since = "0.3.0",
     note = "use `Server::new(service).codec(codec).serve(listener)`"
 )]
 pub async fn serve_with_codec<S>(
@@ -304,7 +304,7 @@ where
 /// [`serve`] until `signal` completes, answering the requests in flight
 /// before returning, as [`Server::shutdown`] describes.
 #[deprecated(
-    since = "0.2.3",
+    since = "0.3.0",
     note = "use `Server::new(service).shutdown(signal).serve(listener)`"
 )]
 pub async fn serve_with_shutdown<S, F>(
@@ -324,7 +324,7 @@ where
 /// [`serve`] with the codec every connection is framed by, until `signal`
 /// completes, as [`Server::shutdown`] describes.
 #[deprecated(
-    since = "0.2.3",
+    since = "0.3.0",
     note = "use `Server::new(service).codec(codec).shutdown(signal).serve(listener)`"
 )]
 pub async fn serve_with_codec_and_shutdown<S, F>(
@@ -423,7 +423,7 @@ where
 
 /// [`serve_connection`] with the codec the connection is framed by.
 #[deprecated(
-    since = "0.2.3",
+    since = "0.3.0",
     note = "use `Server::new(service).codec(codec).serve_connection(io)`"
 )]
 pub async fn serve_connection_with_codec<T, S>(

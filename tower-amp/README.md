@@ -305,7 +305,7 @@ error, which the peer is told in full, is logged at `debug`. The feature
 changes nothing on the wire.
 
 ```toml
-tower-amp = { version = "0.2", features = ["tracing"] }
+tower-amp = { version = "0.3", features = ["tracing"] }
 ```
 
 Not yet supported: TLS. A connection error inside `serve` ends that

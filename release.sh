@@ -17,6 +17,14 @@
 # Before anything is tagged, HEAD must already be on the remote branch with a
 # green CI run, so a release is never cut from untested code.
 #
+# A hand bump of one crate can oblige a bump of the crates that expose its
+# types in their public API (a re-export, a field, a signature): a consumer
+# of those would otherwise get the incompatible types from a patch release.
+# `cargo semver-checks` does not see that, since it compares each crate's own
+# items only. `semwave` diffs the crate versions since the last release and
+# walks the workspace dependency graph, and the script refuses to go on when
+# it finds a dependent that was not bumped enough.
+#
 # Each released crate gets a tag on the (possibly new) HEAD. The branch is
 # pushed first, then each tag in its own push: GitHub creates no push events
 # at all when more than three tags arrive in one push, and without an event
@@ -57,13 +65,18 @@ die() {
 
 # `cargo set-version` comes from cargo-edit, installed as the `cargo-set-version`
 # binary on PATH like any other cargo subcommand.
-for tool in git cargo jq gh cargo-set-version; do
+for tool in git cargo jq gh cargo-set-version semwave; do
     command -v "$tool" >/dev/null && continue
     case "$tool" in
         cargo-set-version) die "'cargo set-version' is required; install it with: cargo install cargo-edit" ;;
+        semwave) die "'semwave' is required; install it with: cargo install semwave --locked" ;;
         *) die "'$tool' is required but not installed" ;;
     esac
 done
+
+# semwave builds rustdoc JSON, which only the nightly toolchain produces.
+rustup run nightly cargo --version >/dev/null 2>&1 \
+    || die "semwave needs the nightly toolchain; install it with: rustup toolchain install nightly"
 
 cd "$(git rev-parse --show-toplevel)"
 
@@ -99,6 +112,17 @@ case "$ci_status/$ci_conclusion" in
     completed/*)       die "CI finished with '$ci_conclusion': $ci_url" ;;
     *)                 die "CI is still '$ci_status'; wait for it to finish: $ci_url" ;;
 esac
+
+# Every release tags its HEAD, so the nearest tag is the last release commit.
+# Versions bumped by hand since then are the seeds; a crate that exposes a
+# seed's types in its public API must have been bumped at least as far.
+last_release="$(git describe --tags --abbrev=0 HEAD)"
+echo "Checking that version bumps since $last_release reach the crates that expose them..."
+if ! semwave_report="$(semwave --no-color --source "$last_release" --target HEAD 2>&1)"; then
+    printf '%s\n' "$semwave_report" >&2
+    die "a crate that exposes a bumped crate's types was not bumped enough; see the report above"
+fi
+echo "  every dependent is bumped as far as it needs to be"
 
 # `name version dir` for every publishable workspace crate. `--no-deps`
 # restricts the metadata to workspace members.

@@ -91,6 +91,26 @@ jobs:
         with:
           tool: wasm-pack
       - run: wasm-pack test --node tower-amp --all-features --test client
+  # A crate bumped by hand (because `cargo semver-checks` demanded it) must
+  # be matched by a bump of every crate that exposes its types in a public
+  # API, or consumers get the incompatible types from a patch release.
+  # `cargo semver-checks` compares each crate's own items only, so this runs
+  # semwave, which diffs the crate versions since the last release and walks
+  # the workspace dependency graph. release.sh runs the same check.
+  semver-deps:
+    name: Check version bumps reach the crates that expose them
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The last release tag is the comparison base.
+          fetch-depth: 0
+      # semwave builds rustdoc JSON, which only nightly produces.
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install semwave --locked --version 0.6.2
+      # Every release tags its HEAD, so the nearest tag is the last release.
+      - run: semwave --no-color --source "$(git describe --tags --abbrev=0)" --target HEAD
   msrv:
     name: Check workspace on the minimum supported Rust version
     runs-on: ubuntu-latest

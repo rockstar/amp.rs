@@ -2,7 +2,7 @@ use std::any::Any;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use amp_protocol::codec::AmpCodec;
 use amp_protocol::{AmpBox, Answer, ErrorResponse, MAX_VALUE_LENGTH, Message, Request};
@@ -13,7 +13,7 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
-use crate::client::{Outgoing, lock};
+use crate::client::{Outgoing, Pending, lock};
 use crate::error::INTERNAL_ERROR;
 use crate::{Client, Error, log};
 
@@ -203,6 +203,12 @@ where
         let cause = Arc::clone(&client.cause);
         drop(client);
         let pending = &pending;
+        // The handles still hold `pending`, so it has to be emptied rather
+        // than dropped, and on every way out of here, including being
+        // dropped part way through: a call waiting for an answer that never
+        // learned the connection ended would wait forever. Declared after
+        // `_open` so that it runs first.
+        let _clear = ClearOnDrop(pending);
         let (mut sink, mut stream) = framed.split();
         let (responses, mut replies) = mpsc::channel::<AmpBox>(16);
         let in_flight = Arc::new(Semaphore::new(max_in_flight));
@@ -376,12 +382,21 @@ where
                 err
             }
         });
-        // Clearing `pending` and dropping the futures, and `outgoing` with
-        // them, fails every call still waiting, and each finds the cause
-        // already recorded. The handles still hold `pending`, so it has to
-        // be emptied rather than dropped.
-        lock(pending).clear();
+        // Returning clears `pending` and drops the futures, and `outgoing`
+        // with them, which fails every call still waiting, and each finds
+        // the cause already recorded.
         result
+    }
+}
+
+/// Empties the map of calls waiting for an answer when dropped, so that
+/// their callers learn the connection ended however [`Connection::run`]
+/// ends.
+struct ClearOnDrop<'a>(&'a Mutex<Pending>);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        lock(self.0).clear();
     }
 }
 

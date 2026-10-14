@@ -396,3 +396,35 @@ async fn dropping_the_serve_future_closes_its_clients() {
     assert!(cause.is_none(), "{cause:?}");
     assert!(client.is_closed());
 }
+
+/// A call still waiting for its answer when the `serve` future is dropped
+/// fails rather than waiting forever: the map of waiting calls outlives the
+/// future, in the handles, so it has to be emptied on the way out.
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
+async fn dropping_the_serve_future_fails_the_calls_in_flight() {
+    let (client_io, peer_io) = tokio::io::duplex(4096);
+    let mut peer = Framed::new(peer_io, AmpCodec::new());
+    let connection = Connection::new(client_io);
+    let client = connection.client();
+    let mut serve = Box::pin(connection.serve(Router::new()));
+    let mut call = std::pin::pin!(client.call(&Silence {}));
+    // Drive both until the request reaches the peer, who never answers.
+    let written = tokio::select! {
+        result = &mut serve => unreachable!("the connection ended: {result:?}"),
+        failed = &mut call => unreachable!("the call ended: {failed:?}"),
+        written = peer.next() => written,
+    };
+    assert!(written.is_some(), "the request was never written");
+    drop(serve);
+    let failed = timeout(Duration::from_secs(2), call)
+        .await
+        .expect("the call never noticed");
+    assert!(
+        matches!(failed, Err(Error::ConnectionClosed { cause: None })),
+        "{failed:?}"
+    );
+}

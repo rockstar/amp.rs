@@ -5,7 +5,7 @@
 use bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::amp_box::{Frame, scan_frame};
+use crate::amp_box::{Frame, Scanned, scan_frame};
 use crate::{AmpBox, Error};
 
 /// Splits a byte stream into boxes and writes boxes back out.
@@ -21,65 +21,98 @@ use crate::{AmpBox, Error};
 /// ```
 ///
 /// A box is read into memory in full before it is decoded, so the codec
-/// refuses one longer than its maximum frame length with
-/// [`Error::FrameTooLong`] rather than buffer without bound. The default
-/// limit is 16 MiB; [`with_max_frame_length`](AmpCodec::with_max_frame_length)
-/// sets another.
+/// holds a box to two limits rather than buffer without bound:
+///
+/// * Its encoding may be at most the maximum frame length, 16 MiB by default.
+///   A longer box fails with [`Error::FrameTooLong`].
+/// * It may hold at most the maximum number of pairs, 1,024 by default. A box
+///   with more fails with [`Error::TooManyPairs`]. A decoded pair costs far
+///   more than the few bytes it can take on the wire, so without this limit
+///   a frame of tiny pairs would cost many times its length to decode.
+///
+/// Both are checked as the box arrives, so an offending box is rejected as
+/// soon as it passes a limit and is never decoded. [`new`](AmpCodec::new)
+/// uses the defaults, [`with_max_frame_length`](AmpCodec::with_max_frame_length)
+/// sets the first, and [`with_limits`](AmpCodec::with_limits) sets both.
 ///
 /// While a box is still arriving, the codec remembers how much of it has
 /// already been checked, so each call scans only the new bytes and the box is
 /// decoded exactly once, when it is complete. That makes a codec specific to
-/// one stream. A clone keeps the frame limit but not that position, so it is
+/// one stream. A clone keeps the limits but not that position, so it is
 /// ready for a fresh stream: clone one codec per connection.
 ///
 /// [`Framed`]: tokio_util::codec::Framed
 #[derive(Debug)]
 pub struct AmpCodec {
     max_frame_length: usize,
-    /// How many bytes at the front of the buffer have been scanned and found
-    /// to be whole pairs of a box whose terminator has not arrived yet.
-    scanned: usize,
+    max_pairs: usize,
+    /// How much of the box at the front of the buffer has been scanned and
+    /// found to be whole pairs, while its terminator has not arrived yet.
+    scanned: Scanned,
 }
 
 /// The frame length [`AmpCodec::new`] allows: 16 MiB, room for a box of a
 /// few hundred full-size values, which is far beyond any sensible packet.
 const DEFAULT_MAX_FRAME_LENGTH: usize = 16 * 1024 * 1024;
 
+/// The number of pairs [`AmpCodec::new`] allows. A box has a pair per
+/// argument of a command plus a few the protocol reserves, so this too is far
+/// beyond any sensible packet.
+const DEFAULT_MAX_PAIRS: usize = 1024;
+
 impl AmpCodec {
-    /// Creates a codec with the default maximum frame length of 16 MiB.
+    /// Creates a codec with the default limits: a frame length of 16 MiB and
+    /// 1,024 pairs.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Creates a codec that rejects a box whose encoding is longer than
     /// `max_frame_length` bytes, counting the key and value length prefixes
-    /// and the two-byte terminator. Decoding such a box fails with
-    /// [`Error::FrameTooLong`], as soon as that many bytes of it have
-    /// arrived without a terminator.
+    /// and the two-byte terminator, with the default limit of 1,024 pairs.
+    /// Decoding such a box fails with [`Error::FrameTooLong`], as soon as
+    /// that many bytes of it have arrived without a terminator.
     ///
     /// Set this to the largest box the peer could legitimately send. Each
     /// value is at most 65,535 bytes and each key at most 255, so the length
     /// is bounded by the number of pairs a box carries.
     pub fn with_max_frame_length(max_frame_length: usize) -> Self {
+        Self::with_limits(max_frame_length, DEFAULT_MAX_PAIRS)
+    }
+
+    /// Creates a codec with both limits set: a box longer than
+    /// `max_frame_length` bytes fails with [`Error::FrameTooLong`], as
+    /// [`with_max_frame_length`](AmpCodec::with_max_frame_length) describes,
+    /// and one with more than `max_pairs` pairs fails with
+    /// [`Error::TooManyPairs`], as soon as the start of one pair too many has
+    /// arrived.
+    ///
+    /// Set `max_pairs` to the most pairs the peer could legitimately send in
+    /// one box, counting the reserved keys (`_command` and `_ask` on a
+    /// request, `_answer` on an answer, and `_error`, `_error_code`, and
+    /// `_error_description` on an error). A repeated key counts each time it
+    /// appears.
+    pub fn with_limits(max_frame_length: usize, max_pairs: usize) -> Self {
         AmpCodec {
             max_frame_length,
-            scanned: 0,
+            max_pairs,
+            scanned: Scanned::default(),
         }
     }
 }
 
 impl Default for AmpCodec {
     fn default() -> Self {
-        Self::with_max_frame_length(DEFAULT_MAX_FRAME_LENGTH)
+        Self::with_limits(DEFAULT_MAX_FRAME_LENGTH, DEFAULT_MAX_PAIRS)
     }
 }
 
-/// A clone is a codec for another stream with the same frame limit. The scan
+/// A clone is a codec for another stream with the same limits. The scan
 /// position is an offset into one buffer and means nothing in any other, so
 /// it is not carried over.
 impl Clone for AmpCodec {
     fn clone(&self) -> Self {
-        Self::with_max_frame_length(self.max_frame_length)
+        Self::with_limits(self.max_frame_length, self.max_pairs)
     }
 }
 
@@ -88,21 +121,14 @@ impl Decoder for AmpCodec {
     type Error = Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<AmpBox>, Error> {
-        if self.scanned == 0 {
-            // Most boxes arrive whole, so decode in one pass when nothing of
-            // this box has been seen before. If it turns out to be incomplete
-            // the wasted work is bounded by the bytes already here, and later
-            // calls scan from where this one stopped instead of retrying, so
-            // a box that trickles in is still decoded only once in full.
-            match AmpBox::decode(src) {
-                Ok((amp_box, consumed)) => return self.accept(src, amp_box, consumed),
-                Err(Error::Incomplete) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        match scan_frame(src, self.scanned) {
+        // The scan finds the end of the box and counts its pairs without
+        // allocating for them, so both limits are checked before anything is
+        // decoded. It resumes from where the last call stopped, so a box
+        // that trickles in is walked once in full and decoded once, when it
+        // is complete.
+        match scan_frame(src, self.scanned, self.max_pairs) {
             Ok(Frame::Complete(len)) => {
-                self.scanned = 0;
+                self.scanned = Scanned::default();
                 if len > self.max_frame_length {
                     return Err(Error::FrameTooLong {
                         limit: self.max_frame_length,
@@ -111,14 +137,15 @@ impl Decoder for AmpCodec {
                 // The scan proved the box ends at `len`, so this decode sees
                 // exactly one complete box and cannot report it incomplete.
                 let (amp_box, consumed) = AmpBox::decode(&src[..len])?;
-                self.accept(src, amp_box, consumed)
+                src.advance(consumed);
+                Ok(Some(amp_box))
             }
             Ok(Frame::Incomplete(scanned)) => {
                 // Every byte in `src` belongs to this box, since the ones
                 // before it were consumed. Once there are more than the
                 // limit, this box can never be accepted, so stop buffering it.
                 if src.len() > self.max_frame_length {
-                    self.scanned = 0;
+                    self.scanned = Scanned::default();
                     return Err(Error::FrameTooLong {
                         limit: self.max_frame_length,
                     });
@@ -127,30 +154,10 @@ impl Decoder for AmpCodec {
                 Ok(None)
             }
             Err(err) => {
-                self.scanned = 0;
+                self.scanned = Scanned::default();
                 Err(err)
             }
         }
-    }
-}
-
-impl AmpCodec {
-    /// Hands over a box decoded from the front of `src`, consuming its bytes,
-    /// unless it is longer than the limit.
-    fn accept(
-        &mut self,
-        src: &mut BytesMut,
-        amp_box: AmpBox,
-        consumed: usize,
-    ) -> Result<Option<AmpBox>, Error> {
-        self.scanned = 0;
-        if consumed > self.max_frame_length {
-            return Err(Error::FrameTooLong {
-                limit: self.max_frame_length,
-            });
-        }
-        src.advance(consumed);
-        Ok(Some(amp_box))
     }
 }
 
@@ -228,9 +235,83 @@ mod test {
     }
 
     #[test]
-    fn default_limit_is_16_mib() {
-        assert_eq!(AmpCodec::new().max_frame_length, 16 * 1024 * 1024);
-        assert_eq!(AmpCodec::default().max_frame_length, 16 * 1024 * 1024);
+    fn default_limits_are_16_mib_and_1024_pairs() {
+        for codec in [AmpCodec::new(), AmpCodec::default()] {
+            assert_eq!(codec.max_frame_length, 16 * 1024 * 1024);
+            assert_eq!(codec.max_pairs, 1024);
+        }
+        let codec = AmpCodec::with_max_frame_length(1024);
+        assert_eq!(codec.max_frame_length, 1024);
+        assert_eq!(codec.max_pairs, 1024);
+    }
+
+    /// The attack: a frame of the smallest possible pairs, each with a
+    /// unique key, decodes to many times its own size. The codec must count
+    /// the pairs and refuse the box before it decodes any of them.
+    #[test]
+    fn complete_box_over_the_pair_limit_is_rejected() {
+        let mut bytes = Vec::new();
+        for i in 0..4u8 {
+            bytes.extend_from_slice(&[0, 1, b'a' + i, 0, 0]);
+        }
+        bytes.extend_from_slice(&[0, 0]);
+
+        let mut codec = AmpCodec::with_limits(1024, 3);
+        let mut buf = BytesMut::from(&bytes[..]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(Error::TooManyPairs { limit: 3 })
+        ));
+        assert_eq!(buf.len(), bytes.len(), "the box is left where it was");
+        assert_eq!(codec.scanned, Scanned::default());
+
+        let mut codec = AmpCodec::with_limits(1024, 4);
+        let amp_box = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(amp_box.len(), 4, "a box at the limit is accepted");
+        assert!(buf.is_empty());
+    }
+
+    /// A box that trickles in is refused as soon as one pair too many starts
+    /// to arrive, with no terminator in sight. The pair count carries over
+    /// from one call to the next like the byte position does.
+    #[test]
+    fn unterminated_box_over_the_pair_limit_is_rejected() {
+        let mut codec = AmpCodec::with_limits(1024, 2);
+        let mut buf = BytesMut::new();
+        for _ in 0..2 {
+            buf.extend_from_slice(PAIR);
+            assert!(codec.decode(&mut buf).unwrap().is_none());
+        }
+        assert_eq!(
+            codec.scanned,
+            Scanned {
+                bytes: 2 * PAIR.len(),
+                pairs: 2
+            }
+        );
+
+        buf.extend_from_slice(&PAIR[..2]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(Error::TooManyPairs { limit: 2 })
+        ));
+        assert_eq!(codec.scanned, Scanned::default());
+    }
+
+    /// Repeated keys collapse into one entry when decoded, but each one is
+    /// a pair on the wire and costs work to decode, so each one counts.
+    #[test]
+    fn repeated_keys_count_as_separate_pairs() {
+        let mut codec = AmpCodec::with_limits(1024, 2);
+        let mut buf = BytesMut::new();
+        for _ in 0..3 {
+            buf.extend_from_slice(PAIR);
+        }
+        buf.extend_from_slice(b"\x00\x00");
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(Error::TooManyPairs { limit: 2 })
+        ));
     }
 
     /// The attack: pairs keep arriving and the terminator never does. The
@@ -298,9 +379,13 @@ mod test {
             match codec.decode(&mut buf).unwrap() {
                 Some(amp_box) => decoded = Some(amp_box),
                 None => {
-                    assert_eq!(codec.scanned % PAIR_LEN, 0, "scan stops at a pair boundary");
+                    assert_eq!(
+                        codec.scanned.bytes % PAIR_LEN,
+                        0,
+                        "scan stops at a pair boundary"
+                    );
                     assert!(
-                        buf.len() - codec.scanned < PAIR_LEN,
+                        buf.len() - codec.scanned.bytes < PAIR_LEN,
                         "scan covers every whole pair"
                     );
                 }
@@ -308,7 +393,7 @@ mod test {
         }
         assert_eq!(decoded.unwrap(), amp_box);
         assert!(buf.is_empty());
-        assert_eq!(codec.scanned, 0);
+        assert_eq!(codec.scanned, Scanned::default());
     }
 
     /// The scan position belongs to one box. It is dropped once that box is
@@ -320,20 +405,26 @@ mod test {
 
         buf.extend_from_slice(&SUM_REQUEST[..12]);
         assert!(codec.decode(&mut buf).unwrap().is_none());
-        assert_eq!(codec.scanned, 9, "the first pair is 9 bytes");
+        assert_eq!(codec.scanned, Scanned { bytes: 9, pairs: 1 });
         buf.extend_from_slice(&SUM_REQUEST[12..]);
         assert!(codec.decode(&mut buf).unwrap().is_some());
-        assert_eq!(codec.scanned, 0);
+        assert_eq!(codec.scanned, Scanned::default());
 
         buf.extend_from_slice(PAIR);
         assert!(codec.decode(&mut buf).unwrap().is_none());
-        assert_eq!(codec.scanned, PAIR.len());
+        assert_eq!(
+            codec.scanned,
+            Scanned {
+                bytes: PAIR.len(),
+                pairs: 1
+            }
+        );
         buf.extend_from_slice(b"\x01\x00");
         assert!(matches!(
             codec.decode(&mut buf),
             Err(Error::KeyTooLong { len: 256 })
         ));
-        assert_eq!(codec.scanned, 0);
+        assert_eq!(codec.scanned, Scanned::default());
     }
 
     /// A codec cloned while a box is still arriving starts the new stream
@@ -343,11 +434,18 @@ mod test {
         let mut codec = AmpCodec::with_max_frame_length(1024);
         let mut buf = BytesMut::from(&SUM_REQUEST[..30]);
         assert!(codec.decode(&mut buf).unwrap().is_none());
-        assert_eq!(codec.scanned, 24, "the first three pairs are 24 bytes");
+        assert_eq!(
+            codec.scanned,
+            Scanned {
+                bytes: 24,
+                pairs: 2
+            }
+        );
 
         let mut clone = codec.clone();
-        assert_eq!(clone.scanned, 0);
+        assert_eq!(clone.scanned, Scanned::default());
         assert_eq!(clone.max_frame_length, 1024);
+        assert_eq!(clone.max_pairs, DEFAULT_MAX_PAIRS);
 
         let mut fresh = BytesMut::from(PAIR);
         fresh.extend_from_slice(b"\x00\x00");

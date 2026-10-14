@@ -22,7 +22,7 @@ pub use amp_protocol::AmpBox;
 /// for the same reason as [`AmpBox`].
 pub use amp_protocol::Request;
 /// The codec a connection is framed by, re-exported from `amp-protocol` so
-/// that the frame-size limit can be set without depending on it directly.
+/// that its limits can be set without depending on it directly.
 /// See [`Server::codec`], [`Connection::with_codec`], and
 /// [`Client::with_codec`].
 pub use amp_protocol::codec::AmpCodec;

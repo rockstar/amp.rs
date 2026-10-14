@@ -253,25 +253,41 @@ impl<'a> Keys<'a> {
 pub(crate) enum Frame {
     /// The whole box, terminator included, is present and this long.
     Complete(usize),
-    /// The box runs past the end of the buffer. This many bytes of it are
-    /// whole pairs, so a later scan can resume there once more arrive.
-    Incomplete(usize),
+    /// The box runs past the end of the buffer. This much of it has been
+    /// scanned, so a later scan can resume there once more arrives.
+    Incomplete(Scanned),
+}
+
+/// How much of an unfinished box a scan has covered: a prefix of whole pairs.
+#[cfg(feature = "tokio")]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Scanned {
+    /// The length of that prefix in bytes.
+    pub(crate) bytes: usize,
+    /// The number of pairs in it.
+    pub(crate) pairs: usize,
 }
 
 /// Walks the pairs of the box at the front of `bytes` without decoding or
-/// copying them, to find where it ends. Starts at `from`, which must be a
-/// pair boundary within that box: zero, or the position a previous
-/// [`Frame::Incomplete`] reported for the same buffer.
+/// copying them, to find where it ends. Starts at `from`: nothing, or the
+/// position a previous [`Frame::Incomplete`] reported for the same buffer.
 ///
 /// Fails with [`Error::KeyTooLong`] as [`AmpBox::decode`] would, so a
-/// malformed box is rejected as soon as the bad length prefix arrives.
+/// malformed box is rejected as soon as the bad length prefix arrives, and
+/// with [`Error::TooManyPairs`] as soon as the start of pair `max_pairs + 1`
+/// does. Counting pairs here, before anything is allocated for them, is what
+/// keeps a box of millions of tiny pairs from costing many times its size.
 #[cfg(feature = "tokio")]
-pub(crate) fn scan_frame(bytes: &[u8], from: usize) -> Result<Frame, Error> {
-    let mut pos = from;
+pub(crate) fn scan_frame(bytes: &[u8], from: Scanned, max_pairs: usize) -> Result<Frame, Error> {
+    let mut pos = from.bytes;
+    let mut pairs = from.pairs;
     loop {
         let start = pos;
         let Ok(key_len) = read_u16(bytes, pos) else {
-            return Ok(Frame::Incomplete(start));
+            return Ok(Frame::Incomplete(Scanned {
+                bytes: start,
+                pairs,
+            }));
         };
         pos += 2;
         if key_len == 0 {
@@ -280,14 +296,24 @@ pub(crate) fn scan_frame(bytes: &[u8], from: usize) -> Result<Frame, Error> {
         if key_len > MAX_KEY_LENGTH {
             return Err(Error::KeyTooLong { len: key_len });
         }
+        if pairs == max_pairs {
+            return Err(Error::TooManyPairs { limit: max_pairs });
+        }
         pos += key_len;
         let Ok(value_len) = read_u16(bytes, pos) else {
-            return Ok(Frame::Incomplete(start));
+            return Ok(Frame::Incomplete(Scanned {
+                bytes: start,
+                pairs,
+            }));
         };
         pos += 2 + value_len;
         if pos > bytes.len() {
-            return Ok(Frame::Incomplete(start));
+            return Ok(Frame::Incomplete(Scanned {
+                bytes: start,
+                pairs,
+            }));
         }
+        pairs += 1;
     }
 }
 
@@ -568,49 +594,92 @@ mod test {
         assert_eq!(amp_box.get(b"\xff\xfe"), Some(&b"\x00\x01"[..]));
     }
 
-    /// The pair boundaries of `SUM_REQUEST`, excluding the terminator.
+    /// The pair boundaries of `SUM_REQUEST`, excluding the terminator. The
+    /// boundary at index `i` follows `i` whole pairs.
     #[cfg(feature = "tokio")]
     const SUM_REQUEST_PAIRS: [usize; 5] = [0, 9, 24, 31, 38];
+
+    /// The scan position after the first `pairs` pairs of `SUM_REQUEST`.
+    #[cfg(feature = "tokio")]
+    fn scanned(pairs: usize) -> Scanned {
+        Scanned {
+            bytes: SUM_REQUEST_PAIRS[pairs],
+            pairs,
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    const UNLIMITED: usize = usize::MAX;
 
     #[cfg(feature = "tokio")]
     #[test]
     fn scan_frame_finds_the_end_of_the_box() {
         assert!(matches!(
-            scan_frame(SUM_REQUEST, 0),
+            scan_frame(SUM_REQUEST, scanned(0), UNLIMITED),
             Ok(Frame::Complete(40))
         ));
         assert!(matches!(
-            scan_frame(b"\x00\x00rest", 0),
+            scan_frame(b"\x00\x00rest", scanned(0), UNLIMITED),
             Ok(Frame::Complete(2))
         ));
         let mut stream = SUM_REQUEST.to_vec();
         stream.extend_from_slice(SUM_REQUEST);
-        assert!(matches!(scan_frame(&stream, 0), Ok(Frame::Complete(40))));
+        assert!(matches!(
+            scan_frame(&stream, scanned(0), UNLIMITED),
+            Ok(Frame::Complete(40))
+        ));
     }
 
     /// At every truncation the scan stops at the start of the pair that is
-    /// cut off, and resuming from any earlier boundary agrees with a scan
-    /// from the start.
+    /// cut off, with the count of pairs before it, and resuming from any
+    /// earlier boundary agrees with a scan from the start.
     #[cfg(feature = "tokio")]
     #[test]
     fn scan_frame_stops_at_the_last_whole_pair() {
         for len in 0..SUM_REQUEST.len() {
             let bytes = &SUM_REQUEST[..len];
-            let expected = SUM_REQUEST_PAIRS
+            let whole = SUM_REQUEST_PAIRS
                 .into_iter()
-                .rev()
-                .find(|&b| b <= len)
+                .rposition(|b| b <= len)
                 .unwrap();
-            for from in SUM_REQUEST_PAIRS.into_iter().filter(|&b| b <= expected) {
+            for from in 0..=whole {
                 assert!(
-                    matches!(scan_frame(bytes, from), Ok(Frame::Incomplete(at)) if at == expected),
-                    "truncated to {len} bytes, scanning from {from}"
+                    matches!(
+                        scan_frame(bytes, scanned(from), UNLIMITED),
+                        Ok(Frame::Incomplete(at)) if at == scanned(whole)
+                    ),
+                    "truncated to {len} bytes, scanning from {from} pairs"
                 );
             }
         }
         assert!(matches!(
-            scan_frame(SUM_REQUEST, 38),
+            scan_frame(SUM_REQUEST, scanned(4), UNLIMITED),
             Ok(Frame::Complete(40))
+        ));
+    }
+
+    /// The limit is on pairs seen, so a box at the limit passes and one over
+    /// it fails as soon as the extra pair's key length is in, whether the
+    /// scan started from the beginning or resumed partway through.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn scan_frame_rejects_a_box_over_the_pair_limit() {
+        assert!(matches!(
+            scan_frame(SUM_REQUEST, scanned(0), 4),
+            Ok(Frame::Complete(40))
+        ));
+        let cut = &SUM_REQUEST[..SUM_REQUEST_PAIRS[3] + 2];
+        assert!(matches!(
+            scan_frame(cut, scanned(0), 3),
+            Err(Error::TooManyPairs { limit: 3 })
+        ));
+        assert!(matches!(
+            scan_frame(cut, scanned(2), 3),
+            Err(Error::TooManyPairs { limit: 3 })
+        ));
+        assert!(matches!(
+            scan_frame(&cut[..cut.len() - 1], scanned(2), 3),
+            Ok(Frame::Incomplete(at)) if at == scanned(3)
         ));
     }
 
@@ -619,11 +688,11 @@ mod test {
     fn scan_frame_rejects_key_longer_than_255() {
         let bytes = b"\x00\x01k\x00\x01v\x01\x00";
         assert!(matches!(
-            scan_frame(bytes, 0),
+            scan_frame(bytes, Scanned::default(), UNLIMITED),
             Err(Error::KeyTooLong { len: 256 })
         ));
         assert!(matches!(
-            scan_frame(bytes, 6),
+            scan_frame(bytes, Scanned { bytes: 6, pairs: 1 }, UNLIMITED),
             Err(Error::KeyTooLong { len: 256 })
         ));
     }

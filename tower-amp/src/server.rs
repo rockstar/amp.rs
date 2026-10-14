@@ -82,8 +82,9 @@ where
     F: Future<Output = ()>,
 {
     /// The codec every connection is framed by, for setting the largest box
-    /// a peer may send with [`AmpCodec::with_max_frame_length`]. The default
-    /// refuses a box longer than 16 MiB.
+    /// a peer may send with [`AmpCodec::with_max_frame_length`] or
+    /// [`AmpCodec::with_limits`]. The default refuses a box longer than
+    /// 16 MiB or with more than 1,024 pairs.
     pub fn codec(mut self, codec: AmpCodec) -> Self {
         self.codec = codec;
         self
@@ -272,8 +273,9 @@ where
 /// the acknowledgement of the one before it.
 ///
 /// Each connection uses a default [`AmpCodec`], which refuses a box longer
-/// than 16 MiB, and may have 256 requests in flight at once. [`Server`]
-/// serves with another codec or limit, and with a way to stop.
+/// than 16 MiB or with more than 1,024 pairs, and may have 256 requests in
+/// flight at once. [`Server`] serves with another codec or limit, and with a
+/// way to stop.
 pub async fn serve<S>(listener: TcpListener, service: S) -> Result<(), Error>
 where
     S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
@@ -408,9 +410,11 @@ fn out_of_descriptors(err: &io::Error) -> bool {
 /// Returns once the peer closes the connection and every request already
 /// received has been answered, or with the error that ended the connection.
 /// A box longer than the codec allows is such an error, reported as
-/// [`Error::Protocol`] wrapping [`amp_protocol::Error::FrameTooLong`]. The
-/// default [`AmpCodec`] allows 16 MiB. [`Server::serve_connection`] serves
-/// with another codec or in-flight limit, and with a way to stop.
+/// [`Error::Protocol`] wrapping [`amp_protocol::Error::FrameTooLong`], and so
+/// is one with more pairs, wrapping [`amp_protocol::Error::TooManyPairs`]. The
+/// default [`AmpCodec`] allows 16 MiB and 1,024 pairs.
+/// [`Server::serve_connection`] serves with another codec or in-flight limit,
+/// and with a way to stop.
 pub async fn serve_connection<T, S>(io: T, service: S) -> Result<(), Error>
 where
     T: AsyncRead + AsyncWrite,

@@ -93,15 +93,16 @@ where
     /// waits for the acknowledgement of the one written before it.
     ///
     /// The connection uses a default [`AmpCodec`], which refuses a box
-    /// longer than 16 MiB and closes the connection;
-    /// [`with_codec`](Connection::with_codec) takes another.
+    /// longer than 16 MiB or with more than 1,024 pairs and closes the
+    /// connection; [`with_codec`](Connection::with_codec) takes another.
     pub fn new(io: T) -> Self {
         Self::with_codec(io, AmpCodec::new())
     }
 
     /// [`new`](Connection::new) with the codec the connection is framed by,
     /// for setting the largest box the peer may send with
-    /// [`AmpCodec::with_max_frame_length`].
+    /// [`AmpCodec::with_max_frame_length`], or that and the most pairs it may
+    /// hold with [`AmpCodec::with_limits`].
     pub fn with_codec(io: T, codec: AmpCodec) -> Self {
         let (client, outgoing, open) = Client::detached();
         Connection {

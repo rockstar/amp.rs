@@ -283,9 +283,11 @@ stops reading until one has been answered, so a peer that sends without
 reading its replies is held to a bounded amount of memory.
 
 A box is read in full before it is handled, so a connection refuses one
-longer than 16 MiB and closes rather than buffering without bound. Pass an
-`AmpCodec` to `Server::codec`, `Connection::with_codec`, or
-`Client::with_codec` to set another limit.
+longer than 16 MiB and closes rather than buffering without bound. It also
+refuses one with more than 1,024 pairs, since a decoded pair costs far more
+than the few bytes it can take on the wire. Pass an `AmpCodec` to
+`Server::codec`, `Connection::with_codec`, or `Client::with_codec` to set
+other limits.
 
 Server options
 --

@@ -854,6 +854,33 @@ async fn server_rejects_a_box_over_its_frame_limit() {
     ));
 }
 
+/// The pair limit ends a connection the same way. An `Echo` request is three
+/// pairs: `_command`, `_ask`, and `payload`.
+#[tokio::test]
+async fn server_rejects_a_box_over_its_pair_limit() {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let codec = AmpCodec::with_limits(1024, 2);
+    let server = tokio::spawn(
+        Server::new(router())
+            .codec(codec)
+            .serve_connection(server_io),
+    );
+    let client = Client::new(client_io);
+
+    let failed = client
+        .call(&Echo {
+            payload: "ok".into(),
+        })
+        .await;
+    assert!(peer_closed(&failed), "{failed:?}");
+    assert!(matches!(
+        server.await.unwrap(),
+        Err(Error::Protocol(amp_protocol::Error::TooManyPairs {
+            limit: 2
+        }))
+    ));
+}
+
 /// The client holds the peer to its limit too: an answer that is too long
 /// ends the connection and fails the call instead of waiting on it.
 #[tokio::test]

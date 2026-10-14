@@ -17,7 +17,8 @@ fn main() {
 const SMALL: &[u8] =
     b"\x00\x04_ask\x00\x011\x00\x08_command\x00\x03Sum\x00\x01a\x00\x0213\x00\x01b\x00\x0281\x00\x00";
 
-/// Pairs in the large box, about 1.2 MB on the wire.
+/// Pairs in the large box, about 1.2 MB on the wire. More than the default
+/// codec allows, so the codec cases that read it raise the pair limit.
 const LARGE_KEYS: u32 = 20_000;
 
 /// A TCP segment's worth of payload, so the chunked case looks like a read
@@ -59,7 +60,7 @@ fn large_box(bencher: Bencher) {
 fn large_box_through_codec_in_chunks(bencher: Bencher) {
     let bytes = large();
     bencher.bench(|| {
-        let mut codec = AmpCodec::new();
+        let mut codec = AmpCodec::with_limits(16 * 1024 * 1024, LARGE_KEYS as usize);
         let mut buf = BytesMut::new();
         let mut decoded = None;
         for chunk in black_box(&bytes).chunks(CHUNK) {

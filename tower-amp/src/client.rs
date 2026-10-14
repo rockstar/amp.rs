@@ -113,8 +113,9 @@ macro_rules! constructors {
             /// server sets it on the connections it accepts.
             ///
             /// The connection uses a default [`AmpCodec`], which refuses a
-            /// box longer than 16 MiB and closes the connection;
-            /// [`with_codec`](Client::with_codec) takes another.
+            /// box longer than 16 MiB or with more than 1,024 pairs and
+            /// closes the connection; [`with_codec`](Client::with_codec)
+            /// takes another.
             pub fn new<T>(io: T) -> Client
             where
                 T: $($bound)+,
@@ -124,7 +125,8 @@ macro_rules! constructors {
 
             /// [`new`](Client::new) with the codec the connection is framed
             /// by, for setting the largest box the peer may send with
-            /// [`AmpCodec::with_max_frame_length`].
+            /// [`AmpCodec::with_max_frame_length`], or that and the most
+            /// pairs it may hold with [`AmpCodec::with_limits`].
             pub fn with_codec<T>(io: T, codec: AmpCodec) -> Client
             where
                 T: $($bound)+,

@@ -126,6 +126,7 @@ impl Error {
                 Protocol::ReservedKey(key) => Protocol::ReservedKey(key.clone()),
                 Protocol::UnrecognizedBox => Protocol::UnrecognizedBox,
                 Protocol::FrameTooLong { limit } => Protocol::FrameTooLong { limit: *limit },
+                Protocol::TooManyPairs { limit } => Protocol::TooManyPairs { limit: *limit },
                 Protocol::Io(err) => Protocol::Io(duplicate_io(err)),
                 // A variant amp-protocol has since added.
                 other => Protocol::Io(std::io::Error::other(other.to_string())),

@@ -38,6 +38,14 @@ pub enum Error {
         /// The limit in bytes.
         limit: usize,
     },
+    /// A box on a stream had more pairs than the codec allows. See
+    /// [`AmpCodec::with_limits`](crate::codec::AmpCodec::with_limits).
+    #[cfg(feature = "tokio")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+    TooManyPairs {
+        /// The limit in pairs.
+        limit: usize,
+    },
     /// The underlying stream failed.
     #[cfg(feature = "tokio")]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
@@ -71,6 +79,10 @@ impl fmt::Display for Error {
             #[cfg(feature = "tokio")]
             Error::FrameTooLong { limit } => {
                 write!(f, "box is longer than the limit of {limit} bytes")
+            }
+            #[cfg(feature = "tokio")]
+            Error::TooManyPairs { limit } => {
+                write!(f, "box has more than the limit of {limit} pairs")
             }
             #[cfg(feature = "tokio")]
             Error::Io(err) => write!(f, "i/o error: {err}"),

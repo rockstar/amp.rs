@@ -5,7 +5,7 @@ use std::pin::pin;
 use std::sync::Arc;
 
 use amp_protocol::codec::AmpCodec;
-use amp_protocol::{AmpBox, Answer, ErrorResponse, Message, Request};
+use amp_protocol::{AmpBox, Answer, ErrorResponse, MAX_VALUE_LENGTH, Message, Request};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -477,11 +477,6 @@ fn error_response(ask: Vec<u8>, err: &Error) -> AmpBox {
         .expect("the ask came off the wire and the other fields were cut to fit")
 }
 
-/// The longest value a box may carry, as `amp_protocol` enforces it. The
-/// crate does not export the limit; `limit_matches_amp_protocol` below pins
-/// this copy to it.
-const MAX_VALUE_LENGTH: usize = 0xFFFF;
-
 /// Truncates `s` to the longest prefix that fits a box value without
 /// splitting a character.
 fn fit(s: &str) -> &str {
@@ -511,13 +506,6 @@ pub(crate) fn spawn(task: impl Future<Output = ()> + 'static) {
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn limit_matches_amp_protocol() {
-        let mut amp_box = AmpBox::new();
-        amp_box.insert("k", vec![0; MAX_VALUE_LENGTH]).unwrap();
-        assert!(amp_box.insert("k", vec![0; MAX_VALUE_LENGTH + 1]).is_err());
-    }
 
     #[test]
     fn fit_keeps_what_fits() {

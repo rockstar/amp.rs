@@ -17,10 +17,10 @@ pub use message::{Answer, ErrorResponse, Message, Request};
 /// The longest key a box may hold, in bytes. Keys share the 16-bit length
 /// prefix used by values, but the protocol restricts them to 8 bits. A key of
 /// length zero is the box terminator.
-const MAX_KEY_LENGTH: usize = 0xFF;
+pub const MAX_KEY_LENGTH: usize = 0xFF;
 
 /// The longest value a box may hold, in bytes.
-const MAX_VALUE_LENGTH: usize = 0xFFFF;
+pub const MAX_VALUE_LENGTH: usize = 0xFFFF;
 
 // The keys the protocol reserves for itself. A box is a request if it carries
 // `_command`, an answer if it carries `_answer`, and an error response if it

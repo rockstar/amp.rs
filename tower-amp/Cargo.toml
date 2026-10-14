@@ -26,7 +26,7 @@ include = [
 tracing = ["dep:tracing"]
 
 [dependencies]
-amp-protocol = { path = "../amp-protocol", version = "0.1", features = ["tokio"] }
+amp-protocol = { path = "../amp-protocol", version = "0.1.3", features = ["tokio"] }
 futures-util = { workspace = true, features = ["sink"] }
 serde = { workspace = true }
 serde_amp = { path = "../serde_amp", version = "0.3" }

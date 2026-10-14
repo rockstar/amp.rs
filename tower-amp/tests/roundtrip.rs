@@ -12,7 +12,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tower::{Service, ServiceBuilder};
-use tower_amp::{AmpCodec, Client, Connection, Error, Handle, HandleWith, Router, command};
+use tower_amp::{AmpCodec, Client, Connection, Error, Handle, HandleWith, Router, Server, command};
 
 #[derive(Serialize, Deserialize)]
 #[command(response = Total)]
@@ -602,19 +602,18 @@ async fn pipelined_large_calls_do_not_deadlock() {
         .expect("deadlocked: neither side is reading while blocked on write");
 }
 
-/// A peer that sends requests faster than they are answered must not make
-/// the server take on every request it sends. Each `Hang` handler counts
-/// itself in and never finishes, so its request stays in flight for good and
-/// the count is exactly how many requests the server took on.
-#[tokio::test]
-async fn a_flooding_peer_is_held_to_the_in_flight_limit() {
-    let counter = Counter::default();
-    let router = Router::with_state(counter.clone()).command::<Hang>();
+/// How many requests a connection served by `server` takes on from a peer
+/// that sends far more than any limit and never reads. Each `Hang` handler
+/// counts itself in and never finishes, so its request stays in flight for
+/// good and the count is exactly how many requests the server took on.
+async fn flood<F>(server: Server<Router<Counter>, F>, counter: Counter) -> u64
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let (peer, server_io) = tokio::io::duplex(4096);
-    tokio::spawn(tower_amp::serve_connection(server_io, router));
-    // The peer writes far more than the limit and never reads. Its writes
-    // block once the server stops reading, so it runs on its own task and
-    // keeps the pipe open by never finishing.
+    tokio::spawn(server.serve_connection(server_io));
+    // The peer's writes block once the server stops reading, so it runs on
+    // its own task and keeps the pipe open by never finishing.
     tokio::spawn(async move {
         let mut peer = tokio_util::codec::Framed::new(peer, AmpCodec::new());
         for i in 0..2_000u32 {
@@ -625,10 +624,75 @@ async fn a_flooding_peer_is_held_to_the_in_flight_limit() {
     });
 
     // Give the server far longer than it needs to take on everything it is
-    // going to, then check that it stopped at the limit.
+    // going to, then check where it stopped.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let handled = counter.0.load(Ordering::SeqCst);
+    counter.0.load(Ordering::SeqCst)
+}
+
+/// A peer that sends requests faster than they are answered must not make
+/// the server take on every request it sends.
+#[tokio::test]
+async fn a_flooding_peer_is_held_to_the_in_flight_limit() {
+    let counter = Counter::default();
+    let router = Router::with_state(counter.clone()).command::<Hang>();
+    let handled = flood(Server::new(router), counter).await;
     assert_eq!(handled, 256, "the server took on {handled} requests");
+}
+
+/// The limit is whatever the server was given, below and above the default.
+#[tokio::test]
+async fn the_in_flight_limit_is_configurable() {
+    for limit in [4, 1_024] {
+        let counter = Counter::default();
+        let router = Router::with_state(counter.clone()).command::<Hang>();
+        let server = Server::new(router).max_in_flight(limit);
+        let handled = flood(server, counter).await;
+        assert_eq!(
+            handled, limit as u64,
+            "the server took on {handled} requests"
+        );
+    }
+}
+
+/// A connection that may never read a request would hang its peer, so a
+/// limit of zero is refused where it is set rather than at the first call.
+#[test]
+#[should_panic(expected = "a connection must be allowed a request in flight")]
+fn a_zero_in_flight_limit_is_refused() {
+    let _ = Server::new(router()).max_in_flight(0);
+}
+
+/// The shutdown signal works on one connection as it does on a listener:
+/// the connection stops reading, answers the request it has, and closes.
+#[tokio::test]
+async fn shutdown_stops_one_connection_once_its_requests_are_answered() {
+    let gate = Gate::default();
+    let router = Router::with_state(gate.clone())
+        .command::<Hold>()
+        .command::<Sum>();
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = Server::new(router).shutdown(async {
+        let _ = stopped.await;
+    });
+    let server = tokio::spawn(server.serve_connection(server_io));
+    let client = Client::new(client_io);
+
+    let held = tokio::spawn({
+        let client = client.clone();
+        async move { client.call(&Hold {}).await }
+    });
+    gate.started.notified().await;
+    stop.send(()).unwrap();
+    // The handler is still running, so the connection cannot have closed.
+    tokio::task::yield_now().await;
+    assert!(!server.is_finished());
+
+    gate.release.notify_one();
+    held.await.unwrap().unwrap();
+    server.await.unwrap().unwrap();
+    let failed = client.call(&Sum { a: 1, b: 2 }).await;
+    assert!(peer_closed(&failed), "{failed:?}");
 }
 
 /// An error code too long for the wire must still be answered, cut down to
@@ -704,11 +768,11 @@ async fn internal_errors_do_not_reach_the_peer() {
 async fn server_rejects_a_box_over_its_frame_limit() {
     let (client_io, server_io) = tokio::io::duplex(4096);
     let codec = AmpCodec::with_max_frame_length(1024);
-    let server = tokio::spawn(tower_amp::serve_connection_with_codec(
-        server_io,
-        router(),
-        codec,
-    ));
+    let server = tokio::spawn(
+        Server::new(router())
+            .codec(codec)
+            .serve_connection(server_io),
+    );
     let client = Client::new(client_io);
 
     let small = client
@@ -961,8 +1025,9 @@ async fn refused_eventually(addr: std::net::SocketAddr) {
     .expect("the listener was not closed");
 }
 
-/// `serve_with_shutdown` stops accepting as soon as the signal fires, still
-/// answers the request in flight, and returns once that connection closes.
+/// A server with a shutdown signal stops accepting as soon as it fires,
+/// still answers the request in flight, and returns once that connection
+/// closes.
 #[tokio::test]
 async fn shutdown_answers_the_requests_in_flight() {
     let gate = Gate::default();
@@ -972,9 +1037,10 @@ async fn shutdown_answers_the_requests_in_flight() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(tower_amp::serve_with_shutdown(listener, router, async {
+    let server = Server::new(router).shutdown(async {
         let _ = stopped.await;
-    }));
+    });
+    let server = tokio::spawn(server.serve(listener));
 
     let client = connect_tcp(addr).await;
     let held = tokio::spawn({
@@ -996,21 +1062,20 @@ async fn shutdown_answers_the_requests_in_flight() {
     assert!(peer_closed(&failed), "{failed:?}");
 }
 
-/// `serve_with_codec_and_shutdown` frames its connections with the codec
-/// and still stops on the signal, with nothing in flight to wait for.
+/// A server with a codec and a shutdown signal frames its connections with
+/// the codec and still stops on the signal, with nothing in flight to wait
+/// for.
 #[tokio::test]
 async fn shutdown_with_codec_keeps_the_frame_limit() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(tower_amp::serve_with_codec_and_shutdown(
-        listener,
-        router(),
-        AmpCodec::with_max_frame_length(1024),
-        async {
+    let server = Server::new(router())
+        .codec(AmpCodec::with_max_frame_length(1024))
+        .shutdown(async {
             let _ = stopped.await;
-        },
-    ));
+        });
+    let server = tokio::spawn(server.serve(listener));
 
     let client = connect_tcp(addr).await;
     let payload = "x".repeat(8_000);
@@ -1022,17 +1087,14 @@ async fn shutdown_with_codec_keeps_the_frame_limit() {
     refused_eventually(addr).await;
 }
 
-/// `serve_with_codec` frames every connection it accepts with the codec it
-/// was given, and a connection that breaks the limit ends only itself.
+/// A server with a codec frames every connection it accepts with it, and a
+/// connection that breaks the limit ends only itself.
 #[tokio::test]
-async fn serve_with_codec_frames_every_connection_with_it() {
+async fn a_server_frames_every_connection_with_its_codec() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(tower_amp::serve_with_codec(
-        listener,
-        router(),
-        AmpCodec::with_max_frame_length(1024),
-    ));
+    let server = Server::new(router()).codec(AmpCodec::with_max_frame_length(1024));
+    tokio::spawn(server.serve(listener));
 
     let client = connect_tcp(addr).await;
     let payload = "x".repeat(8_000);

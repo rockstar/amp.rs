@@ -23,7 +23,7 @@ pub use amp_protocol::AmpBox;
 pub use amp_protocol::Request;
 /// The codec a connection is framed by, re-exported from `amp-protocol` so
 /// that the frame-size limit can be set without depending on it directly.
-/// See [`serve_with_codec`], [`serve_connection_with_codec`], and
+/// See [`Server::codec`], [`Connection::with_codec`], and
 /// [`Client::with_codec`].
 pub use amp_protocol::codec::AmpCodec;
 pub use client::Client;
@@ -33,8 +33,10 @@ pub use error::Error;
 pub use handle::{Handle, HandleWith};
 pub use router::Router;
 #[cfg(not(target_family = "wasm"))]
+// Re-exporting the deprecated functions counts as using them.
+#[allow(deprecated)]
 pub use server::{
-    serve, serve_connection, serve_connection_with_codec, serve_with_codec,
+    Server, serve, serve_connection, serve_connection_with_codec, serve_with_codec,
     serve_with_codec_and_shutdown, serve_with_shutdown,
 };
 /// Declares a struct as a command's arguments. See [`Command`].

@@ -182,9 +182,9 @@ with `Error::ConnectionClosed`, carrying a copy of that error. A handle
 that would rather not wait for a call to fail, such as one that
 reconnects, awaits `Client::closed`, which resolves to the same cause once
 the connection has ended; `Client::is_closed` says whether it has. `serve` and
-`serve_with_shutdown` take one service for every connection, so a server
-whose handlers call back accepts connections itself and builds a
-`Connection` and a router for each, as the `kv_server` example does.
+`Server` take one service for every connection, so a server whose handlers
+call back accepts connections itself and builds a `Connection` and a router
+for each, as the `kv_server` example does.
 
 WebAssembly
 --
@@ -249,35 +249,48 @@ reading its replies is held to a bounded amount of memory.
 
 A box is read in full before it is handled, so a connection refuses one
 longer than 16 MiB and closes rather than buffering without bound. Pass an
-`AmpCodec` to `serve_with_codec`, `serve_connection_with_codec`, or
+`AmpCodec` to `Server::codec`, `Connection::with_codec`, or
 `Client::with_codec` to set another limit.
 
-Shutdown
+Server options
 --
 
-`serve_with_shutdown` takes a future along with the listener and the service,
-and stops once it completes: the listener is closed, so a peer that connects
-from then on is refused, and each connection stops reading requests, answers
-the ones it already has, and closes. It returns once the last connection has
-closed.
+`serve` and `serve_connection` use the defaults above. `Server` is the same
+server with its options set: the codec, how many requests a connection may
+have in flight, and a future that stops it.
 
 ```rust,no_run
-# use tower_amp::Router;
+# use tower_amp::{AmpCodec, Router, Server};
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 # let router = Router::new();
 # let listener = tokio::net::TcpListener::bind("127.0.0.1:1234").await?;
-tower_amp::serve_with_shutdown(listener, router, async {
-    let _ = tokio::signal::ctrl_c().await;
-})
-.await?;
+Server::new(router)
+    .codec(AmpCodec::with_max_frame_length(1024 * 1024))
+    .max_in_flight(32)
+    .shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .serve(listener)
+    .await?;
 # Ok(())
 # }
 ```
 
-A handler that never finishes holds shutdown open, so wrap the call in
-`tokio::time::timeout` if that matters. `serve_with_codec_and_shutdown` takes
-a codec as well.
+`max_in_flight` bounds what one connection takes on, not what runs: fewer
+holds a peer to less memory when a handler is expensive, more lets a trusted
+peer pipeline deeper. Tower's `ConcurrencyLimit` on the service bounds the
+handlers running across every connection.
+
+The shutdown future stops the server once it completes: the listener is
+closed, so a peer that connects from then on is refused, and each
+connection stops reading requests, answers the ones it already has, and
+closes. `serve` returns once the last connection has closed. A handler that
+never finishes holds shutdown open, so wrap the call in `tokio::time::timeout`
+if that matters.
+
+`Server::serve_connection` serves one connection with the same options, for
+an accept loop of your own; the shutdown future then stops that connection.
 
 Logging
 --
@@ -295,13 +308,13 @@ changes nothing on the wire.
 tower-amp = { version = "0.2", features = ["tracing"] }
 ```
 
-Not yet supported: TLS. A
-connection error inside `serve` ends that connection and is only logged;
-write the accept loop yourself with `serve_connection` to handle it, at the
-cost of `serve_with_shutdown`, which has no connection-level counterpart,
-and set `TCP_NODELAY` on each stream yourself. `serve` itself survives a peer that hangs up before it is
-accepted and a process briefly out of file descriptors, and returns only on
-an error that means the listener is no good.
+Not yet supported: TLS. A connection error inside `serve` ends that
+connection and is only logged; write the accept loop yourself with
+`serve_connection` or `Server::serve_connection` to handle it, and set
+`TCP_NODELAY` on each stream yourself. `serve` itself survives a peer that
+hangs up before it is accepted and a process briefly out of file
+descriptors, and returns only on an error that means the listener is no
+good.
 
 License
 --

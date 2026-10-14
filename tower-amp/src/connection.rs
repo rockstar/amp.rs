@@ -17,11 +17,12 @@ use crate::client::{Outgoing, lock};
 use crate::error::INTERNAL_ERROR;
 use crate::{Client, Error, log};
 
-/// How many requests one connection may have in flight: received and not
-/// yet answered. Past this the connection stops reading until a reply has
-/// been queued, so a peer that sends requests without reading the replies
-/// is held to this much memory rather than as much as it cares to send.
-const MAX_IN_FLIGHT: usize = 256;
+/// How many requests one connection may have in flight unless told
+/// otherwise: received and not yet answered. Past this the connection stops
+/// reading until a reply has been queued, so a peer that sends requests
+/// without reading the replies is held to this much memory rather than as
+/// much as it cares to send.
+pub(crate) const DEFAULT_MAX_IN_FLIGHT: usize = 256;
 
 /// One AMP connection, used in both directions: a [`Client`] handle calls
 /// commands on the peer, and a service answers the commands the peer
@@ -144,17 +145,24 @@ where
         S::Error: Into<Error>,
         S::Future: Send,
     {
-        self.run(service, CancellationToken::new(), Owner::Driver)
-            .await
+        self.run(
+            service,
+            std::future::pending(),
+            Owner::Driver,
+            DEFAULT_MAX_IN_FLIGHT,
+        )
+        .await
     }
 
     /// Drives the connection: writes the requests its handles make, matches
     /// the peer's answers to them, and answers the peer's requests with
     /// `service`.
     ///
-    /// Once `shutdown` is cancelled the connection reads no more, and
-    /// returns once the requests it had already received are answered.
-    /// `owner` says whether the handles keep the connection open.
+    /// Once `shutdown` completes the connection reads no more, and returns
+    /// once the requests it had already received are answered. `owner` says
+    /// whether the handles keep the connection open, and `max_in_flight`,
+    /// which must not be zero, how many of the peer's requests may be in
+    /// flight at once.
     ///
     /// Reading and writing are separate futures so that a write the peer is
     /// slow to accept never stops this side from reading. If both sides
@@ -166,17 +174,20 @@ where
     /// is recorded in the cause before anything that holds a reply sender is
     /// let go of: the entries of `pending`, the futures, and the queue
     /// behind the handles.
-    pub(crate) async fn run<S>(
+    pub(crate) async fn run<S, F>(
         self,
         service: S,
-        shutdown: CancellationToken,
+        shutdown: F,
         owner: Owner,
+        max_in_flight: usize,
     ) -> Result<(), Error>
     where
         S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
         S::Error: Into<Error>,
         S::Future: Send,
+        F: Future<Output = ()>,
     {
+        debug_assert!(max_in_flight > 0, "a connection must be able to read");
         // `open` outlives everything else here: a handle waiting on it
         // must find the cause recorded and `pending` cleared, whether this
         // returns or is dropped part way through.
@@ -194,7 +205,7 @@ where
         let pending = &pending;
         let (mut sink, mut stream) = framed.split();
         let (responses, mut replies) = mpsc::channel::<AmpBox>(16);
-        let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+        let in_flight = Arc::new(Semaphore::new(max_in_flight));
         // Cancelled when the read future ends, however it ends, so that
         // the writer stops taking requests that could never be answered.
         let done_reading = CancellationToken::new();
@@ -202,6 +213,9 @@ where
         let done = done_reading.clone();
         let read = async move {
             let _done = done.drop_guard();
+            // Polled only until it completes: each branch that sees it
+            // complete returns.
+            let mut shutdown = pin!(shutdown);
             loop {
                 // `biased` so that a shutdown is seen even while the peer
                 // keeps the stream ready. A `next` that loses to it is
@@ -209,7 +223,7 @@ where
                 // codec's buffer.
                 let incoming = tokio::select! {
                     biased;
-                    () = shutdown.cancelled() => return Ok(()),
+                    () = &mut shutdown => return Ok(()),
                     next = stream.next() => match next {
                         Some(incoming) => incoming?,
                         // The peer closed the connection.
@@ -219,13 +233,13 @@ where
                 match Message::from_box(incoming)? {
                     Message::Request(request) => {
                         // Waiting here, rather than spawning without bound,
-                        // is what holds the peer to `MAX_IN_FLIGHT`. Replies
+                        // is what holds the peer to `max_in_flight`. Replies
                         // are written by `write` below, which does not
                         // depend on this loop, so waiting cannot deadlock.
                         // A shutdown ends the wait, and the request with it.
                         let permit = tokio::select! {
                             biased;
-                            () = shutdown.cancelled() => return Ok(()),
+                            () = &mut shutdown => return Ok(()),
                             permit = Arc::clone(&in_flight).acquire_owned() => {
                                 permit.expect("the semaphore is never closed")
                             }

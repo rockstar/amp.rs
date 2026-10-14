@@ -12,10 +12,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_util::sync::CancellationToken;
 use tower::Service;
 
-use crate::connection::{Owner, spawn};
+use crate::connection::{DEFAULT_MAX_IN_FLIGHT, Owner, spawn};
 use crate::{Command, Connection, Error};
 
 /// Calls commands on a peer over one connection.
@@ -136,7 +135,12 @@ macro_rules! constructors {
                 // `cause`, so the error returned here has nobody to go to.
                 spawn(async move {
                     let _ = connection
-                        .run(Refuse, CancellationToken::new(), Owner::Handles)
+                        .run(
+                            Refuse,
+                            std::future::pending(),
+                            Owner::Handles,
+                            DEFAULT_MAX_IN_FLIGHT,
+                        )
                         .await;
                 });
                 client

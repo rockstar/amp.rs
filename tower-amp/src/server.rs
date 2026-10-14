@@ -1,3 +1,4 @@
+use std::future::Pending;
 use std::io;
 use std::pin::pin;
 use std::time::Duration;
@@ -10,13 +11,247 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tower::Service;
 
-use crate::connection::Owner;
+use crate::connection::{DEFAULT_MAX_IN_FLIGHT, Owner};
 use crate::{Connection, Error, log};
 
 /// How long the accept loop waits after `accept` fails for want of a file
 /// descriptor, so that it neither spins nor gives up while the process is
 /// briefly at its limit.
 const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
+
+/// A server with its options: the codec its connections are framed by, how
+/// many requests each may have in flight, and a signal that stops it.
+///
+/// [`serve`] and [`serve_connection`] are the defaults; this is for a server
+/// that needs something else. Set what differs, then run it on a listener
+/// with [`serve`](Server::serve), or on one connection from an accept loop
+/// of your own with [`serve_connection`](Server::serve_connection):
+///
+/// ```no_run
+/// # use tower_amp::{AmpCodec, Router, Server};
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), tower_amp::Error> {
+/// # let router = Router::new();
+/// # let listener = tokio::net::TcpListener::bind("127.0.0.1:1234").await.unwrap();
+/// Server::new(router)
+///     .codec(AmpCodec::with_max_frame_length(1024 * 1024))
+///     .max_in_flight(32)
+///     .shutdown(async {
+///         let _ = tokio::signal::ctrl_c().await;
+///     })
+///     .serve(listener)
+///     .await
+/// # }
+/// ```
+///
+/// A server without a shutdown signal is `Clone`, so one configured once
+/// can serve each connection an accept loop takes.
+#[derive(Clone)]
+pub struct Server<S, F = Pending<()>> {
+    service: S,
+    codec: AmpCodec,
+    max_in_flight: usize,
+    shutdown: F,
+}
+
+impl<S> Server<S>
+where
+    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
+    S::Error: Into<Error>,
+    S::Future: Send,
+{
+    /// A server that answers every connection's requests with a clone of
+    /// `service`, with the defaults [`serve`] and [`serve_connection`] use:
+    /// a default [`AmpCodec`], 256 requests in flight per connection, and
+    /// no shutdown signal.
+    pub fn new(service: S) -> Self {
+        Server {
+            service,
+            codec: AmpCodec::new(),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            shutdown: std::future::pending(),
+        }
+    }
+}
+
+impl<S, F> Server<S, F>
+where
+    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
+    S::Error: Into<Error>,
+    S::Future: Send,
+    F: Future<Output = ()>,
+{
+    /// The codec every connection is framed by, for setting the largest box
+    /// a peer may send with [`AmpCodec::with_max_frame_length`]. The default
+    /// refuses a box longer than 16 MiB.
+    pub fn codec(mut self, codec: AmpCodec) -> Self {
+        self.codec = codec;
+        self
+    }
+
+    /// How many requests one connection may have in flight at once:
+    /// received and not yet answered. Past this the connection stops
+    /// reading until one has been answered, which a peer sees as ordinary
+    /// backpressure on its writes. The default is 256.
+    ///
+    /// Fewer holds a peer to less memory, which matters when a handler
+    /// holds its request body or a database connection while it runs. More
+    /// lets a trusted peer pipeline deeper. This bounds what a connection
+    /// takes on, not what runs: wrap the service in tower's
+    /// `ConcurrencyLimit` to bound the handlers running across every
+    /// connection.
+    ///
+    /// # Panics
+    ///
+    /// If `limit` is zero, since a connection that may never read a request
+    /// would hang its peer.
+    pub fn max_in_flight(mut self, limit: usize) -> Self {
+        assert!(
+            limit > 0,
+            "a connection must be allowed a request in flight"
+        );
+        self.max_in_flight = limit;
+        self
+    }
+
+    /// A future that stops the server once it completes, answering the
+    /// requests in flight before [`serve`](Server::serve) returns.
+    ///
+    /// Once `signal` completes the listener is closed, so a peer that
+    /// connects from then on is refused, and every connection stops reading
+    /// requests. A request already received is still handled and its reply
+    /// written; each connection closes once the last of its requests is
+    /// answered, and `serve` returns `Ok(())` once every connection has
+    /// closed. A request the peer had sent but the connection had not yet
+    /// read is lost with the connection, which the peer sees as a call
+    /// failed by the connection closing; the same goes for one that arrives
+    /// afterwards.
+    ///
+    /// A handler that never finishes holds shutdown open: nothing here
+    /// gives up on a request. Wrap the call in [`tokio::time::timeout`] if
+    /// that matters. Dropping the future, which the timeout does, still
+    /// tells the connections to stop reading and answer what they have, but
+    /// no longer waits for them.
+    ///
+    /// For [`serve_connection`](Server::serve_connection) the signal stops
+    /// that one connection the same way: it reads no more requests and
+    /// closes once those it had received are answered.
+    pub fn shutdown<G>(self, signal: G) -> Server<S, G>
+    where
+        G: Future<Output = ()>,
+    {
+        Server {
+            service: self.service,
+            codec: self.codec,
+            max_in_flight: self.max_in_flight,
+            shutdown: signal,
+        }
+    }
+
+    /// Accepts connections on `listener` and serves each one on its own
+    /// task, as [`serve`] does, with this server's options.
+    ///
+    /// Returns when accepting a connection fails for good, as `serve`
+    /// does, or with `Ok(())` once the [shutdown](Server::shutdown) signal
+    /// has completed and every connection has closed. An accept error that
+    /// ends `serve` ends this the same way: the connections finish what
+    /// they have received and the error is returned.
+    pub async fn serve(self, listener: TcpListener) -> Result<(), Error> {
+        let Server {
+            service,
+            codec,
+            max_in_flight,
+            shutdown: signal,
+        } = self;
+        let shutdown = CancellationToken::new();
+        // If this future is dropped instead of returning, say by a timeout
+        // on it, the connections are still told to stop reading and finish
+        // up.
+        let _cancel_on_drop = shutdown.clone().drop_guard();
+        let connections = TaskTracker::new();
+        let mut signal = pin!(signal);
+        let result = loop {
+            // `biased` so that the signal is seen even while peers keep the
+            // listener ready. Neither branch is polled again after it
+            // completes.
+            let accepted = tokio::select! {
+                biased;
+                () = &mut signal => break Ok(()),
+                accepted = listener.accept() => accepted,
+            };
+            match accepted {
+                Ok((stream, _)) => {
+                    // Replies are small and written one at a time, and a
+                    // peer that pipelines calls gets several back to back.
+                    // With Nagle's algorithm on, each would wait for the
+                    // ACK of the one before it, up to the peer's
+                    // delayed-ACK timer. This only fails on a socket
+                    // already dead, which the connection task finds out
+                    // for itself.
+                    let _ = stream.set_nodelay(true);
+                    let connection = Server {
+                        service: service.clone(),
+                        codec: codec.clone(),
+                        max_in_flight,
+                        shutdown: shutdown.clone().cancelled_owned(),
+                    };
+                    connections.spawn(async move {
+                        if let Err(err) = connection.serve_connection(stream).await {
+                            log::connection_failed(&err);
+                        }
+                    });
+                }
+                Err(err) => match retry_after(&err) {
+                    Some(delay) => {
+                        log::accept_skipped(&err);
+                        tokio::select! {
+                            biased;
+                            () = &mut signal => break Ok(()),
+                            () = tokio::time::sleep(delay) => {}
+                        }
+                    }
+                    None => break Err(err.into()),
+                },
+            }
+        };
+        // The listener goes first so that a peer connecting from now on is
+        // refused rather than left in the backlog until the last connection
+        // is done, and the connections are told to stop before this waits
+        // on them.
+        drop(listener);
+        shutdown.cancel();
+        connections.close();
+        connections.wait().await;
+        result
+    }
+
+    /// Serves one connection until the peer closes it, as
+    /// [`serve_connection`] does, with this server's options.
+    ///
+    /// Returns once the peer closes the connection and every request
+    /// already received has been answered, or with the error that ended the
+    /// connection, as `serve_connection` does. With a
+    /// [shutdown](Server::shutdown) signal, it also returns `Ok(())` once
+    /// the signal has completed and the requests received before it were
+    /// answered.
+    ///
+    /// `io` need not be a socket, so nothing is done to its options. An
+    /// accept loop of your own should set `TCP_NODELAY` on each
+    /// `TcpStream`, as [`serve`] does.
+    pub async fn serve_connection<T>(self, io: T) -> Result<(), Error>
+    where
+        T: AsyncRead + AsyncWrite,
+    {
+        Connection::with_codec(io, self.codec)
+            .run(
+                self.service,
+                self.shutdown,
+                Owner::Driver,
+                self.max_in_flight,
+            )
+            .await
+    }
+}
 
 /// Accepts connections on `listener` forever, serving each one with a clone
 /// of `service` on its own task.
@@ -37,20 +272,22 @@ const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 /// the acknowledgement of the one before it.
 ///
 /// Each connection uses a default [`AmpCodec`], which refuses a box longer
-/// than 16 MiB; [`serve_with_codec`] takes another. [`serve_with_shutdown`]
-/// is the same server with a way to stop it.
+/// than 16 MiB, and may have 256 requests in flight at once. [`Server`]
+/// serves with another codec or limit, and with a way to stop.
 pub async fn serve<S>(listener: TcpListener, service: S) -> Result<(), Error>
 where
     S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
     S::Error: Into<Error>,
     S::Future: Send,
 {
-    serve_with_codec(listener, service, AmpCodec::new()).await
+    Server::new(service).serve(listener).await
 }
 
-/// [`serve`] with the codec every connection is framed by, for setting the
-/// largest box a peer may send with
-/// [`AmpCodec::with_max_frame_length`].
+/// [`serve`] with the codec every connection is framed by.
+#[deprecated(
+    since = "0.2.3",
+    note = "use `Server::new(service).codec(codec).serve(listener)`"
+)]
 pub async fn serve_with_codec<S>(
     listener: TcpListener,
     service: S,
@@ -61,31 +298,15 @@ where
     S::Error: Into<Error>,
     S::Future: Send,
 {
-    serve_with_codec_and_shutdown(listener, service, codec, std::future::pending()).await
+    Server::new(service).codec(codec).serve(listener).await
 }
 
 /// [`serve`] until `signal` completes, answering the requests in flight
-/// before returning.
-///
-/// Once `signal` completes the listener is closed, so a peer that connects
-/// from then on is refused, and every connection stops reading requests.
-/// A request already received is still handled and its reply written; each
-/// connection closes once the last of its requests is answered, and
-/// `serve_with_shutdown` returns `Ok(())` once every connection has closed.
-/// A request the peer had sent but the connection had not yet read is lost
-/// with the connection, which the peer sees as a call failed by the
-/// connection closing; the same goes for one that arrives afterwards.
-///
-/// A handler that never finishes holds shutdown open: nothing here gives up
-/// on a request. Wrap the call in [`tokio::time::timeout`] if that matters.
-/// Dropping the future, which the timeout does, still tells the connections
-/// to stop reading and answer what they have, but no longer waits for them.
-///
-/// An accept error that ends [`serve`] ends this the same way: the
-/// connections finish what they have received and the error is returned.
-///
-/// Each connection uses a default [`AmpCodec`];
-/// [`serve_with_codec_and_shutdown`] takes another.
+/// before returning, as [`Server::shutdown`] describes.
+#[deprecated(
+    since = "0.2.3",
+    note = "use `Server::new(service).shutdown(signal).serve(listener)`"
+)]
 pub async fn serve_with_shutdown<S, F>(
     listener: TcpListener,
     service: S,
@@ -97,12 +318,15 @@ where
     S::Future: Send,
     F: Future<Output = ()>,
 {
-    serve_with_codec_and_shutdown(listener, service, AmpCodec::new(), signal).await
+    Server::new(service).shutdown(signal).serve(listener).await
 }
 
-/// [`serve_with_shutdown`] with the codec every connection is framed by,
-/// for setting the largest box a peer may send with
-/// [`AmpCodec::with_max_frame_length`].
+/// [`serve`] with the codec every connection is framed by, until `signal`
+/// completes, as [`Server::shutdown`] describes.
+#[deprecated(
+    since = "0.2.3",
+    note = "use `Server::new(service).codec(codec).shutdown(signal).serve(listener)`"
+)]
 pub async fn serve_with_codec_and_shutdown<S, F>(
     listener: TcpListener,
     service: S,
@@ -115,60 +339,11 @@ where
     S::Future: Send,
     F: Future<Output = ()>,
 {
-    let shutdown = CancellationToken::new();
-    // If this future is dropped instead of returning, say by a timeout on
-    // it, the connections are still told to stop reading and finish up.
-    let _cancel_on_drop = shutdown.clone().drop_guard();
-    let connections = TaskTracker::new();
-    let mut signal = pin!(signal);
-    let result = loop {
-        // `biased` so that the signal is seen even while peers keep the
-        // listener ready. Neither branch is polled again after it completes.
-        let accepted = tokio::select! {
-            biased;
-            () = &mut signal => break Ok(()),
-            accepted = listener.accept() => accepted,
-        };
-        match accepted {
-            Ok((stream, _)) => {
-                // Replies are small and written one at a time, and a peer
-                // that pipelines calls gets several back to back. With
-                // Nagle's algorithm on, each would wait for the ACK of the
-                // one before it, up to the peer's delayed-ACK timer. This
-                // only fails on a socket already dead, which the connection
-                // task finds out for itself.
-                let _ = stream.set_nodelay(true);
-                let service = service.clone();
-                let codec = codec.clone();
-                let shutdown = shutdown.clone();
-                connections.spawn(async move {
-                    if let Err(err) = serve_connection_until(stream, service, codec, shutdown).await
-                    {
-                        log::connection_failed(&err);
-                    }
-                });
-            }
-            Err(err) => match retry_after(&err) {
-                Some(delay) => {
-                    log::accept_skipped(&err);
-                    tokio::select! {
-                        biased;
-                        () = &mut signal => break Ok(()),
-                        () = tokio::time::sleep(delay) => {}
-                    }
-                }
-                None => break Err(err.into()),
-            },
-        }
-    };
-    // The listener goes first so that a peer connecting from now on is
-    // refused rather than left in the backlog until the last connection is
-    // done, and the connections are told to stop before this waits on them.
-    drop(listener);
-    shutdown.cancel();
-    connections.close();
-    connections.wait().await;
-    result
+    Server::new(service)
+        .codec(codec)
+        .shutdown(signal)
+        .serve(listener)
+        .await
 }
 
 /// How the accept loop treats an error from `accept`: `Some(delay)` means
@@ -234,8 +409,8 @@ fn out_of_descriptors(err: &io::Error) -> bool {
 /// received has been answered, or with the error that ended the connection.
 /// A box longer than the codec allows is such an error, reported as
 /// [`Error::Protocol`] wrapping [`amp_protocol::Error::FrameTooLong`]. The
-/// default [`AmpCodec`] allows 16 MiB; [`serve_connection_with_codec`] takes
-/// another.
+/// default [`AmpCodec`] allows 16 MiB. [`Server::serve_connection`] serves
+/// with another codec or in-flight limit, and with a way to stop.
 pub async fn serve_connection<T, S>(io: T, service: S) -> Result<(), Error>
 where
     T: AsyncRead + AsyncWrite,
@@ -243,12 +418,14 @@ where
     S::Error: Into<Error>,
     S::Future: Send,
 {
-    serve_connection_with_codec(io, service, AmpCodec::new()).await
+    Server::new(service).serve_connection(io).await
 }
 
-/// [`serve_connection`] with the codec the connection is framed by, for
-/// setting the largest box the peer may send with
-/// [`AmpCodec::with_max_frame_length`].
+/// [`serve_connection`] with the codec the connection is framed by.
+#[deprecated(
+    since = "0.2.3",
+    note = "use `Server::new(service).codec(codec).serve_connection(io)`"
+)]
 pub async fn serve_connection_with_codec<T, S>(
     io: T,
     service: S,
@@ -260,28 +437,7 @@ where
     S::Error: Into<Error>,
     S::Future: Send,
 {
-    serve_connection_until(io, service, codec, CancellationToken::new()).await
-}
-
-/// [`serve_connection_with_codec`] until `shutdown` is cancelled, after which
-/// the connection reads no more requests, and returns once those it had
-/// already received are answered. A request the peer sent and this side had
-/// not read by then is lost with the connection.
-async fn serve_connection_until<T, S>(
-    io: T,
-    service: S,
-    codec: AmpCodec,
-    shutdown: CancellationToken,
-) -> Result<(), Error>
-where
-    T: AsyncRead + AsyncWrite,
-    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
-    S::Error: Into<Error>,
-    S::Future: Send,
-{
-    Connection::with_codec(io, codec)
-        .run(service, shutdown, Owner::Driver)
-        .await
+    Server::new(service).codec(codec).serve_connection(io).await
 }
 
 /// What the `tracing` feature logs. This lives with the unit tests rather

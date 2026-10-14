@@ -1,0 +1,5 @@
+error: `error` given twice
+ --> tests/ui/error_twice.rs:3:37
+  |
+3 | #[command(error = tower_amp::Error, error = tower_amp::Error)]
+  |                                     ^^^^^

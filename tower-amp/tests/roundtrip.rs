@@ -58,6 +58,39 @@ impl Handle for Divide {
     }
 }
 
+/// A command whose handler fails with a type of its own, which chooses the
+/// code and description the peer sees.
+#[derive(Serialize, Deserialize)]
+#[command(response = Quotient, error = DivideError)]
+struct DivideChecked {
+    numerator: i64,
+    denominator: i64,
+}
+
+#[derive(Debug)]
+enum DivideError {
+    ZeroDivision,
+}
+
+impl From<DivideError> for Error {
+    fn from(err: DivideError) -> Self {
+        match err {
+            DivideError::ZeroDivision => Error::new("ZERO_DIVISION", "cannot divide by zero"),
+        }
+    }
+}
+
+impl Handle for DivideChecked {
+    async fn handle(self) -> Result<Quotient, DivideError> {
+        if self.denominator == 0 {
+            return Err(DivideError::ZeroDivision);
+        }
+        Ok(Quotient {
+            result: self.numerator as f64 / self.denominator as f64,
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[command(response = Slept)]
 struct Sleep {
@@ -297,6 +330,7 @@ fn router() -> Router {
     Router::new()
         .command::<Sum>()
         .command::<Divide>()
+        .command::<DivideChecked>()
         .command::<Sleep>()
         .command::<Echo>()
 }
@@ -400,6 +434,30 @@ async fn receives_the_handlers_error() {
     let client = connect(router());
     let failed = client
         .call(&Divide {
+            numerator: 1,
+            denominator: 0,
+        })
+        .await;
+    assert!(matches!(
+        failed,
+        Err(Error::Command { code, description })
+            if code == "ZERO_DIVISION" && description == "cannot divide by zero"
+    ));
+}
+
+#[tokio::test]
+async fn receives_a_handlers_own_error_type_as_its_code() {
+    let client = connect(router());
+    let quotient = client
+        .call(&DivideChecked {
+            numerator: 6,
+            denominator: 3,
+        })
+        .await
+        .unwrap();
+    assert_eq!(quotient, Quotient { result: 2.0 });
+    let failed = client
+        .call(&DivideChecked {
             numerator: 1,
             denominator: 0,
         })

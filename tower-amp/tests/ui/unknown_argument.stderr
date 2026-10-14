@@ -1,4 +1,4 @@
-error: unknown argument `nam`; expected `name` or `response`
+error: unknown argument `nam`; expected `name`, `response` or `error`
  --> tests/ui/unknown_argument.rs:3:11
   |
 3 | #[command(nam = "Cmd")]

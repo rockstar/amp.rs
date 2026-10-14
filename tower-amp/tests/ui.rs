@@ -11,5 +11,6 @@ fn command_attribute() {
     t.pass("tests/ui/generic_struct.rs");
     t.compile_fail("tests/ui/name_twice.rs");
     t.compile_fail("tests/ui/response_twice.rs");
+    t.compile_fail("tests/ui/error_twice.rs");
     t.compile_fail("tests/ui/unknown_argument.rs");
 }

@@ -1,14 +1,15 @@
-//! A key/value store: commands that share state, optional arguments, list
-//! results, a command with no results, tower middleware, a hand-written
-//! accept loop that reports connection errors, and commands going both
-//! ways on one connection: a client that calls `Subscribe` is sent a
-//! `Changed` command whenever a key is set, on the connection it
-//! subscribed from.
+//! A key/value store: commands that share state, an error type of the
+//! server's own, optional arguments, list results, a command with no
+//! results, tower middleware, a hand-written accept loop that reports
+//! connection errors, and commands going both ways on one connection: a
+//! client that calls `Subscribe` is sent a `Changed` command whenever a key
+//! is set, on the connection it subscribed from.
 //!
 //! Run with `cargo run --example kv_server`, then run one or more
 //! `cargo run --example kv_watcher` against it.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,8 +41,47 @@ struct Session {
     peer: Client,
 }
 
+/// Every way a command on this server can fail. The commands that can fail
+/// declare it with `error = KvError` and return it directly; the ones that
+/// cannot keep the default, `tower_amp::Error`. The code each variant goes
+/// on the wire with is decided once, here, rather than at every `Err`.
+#[derive(Debug)]
+enum KvError {
+    NotFound(String),
+    EmptyKey,
+}
+
+impl KvError {
+    /// The AMP error code, by convention all-caps `SNAKE_CASE`.
+    fn code(&self) -> &'static str {
+        match self {
+            KvError::NotFound(_) => "NOT_FOUND",
+            KvError::EmptyKey => "EMPTY_KEY",
+        }
+    }
+}
+
+impl fmt::Display for KvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KvError::NotFound(key) => write!(f, "no key {key:?}"),
+            KvError::EmptyKey => f.write_str("a key cannot be empty"),
+        }
+    }
+}
+
+impl std::error::Error for KvError {}
+
+/// What the peer sees: the variant's code, and its message as the
+/// description.
+impl From<KvError> for Error {
+    fn from(err: KvError) -> Self {
+        Error::new(err.code(), err.to_string())
+    }
+}
+
 #[derive(Deserialize)]
-#[command(response = Previous)]
+#[command(response = Previous, error = KvError)]
 struct Set {
     key: String,
     value: String,
@@ -54,7 +94,10 @@ struct Previous {
 }
 
 impl HandleWith<Session> for Set {
-    async fn handle(self, session: Session) -> Result<Previous, Error> {
+    async fn handle(self, session: Session) -> Result<Previous, KvError> {
+        if self.key.is_empty() {
+            return Err(KvError::EmptyKey);
+        }
         let store = &session.store;
         let previous = store
             .entries
@@ -115,7 +158,7 @@ impl HandleWith<Session> for Subscribe {
 }
 
 #[derive(Deserialize)]
-#[command(response = Value)]
+#[command(response = Value, error = KvError)]
 struct Get {
     key: String,
 }
@@ -126,12 +169,12 @@ struct Value {
 }
 
 impl HandleWith<Session> for Get {
-    async fn handle(self, session: Session) -> Result<Value, Error> {
+    async fn handle(self, session: Session) -> Result<Value, KvError> {
         match session.store.entries.lock().unwrap().get(&self.key) {
             Some(value) => Ok(Value {
                 value: value.clone(),
             }),
-            None => Err(Error::new("NOT_FOUND", format!("no key {:?}", self.key))),
+            None => Err(KvError::NotFound(self.key)),
         }
     }
 }

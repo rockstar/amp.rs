@@ -64,6 +64,41 @@ and a handler that panics, is answered with `UNKNOWN` and the description
 `internal error`: what went wrong is this side's business, and goes to the
 log instead. The connection stays up either way.
 
+A server with more than a command or two will want its failures in one
+place rather than spelled out as a code and a string at each `Err`. A
+command declared with `error = Type` is handled with that type instead,
+which chooses its code and description once, in its conversion to `Error`:
+
+```rust,ignore
+enum KvError {
+    NotFound(String),
+    EmptyKey,
+}
+
+impl From<KvError> for Error {
+    fn from(err: KvError) -> Self {
+        match err {
+            KvError::NotFound(key) => Error::new("NOT_FOUND", format!("no key {key:?}")),
+            KvError::EmptyKey => Error::new("EMPTY_KEY", "a key cannot be empty"),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[command(response = Value, error = KvError)]
+struct Get {
+    key: String,
+}
+
+impl HandleWith<Store> for Get {
+    async fn handle(self, store: Store) -> Result<Value, KvError> {
+        store.get(&self.key).ok_or(KvError::NotFound(self.key))
+    }
+}
+```
+
+The `kv_server` example does this for a whole server.
+
 Commands that share state implement `HandleWith` for the state type instead,
 and the router is built with `Router::with_state`:
 

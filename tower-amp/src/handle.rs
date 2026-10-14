@@ -1,13 +1,17 @@
 use std::future::Future;
 
-use crate::{Command, Error};
+use crate::Command;
+#[cfg(doc)]
+use crate::Error;
 
 /// A command that handles itself without any state.
 ///
 /// Implemented on the command's argument struct. The handler consumes the
-/// arguments and returns the command's response, or an [`Error`] for the
-/// peer. Every `Handle` is also a [`HandleWith`] for any state, so a
-/// stateless command can be registered on a router that has state.
+/// arguments and returns the command's response, or the command's error for
+/// the peer: [`Error`] unless the command was declared with `error = Type`,
+/// and then that type. Every `Handle` is also a [`HandleWith`] for any
+/// state, so a stateless command can be registered on a router that has
+/// state.
 ///
 /// ```
 /// use serde::{Deserialize, Serialize};
@@ -33,13 +37,14 @@ use crate::{Command, Error};
 /// ```
 pub trait Handle: Command + Sized {
     /// Runs the command.
-    fn handle(self) -> impl Future<Output = Result<Self::Response, Error>> + Send;
+    fn handle(self) -> impl Future<Output = Result<Self::Response, Self::Error>> + Send;
 }
 
 /// A command that handles itself with a clone of the router's state.
 ///
 /// Implemented on the command's argument struct, for the state type the
 /// router was built with by [`Router::with_state`](crate::Router::with_state).
+/// It fails as [`Handle`] does.
 ///
 /// ```
 /// use std::sync::{Arc, Mutex};
@@ -70,11 +75,11 @@ pub trait Handle: Command + Sized {
 /// ```
 pub trait HandleWith<S>: Command + Sized {
     /// Runs the command with `state`.
-    fn handle(self, state: S) -> impl Future<Output = Result<Self::Response, Error>> + Send;
+    fn handle(self, state: S) -> impl Future<Output = Result<Self::Response, Self::Error>> + Send;
 }
 
 impl<C: Handle, S> HandleWith<S> for C {
-    fn handle(self, _state: S) -> impl Future<Output = Result<Self::Response, Error>> + Send {
+    fn handle(self, _state: S) -> impl Future<Output = Result<Self::Response, Self::Error>> + Send {
         Handle::handle(self)
     }
 }

@@ -13,9 +13,11 @@ use syn::{Data, DeriveInput, LitStr, Token, Type, parse_macro_input};
 /// Declares the struct it is attached to as a command's arguments.
 ///
 /// Takes `name = "..."`, the command's name on the wire, which defaults to
-/// the struct's name, and `response = Type`, the type of the command's
-/// results, which defaults to `()`. Generates an implementation of
-/// `tower_amp::Command` and leaves the struct itself untouched.
+/// the struct's name; `response = Type`, the type of the command's results,
+/// which defaults to `()`; and `error = Type`, the type a handler of the
+/// command fails with, which defaults to `tower_amp::Error`. Generates an
+/// implementation of `tower_amp::Command` and leaves the struct itself
+/// untouched.
 ///
 /// The generated code refers to the crate as `::tower_amp`, so tower-amp must
 /// be a dependency under its own name. Renaming it with `package = "tower-amp"`
@@ -45,6 +47,9 @@ pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
     let response = args
         .response
         .unwrap_or_else(|| syn::parse_quote_spanned!(Span::call_site() => ()));
+    let error = args
+        .error
+        .unwrap_or_else(|| syn::parse_quote_spanned!(Span::call_site() => ::tower_amp::Error));
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     quote! {
@@ -53,6 +58,7 @@ pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
         impl #impl_generics ::tower_amp::Command for #ident #ty_generics #where_clause {
             const NAME: &'static str = #name;
             type Response = #response;
+            type Error = #error;
         }
     }
     .into()
@@ -63,6 +69,7 @@ pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
 struct Args {
     name: Option<LitStr>,
     response: Option<Type>,
+    error: Option<Type>,
 }
 
 impl Parse for Args {
@@ -80,6 +87,11 @@ impl Parse for Args {
                         return Err(syn::Error::new(key.span(), "`response` given twice"));
                     }
                 }
+                Arg::Error(key, error) => {
+                    if args.error.replace(*error).is_some() {
+                        return Err(syn::Error::new(key.span(), "`error` given twice"));
+                    }
+                }
             }
         }
         Ok(args)
@@ -89,6 +101,7 @@ impl Parse for Args {
 enum Arg {
     Name(syn::Ident, LitStr),
     Response(syn::Ident, Box<Type>),
+    Error(syn::Ident, Box<Type>),
 }
 
 impl Parse for Arg {
@@ -98,9 +111,10 @@ impl Parse for Arg {
         match key.to_string().as_str() {
             "name" => Ok(Arg::Name(key, input.parse()?)),
             "response" => Ok(Arg::Response(key, Box::new(input.parse()?))),
+            "error" => Ok(Arg::Error(key, Box::new(input.parse()?))),
             other => Err(syn::Error::new(
                 key.span(),
-                format!("unknown argument `{other}`; expected `name` or `response`"),
+                format!("unknown argument `{other}`; expected `name`, `response` or `error`"),
             )),
         }
     }

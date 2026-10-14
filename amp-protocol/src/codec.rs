@@ -29,10 +29,11 @@ use crate::{AmpBox, Error};
 /// While a box is still arriving, the codec remembers how much of it has
 /// already been checked, so each call scans only the new bytes and the box is
 /// decoded exactly once, when it is complete. That makes a codec specific to
-/// one stream: use a fresh one per connection, as [`Framed`] does.
+/// one stream. A clone keeps the frame limit but not that position, so it is
+/// ready for a fresh stream: clone one codec per connection.
 ///
 /// [`Framed`]: tokio_util::codec::Framed
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct AmpCodec {
     max_frame_length: usize,
     /// How many bytes at the front of the buffer have been scanned and found
@@ -70,6 +71,15 @@ impl AmpCodec {
 impl Default for AmpCodec {
     fn default() -> Self {
         Self::with_max_frame_length(DEFAULT_MAX_FRAME_LENGTH)
+    }
+}
+
+/// A clone is a codec for another stream with the same frame limit. The scan
+/// position is an offset into one buffer and means nothing in any other, so
+/// it is not carried over.
+impl Clone for AmpCodec {
+    fn clone(&self) -> Self {
+        Self::with_max_frame_length(self.max_frame_length)
     }
 }
 
@@ -324,6 +334,32 @@ mod test {
             Err(Error::KeyTooLong { len: 256 })
         ));
         assert_eq!(codec.scanned, 0);
+    }
+
+    /// A codec cloned while a box is still arriving starts the new stream
+    /// from its first byte, instead of from where the old one left off.
+    #[test]
+    fn clone_starts_from_the_beginning_of_a_new_stream() {
+        let mut codec = AmpCodec::with_max_frame_length(1024);
+        let mut buf = BytesMut::from(&SUM_REQUEST[..30]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert_eq!(codec.scanned, 24, "the first three pairs are 24 bytes");
+
+        let mut clone = codec.clone();
+        assert_eq!(clone.scanned, 0);
+        assert_eq!(clone.max_frame_length, 1024);
+
+        let mut fresh = BytesMut::from(PAIR);
+        fresh.extend_from_slice(b"\x00\x00");
+        let amp_box = clone.decode(&mut fresh).unwrap().unwrap();
+        assert_eq!(amp_box.get("k"), Some(&b"v"[..]));
+        assert!(fresh.is_empty());
+
+        buf.extend_from_slice(&SUM_REQUEST[30..]);
+        assert!(
+            codec.decode(&mut buf).unwrap().is_some(),
+            "the original is unaffected"
+        );
     }
 
     /// The limit is per box, not per buffer: several boxes that together

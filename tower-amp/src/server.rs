@@ -139,6 +139,7 @@ where
                 // task finds out for itself.
                 let _ = stream.set_nodelay(true);
                 let service = service.clone();
+                let codec = codec.clone();
                 let shutdown = shutdown.clone();
                 connections.spawn(async move {
                     if let Err(err) = serve_connection_until(stream, service, codec, shutdown).await

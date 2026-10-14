@@ -18,7 +18,7 @@ include = [
 ]
 
 [dependencies]
-amp-protocol = { path = "../amp-protocol", version = "0.1" }
+amp-protocol = { path = "../amp-protocol", version = "0.2" }
 serde.workspace = true
 
 [dev-dependencies]

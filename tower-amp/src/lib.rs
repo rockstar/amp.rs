@@ -38,4 +38,8 @@ pub use server::{
     serve_with_codec_and_shutdown, serve_with_shutdown,
 };
 /// Declares a struct as a command's arguments. See [`Command`].
+///
+/// The generated code refers to this crate as `::tower_amp`, so it must be a
+/// dependency under its own name. Renaming it with `package = "tower-amp"` in
+/// Cargo.toml is not supported.
 pub use tower_amp_macros::command;

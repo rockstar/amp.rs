@@ -236,7 +236,10 @@ How it fits together
   including one wrapped in tower middleware whose error type is a boxed error.
 * The `#[command]` attribute comes from the
   [tower-amp-macros](https://crates.io/crates/tower-amp-macros) crate and is
-  re-exported here, so only this crate needs to be a dependency.
+  re-exported here, so only this crate needs to be a dependency. The code it
+  generates refers to this crate as `::tower_amp`, so it must be a dependency
+  under its own name: renaming it with `package = "tower-amp"` is not
+  supported.
 
 Requests on one connection are handled concurrently, each on its own task,
 and answered in the order they finish, as the protocol allows. At most 256

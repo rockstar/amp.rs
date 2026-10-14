@@ -4,7 +4,6 @@
 #![forbid(unsafe_code)]
 
 use proc_macro::TokenStream;
-use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::Span;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
@@ -17,6 +16,10 @@ use syn::{Data, DeriveInput, LitStr, Token, Type, parse_macro_input};
 /// the struct's name, and `response = Type`, the type of the command's
 /// results, which defaults to `()`. Generates an implementation of
 /// `tower_amp::Command` and leaves the struct itself untouched.
+///
+/// The generated code refers to the crate as `::tower_amp`, so tower-amp must
+/// be a dependency under its own name. Renaming it with `package = "tower-amp"`
+/// in Cargo.toml is not supported.
 #[proc_macro_attribute]
 pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
@@ -43,33 +46,16 @@ pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
         .response
         .unwrap_or_else(|| syn::parse_quote_spanned!(Span::call_site() => ()));
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let tower_amp = tower_amp_path();
 
     quote! {
         #input
 
-        impl #impl_generics #tower_amp::Command for #ident #ty_generics #where_clause {
+        impl #impl_generics ::tower_amp::Command for #ident #ty_generics #where_clause {
             const NAME: &'static str = #name;
             type Response = #response;
         }
     }
     .into()
-}
-
-/// The path to the tower-amp crate as seen from the calling crate.
-///
-/// A dependency can be renamed with `package = "tower-amp"` in Cargo.toml,
-/// so the name is read from the caller's manifest rather than hard-coded.
-/// Inside tower-amp itself, its tests, examples and doctests all refer to
-/// it as an external crate, so `::tower_amp` is right there too.
-fn tower_amp_path() -> proc_macro2::TokenStream {
-    match crate_name("tower-amp") {
-        Ok(FoundCrate::Name(name)) => {
-            let ident = proc_macro2::Ident::new(&name, Span::call_site());
-            quote!(::#ident)
-        }
-        Ok(FoundCrate::Itself) | Err(_) => quote!(::tower_amp),
-    }
 }
 
 /// The arguments of `#[command(...)]`.

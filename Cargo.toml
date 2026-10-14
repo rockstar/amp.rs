@@ -19,7 +19,6 @@ repository = "https://github.com/rockstar/amp.rs"
 [workspace.dependencies]
 bytes = "1"
 futures-util = "0.3"
-proc-macro-crate = "3"
 proc-macro2 = "1"
 quote = "1"
 serde = "1"

@@ -1,0 +1,20 @@
+name: audit
+# A new advisory can fail this with no change to the repository, so it also
+# runs weekly, and it is a separate workflow so that run skips the build.
+on:
+  push:
+    paths: ["Cargo.lock", ".github/workflows/audit.yml"]
+  pull_request:
+    paths: ["Cargo.lock", ".github/workflows/audit.yml"]
+  schedule:
+    - cron: "0 6 * * 1"
+jobs:
+  audit:
+    name: Audit Cargo.lock against the RustSec advisory database
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny warnings

@@ -8,7 +8,7 @@ use amp_protocol::codec::AmpCodec;
 use amp_protocol::{AmpBox, Answer, ErrorResponse, MAX_VALUE_LENGTH, Message, Request};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
@@ -74,6 +74,9 @@ pub struct Connection<T> {
     framed: Framed<T, AmpCodec>,
     client: Client,
     outgoing: mpsc::Receiver<Outgoing>,
+    /// Dropped once the connection has ended, which is what the handles'
+    /// [`Client::closed`] waits for.
+    open: watch::Sender<()>,
 }
 
 impl<T> Connection<T>
@@ -99,11 +102,12 @@ where
     /// for setting the largest box the peer may send with
     /// [`AmpCodec::with_max_frame_length`].
     pub fn with_codec(io: T, codec: AmpCodec) -> Self {
-        let (client, outgoing) = Client::detached();
+        let (client, outgoing, open) = Client::detached();
         Connection {
             framed: Framed::new(io, codec),
             client,
             outgoing,
+            open,
         }
     }
 
@@ -114,7 +118,7 @@ where
     /// A call made before the connection is served waits until it is. Once
     /// the connection has ended, every call fails with
     /// [`Error::ConnectionClosed`], which carries a copy of the error that
-    /// ended it, if one did.
+    /// ended it, if one did, and [`Client::closed`] resolves to the same.
     pub fn client(&self) -> Client {
         self.client.clone()
     }
@@ -173,10 +177,14 @@ where
         S::Error: Into<Error>,
         S::Future: Send,
     {
+        // `open` outlives everything else here: a handle waiting on it
+        // must find the cause recorded and `pending` cleared, whether this
+        // returns or is dropped part way through.
         let Connection {
             framed,
             client,
             mut outgoing,
+            open: _open,
         } = self;
         // Dropping the connection's own handle here is what lets `outgoing`
         // close once every handle the caller took is gone.

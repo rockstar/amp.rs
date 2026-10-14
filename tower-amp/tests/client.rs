@@ -346,3 +346,53 @@ async fn a_closed_connection_fails_calls() {
         "{failed:?}"
     );
 }
+
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
+async fn a_client_learns_its_connection_closed_without_a_call() {
+    let (client_io, peer_io) = tokio::io::duplex(4096);
+    let client = Client::new(client_io);
+    let clone = client.clone();
+    assert!(!client.is_closed());
+    drop(peer_io);
+    // Whether the connection task sees the read half's end of stream or the
+    // write half's broken pipe first depends on scheduling, so the cause is
+    // not checked.
+    timeout(Duration::from_secs(2), client.closed())
+        .await
+        .expect("the client never noticed");
+    assert!(client.is_closed());
+    assert!(clone.is_closed(), "every clone shares the connection");
+    // Already closed, so this returns at once.
+    timeout(Duration::from_secs(2), clone.closed())
+        .await
+        .expect("closed did not return at once");
+    let failed = client.call(&Sum { a: 1, b: 1 }).await;
+    assert!(
+        matches!(failed, Err(Error::ConnectionClosed { .. })),
+        "{failed:?}"
+    );
+}
+
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), tokio::test)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen_test::wasm_bindgen_test
+)]
+async fn dropping_the_serve_future_closes_its_clients() {
+    let (client_io, _peer_io) = tokio::io::duplex(4096);
+    let connection = Connection::new(client_io);
+    let client = connection.client();
+    let serve = Box::pin(connection.serve(Router::new()));
+    assert!(!client.is_closed(), "not served yet, but not closed either");
+    drop(serve);
+    // Nothing went wrong on the connection: it was simply let go of.
+    let cause = timeout(Duration::from_secs(2), client.closed())
+        .await
+        .expect("the client never noticed");
+    assert!(cause.is_none(), "{cause:?}");
+    assert!(client.is_closed());
+}

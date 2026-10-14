@@ -11,7 +11,7 @@ use amp_protocol::{AmpBox, Request};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tower::Service;
 
@@ -45,13 +45,21 @@ use crate::{Command, Connection, Error};
 /// Once the connection has ended, every call fails with
 /// [`Error::ConnectionClosed`], which carries what ended it: an I/O error,
 /// or a box from the peer that broke the protocol. A connection the peer
-/// closed cleanly has no cause.
+/// closed cleanly has no cause. A client that would rather not wait for a
+/// call to fail, such as one that reconnects, or one that only sends
+/// notifications and so never hears back, waits on
+/// [`closed`](Client::closed) instead.
 #[derive(Clone)]
 pub struct Client {
     outgoing: mpsc::Sender<Outgoing>,
     next_ask: Arc<AtomicU64>,
     pub(crate) pending: Arc<Mutex<Pending>>,
     pub(crate) cause: Arc<Cause>,
+    /// Nothing is ever sent on it: its sender is held by whatever drives
+    /// the connection, and dropped once the connection has ended and the
+    /// cause is recorded, which is what [`closed`](Client::closed) waits
+    /// for.
+    closed: watch::Receiver<()>,
     timeout: Option<Duration>,
 }
 
@@ -143,18 +151,22 @@ constructors!(AsyncRead + AsyncWrite + Send + 'static);
 constructors!(AsyncRead + AsyncWrite + 'static);
 
 impl Client {
-    /// A client with nothing driving its connection yet, and the receiving
-    /// end of its request queue, for a [`Connection`] to drive.
-    pub(crate) fn detached() -> (Client, mpsc::Receiver<Outgoing>) {
+    /// A client with nothing driving its connection yet, and what a
+    /// [`Connection`] needs to drive it: the receiving end of its request
+    /// queue, and the sender whose drop tells the client the connection
+    /// has ended.
+    pub(crate) fn detached() -> (Client, mpsc::Receiver<Outgoing>, watch::Sender<()>) {
         let (outgoing, incoming) = mpsc::channel(16);
+        let (open, closed) = watch::channel(());
         let client = Client {
             outgoing,
             next_ask: Arc::new(AtomicU64::new(1)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             cause: Arc::new(Mutex::new(None)),
+            closed,
             timeout: None,
         };
-        (client, incoming)
+        (client, incoming, open)
     }
 
     /// Fails any call or notification that has not completed within `limit`
@@ -254,13 +266,50 @@ impl Client {
             .await
             .is_err()
         {
-            return Err(self.closed());
+            return Err(self.connection_closed());
         }
-        response.await.unwrap_or_else(|_| Err(self.closed()))
+        response
+            .await
+            .unwrap_or_else(|_| Err(self.connection_closed()))
+    }
+
+    /// Waits until the connection has ended, and returns what ended it:
+    /// the same cause that [`Error::ConnectionClosed`] carries, or `None`
+    /// for a connection the peer closed cleanly, or that ended because
+    /// whoever drove it stopped. Returns at once if the connection has
+    /// already ended.
+    ///
+    /// Every clone of a client shares the connection, so this resolves for
+    /// all of them together. A client that reconnects waits here, then
+    /// makes a new client over a new connection:
+    ///
+    /// ```no_run
+    /// # use tower_amp::Client;
+    /// # async fn connect() -> Client { unimplemented!() }
+    /// # async fn example() {
+    /// let mut client = connect().await;
+    /// loop {
+    ///     let cause = client.closed().await;
+    ///     eprintln!("connection lost: {cause:?}; reconnecting");
+    ///     client = connect().await;
+    /// }
+    /// # }
+    /// ```
+    pub async fn closed(&self) -> Option<Arc<Error>> {
+        // `changed` only ever errs, and only once the sender is dropped,
+        // since nothing is ever sent.
+        let _ = self.closed.clone().changed().await;
+        lock(&self.cause).clone()
+    }
+
+    /// Whether the connection has ended, in which case every call fails
+    /// with [`Error::ConnectionClosed`].
+    pub fn is_closed(&self) -> bool {
+        self.closed.has_changed().is_err()
     }
 
     /// The error for a call the connection ended on.
-    fn closed(&self) -> Error {
+    fn connection_closed(&self) -> Error {
         Error::closed(lock(&self.cause).clone())
     }
 }

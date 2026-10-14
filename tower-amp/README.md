@@ -178,7 +178,10 @@ tokio::spawn(connection.serve(Router::new().command::<Notify>()));
 `Connection::serve` runs until the peer closes the connection, or returns
 the error that ended it. Dropping the handles does not end it; dropping the
 `serve` future does. A call on a handle that outlives the connection fails
-with `Error::ConnectionClosed`, carrying a copy of that error. `serve` and
+with `Error::ConnectionClosed`, carrying a copy of that error. A handle
+that would rather not wait for a call to fail, such as one that
+reconnects, awaits `Client::closed`, which resolves to the same cause once
+the connection has ended; `Client::is_closed` says whether it has. `serve` and
 `serve_with_shutdown` take one service for every connection, so a server
 whose handlers call back accepts connections itself and builds a
 `Connection` and a router for each, as the `kv_server` example does.

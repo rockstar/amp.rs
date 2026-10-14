@@ -460,7 +460,7 @@ mod log_test {
     use tracing_subscriber::util::SubscriberInitExt;
 
     use super::*;
-    use crate::Client;
+    use crate::{Client, Router};
 
     /// Collects what the subscriber writes.
     #[derive(Clone, Default)]
@@ -540,18 +540,18 @@ mod log_test {
         let lines = log.lines();
         assert_eq!(lines.len(), 3, "{lines:#?}");
         assert!(lines[0].contains("ERROR"), "{lines:#?}");
-        assert!(lines[0].contains("command=Boom"), "{lines:#?}");
+        assert!(lines[0].contains(r#"command="Boom""#), "{lines:#?}");
         assert!(
             lines[0].contains("command panicked: handler bug"),
             "{lines:#?}"
         );
         assert!(lines[1].contains("WARN"), "{lines:#?}");
-        assert!(lines[1].contains("command=Flaky"), "{lines:#?}");
+        assert!(lines[1].contains(r#"command="Flaky""#), "{lines:#?}");
         assert!(lines[1].contains("10.0.0.7:5432"), "{lines:#?}");
         // A handler's own error is the peer's business, so it is only of
         // interest when debugging.
         assert!(lines[2].contains("DEBUG"), "{lines:#?}");
-        assert!(lines[2].contains("command=Divide"), "{lines:#?}");
+        assert!(lines[2].contains(r#"command="Divide""#), "{lines:#?}");
         assert!(lines[2].contains("ZERO_DIVISION"), "{lines:#?}");
     }
 
@@ -579,8 +579,46 @@ mod log_test {
         let lines = log.lines();
         assert_eq!(lines.len(), 1, "{lines:#?}");
         assert!(lines[0].contains("WARN"), "{lines:#?}");
-        assert!(lines[0].contains("command=Flaky"), "{lines:#?}");
-        assert!(lines[0].contains("ask=-"), "{lines:#?}");
+        assert!(lines[0].contains(r#"command="Flaky""#), "{lines:#?}");
+        assert!(lines[0].contains(r#"ask="-""#), "{lines:#?}");
+    }
+
+    /// The command is the peer's bytes, and the error text repeats it. A
+    /// newline in it must not become a second log line, and an escape byte
+    /// must not reach the terminal as is.
+    #[tokio::test]
+    async fn peer_bytes_are_escaped() {
+        let log = Log::default();
+        let _guard = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(LevelFilter::DEBUG)
+            .finish()
+            .set_default();
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server_io, Router::new()));
+        let mut client = Client::new(client_io);
+        let command = "Nope\n2026-10-14T00:00:00Z ERROR tower_amp: admin login \x1b[31msucceeded";
+        let request = Request::new(command, AmpBox::new()).with_ask("x");
+        Service::call(&mut client, request).await.unwrap_err();
+
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(!lines[0].contains('\x1b'), "{lines:#?}");
+        let escaped =
+            r#""Nope\n2026-10-14T00:00:00Z ERROR tower_amp: admin login \u{1b}[31msucceeded""#;
+        assert!(
+            lines[0].contains(&format!("command={escaped}")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[0].contains(&format!(
+                "error=\"UNHANDLED: unhandled command: {}",
+                &escaped[1..]
+            )),
+            "{lines:#?}"
+        );
     }
 }
 

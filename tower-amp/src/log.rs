@@ -1,6 +1,11 @@
 //! What a connection has to say about failures the peer does not hear about
 //! in full. Each function is an event with the `tracing` feature, and
 //! nothing without it, so the callers need no `cfg`.
+//!
+//! Everything the peer chose, and every error text, is logged as its Debug
+//! form: quoted, with control characters and escape bytes written out. A
+//! command name with a newline in it would otherwise forge a second log
+//! line, and one with terminal escapes would restyle whoever tails the log.
 
 #[cfg(feature = "tracing")]
 mod with_tracing {
@@ -23,9 +28,9 @@ mod with_tracing {
         let ask = self::ask(ask);
         match err {
             Error::Command { .. } => {
-                tracing::debug!(%command, %ask, error = %err, "command failed")
+                tracing::debug!(?command, ?ask, error = ?err.to_string(), "command failed")
             }
-            _ => tracing::warn!(%command, %ask, error = %err, "command failed"),
+            _ => tracing::warn!(?command, ?ask, error = ?err.to_string(), "command failed"),
         }
     }
 
@@ -33,19 +38,19 @@ mod with_tracing {
     pub(crate) fn command_panicked(command: &[u8], ask: Option<&[u8]>, reason: &str) {
         let command = String::from_utf8_lossy(command);
         let ask = self::ask(ask);
-        tracing::error!(%command, %ask, "{reason}");
+        tracing::error!(?command, ?ask, "{}", reason.escape_debug());
     }
 
     /// An error from `accept` that the accept loop carries on past.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn accept_skipped(err: &std::io::Error) {
-        tracing::warn!(error = %err, "could not accept a connection");
+        tracing::warn!(error = ?err.to_string(), "could not accept a connection");
     }
 
     /// An error that ended one of `serve`'s connections.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn connection_failed(err: &Error) {
-        tracing::warn!(error = %err, "connection failed");
+        tracing::warn!(error = ?err.to_string(), "connection failed");
     }
 }
 

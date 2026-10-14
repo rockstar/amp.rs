@@ -24,6 +24,7 @@ proc-macro2 = "1"
 quote = "1"
 serde = "1"
 syn = "2"
-tokio = { version = "1", default-features = false }
+# 1.37 for `mpsc::Receiver::is_empty`.
+tokio = { version = "1.37", default-features = false }
 tokio-util = { version = "0.7", features = ["codec"] }
 tower = "0.5"

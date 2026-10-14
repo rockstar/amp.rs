@@ -1,20 +1,24 @@
 //! Calls through a served connection, one at a time and pipelined.
 //!
-//! Run with `cargo bench -p tower-amp`. A client and a server share an
-//! in-memory pipe on a current-thread runtime, so what is timed is the work
-//! the two sides do for each call and nothing else: framing it, routing it,
-//! the task per request, framing the reply, and matching it to the call.
+//! Run with `cargo bench -p tower-amp`. A client and a server run on a
+//! current-thread runtime, joined by an in-memory pipe or by loopback TCP.
+//! Over the pipe, what is timed is the work the two sides do for each call
+//! and nothing else: framing it, routing it, the task per request, framing
+//! the reply, and matching it to the call. Over TCP, the writes and reads
+//! are system calls, so the number of each per call shows up in the time.
 //! The sequential case times one round trip at a time, where every step is
 //! on the critical path. The pipelined case has every call in flight at
 //! once, up to the server's limit of 256, so a step that overlaps with the
-//! others, such as the spawn of the request's task, costs less there. Watch
-//! both when touching how a connection reads, dispatches or answers a
-//! request. divan reports throughput in calls per second alongside the
-//! time.
+//! others, such as the spawn of the request's task, costs less there, and
+//! a side that writes several frames in one go pays for one write rather
+//! than one per frame. Watch all four when touching how a connection reads,
+//! writes, dispatches or answers a request. divan reports throughput in
+//! calls per second alongside the time.
 
 use divan::counter::ItemsCount;
 use divan::{Bencher, black_box};
 use serde::{Deserialize, Serialize};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 use tower_amp::{Client, Error, Handle, Router, command};
 
@@ -47,28 +51,50 @@ impl Handle for Sum {
     }
 }
 
-/// A client joined to a served `Sum` by an in-memory pipe, and the runtime
-/// both run on. Current-thread, so that the timings are not at the mercy of
-/// the scheduler moving tasks between workers.
-fn connect() -> (Runtime, Client) {
+/// What joins the client to the server.
+#[derive(Debug, Clone, Copy)]
+enum Transport {
+    /// An in-memory pipe, so no system calls.
+    Pipe,
+    /// Loopback TCP, with Nagle's algorithm off as `serve` sets it.
+    Tcp,
+}
+
+/// A client joined to a served `Sum` by `transport`, and the runtime both
+/// run on. Current-thread, so that the timings are not at the mercy of the
+/// scheduler moving tasks between workers.
+fn connect(transport: Transport) -> (Runtime, Client) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let client = runtime.block_on(async {
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(tower_amp::serve_connection(
-            server_io,
-            Router::new().command::<Sum>(),
-        ));
-        Client::new(client_io)
+        let router = Router::new().command::<Sum>();
+        match transport {
+            Transport::Pipe => {
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(tower_amp::serve_connection(server_io, router));
+                Client::new(client_io)
+            }
+            Transport::Tcp => {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let client_io = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (server_io, _) = listener.accept().await.unwrap();
+                client_io.set_nodelay(true).unwrap();
+                server_io.set_nodelay(true).unwrap();
+                tokio::spawn(tower_amp::serve_connection(server_io, router));
+                Client::new(client_io)
+            }
+        }
     });
     (runtime, client)
 }
 
-#[divan::bench]
-fn sequential(bencher: Bencher) {
-    let (runtime, client) = connect();
+#[divan::bench(args = [Transport::Pipe, Transport::Tcp])]
+fn sequential(bencher: Bencher, transport: Transport) {
+    let (runtime, client) = connect(transport);
     let sum = Sum { a: 13, b: 81 };
     bencher.counter(ItemsCount::new(CALLS)).bench(|| {
         runtime.block_on(async {
@@ -79,9 +105,9 @@ fn sequential(bencher: Bencher) {
     });
 }
 
-#[divan::bench]
-fn pipelined(bencher: Bencher) {
-    let (runtime, client) = connect();
+#[divan::bench(args = [Transport::Pipe, Transport::Tcp])]
+fn pipelined(bencher: Bencher, transport: Transport) {
+    let (runtime, client) = connect(transport);
     let sum = Sum { a: 13, b: 81 };
     bencher.counter(ItemsCount::new(CALLS)).bench(|| {
         runtime.block_on(async {

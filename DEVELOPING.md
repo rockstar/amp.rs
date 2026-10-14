@@ -187,9 +187,11 @@ four-field struct and a 10,000-entry map:
 cargo bench -p serde_amp
 ```
 
-`tower-amp` has one for calls through a served connection over an in-memory
-pipe, one at a time and pipelined, reported as calls per second as well as
-time:
+`tower-amp` has one for calls through a served connection, one at a time
+and pipelined, over an in-memory pipe and over loopback TCP, reported as
+calls per second as well as time. The pipe times the two sides' work alone;
+TCP adds the system calls, so it shows how many writes a batch of calls
+costs:
 
 ```
 cargo bench -p tower-amp

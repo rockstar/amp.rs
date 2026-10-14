@@ -8,7 +8,7 @@ use amp_protocol::codec::AmpCodec;
 use amp_protocol::{AmpBox, Answer, ErrorResponse, Message, Request};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
@@ -249,7 +249,24 @@ where
             // may still queue a request.
             let mut reading = true;
             let mut requests = true;
+            // Whether a box has been fed to the sink since it was last
+            // flushed, and the notifications among those, whose callers
+            // are answered once it has been.
+            let mut unflushed = false;
+            let mut notified = Vec::new();
             loop {
+                // A box is flushed only once nothing is queued behind it,
+                // so that a burst of small boxes is one write rather than
+                // one each; `Framed` flushes on its own once 8 KiB are
+                // waiting, so a batch is bounded. Waiting here, rather than
+                // feeding more while the write is slow, is what keeps a
+                // request queued behind it from being written after its
+                // caller has given up.
+                if unflushed && outgoing.is_empty() && replies.is_empty() {
+                    sink.flush().await?;
+                    unflushed = false;
+                    answer_written(&mut notified);
+                }
                 tokio::select! {
                     biased;
                     () = done_reading.cancelled(), if reading => {
@@ -264,7 +281,7 @@ where
                     }
                     next = outgoing.recv(), if requests => match next {
                         // Every handle is gone.
-                        None if reading && owner == Owner::Handles => return Ok(()),
+                        None if reading && owner == Owner::Handles => break,
                         None => requests = false,
                         Some(Outgoing { request, written }) => {
                             // A request whose caller stopped waiting while
@@ -290,20 +307,25 @@ where
                                     continue;
                                 }
                             };
-                            sink.send(amp_box).await?;
-                            if let Some(reply) = written {
-                                let _ = reply.send(Ok(AmpBox::new()));
-                            }
+                            sink.feed(amp_box).await?;
+                            unflushed = true;
+                            notified.extend(written);
                         }
                     },
                     reply = replies.recv() => match reply {
-                        Some(reply) => sink.send(reply).await?,
+                        Some(reply) => {
+                            sink.feed(reply).await?;
+                            unflushed = true;
+                        }
                         // The read future has ended and every request it
                         // took on has been answered.
-                        None => return Ok(()),
+                        None => break,
                     },
                 }
             }
+            sink.flush().await?;
+            answer_written(&mut notified);
+            Ok(())
         };
 
         let mut read = pin!(read);
@@ -338,6 +360,14 @@ where
         // be emptied rather than dropped.
         lock(pending).clear();
         result
+    }
+}
+
+/// Tells the callers of the notifications in `notified` that they have been
+/// written. One whose caller has stopped waiting is dropped unheard.
+fn answer_written(notified: &mut Vec<oneshot::Sender<Result<AmpBox, Error>>>) {
+    for reply in notified.drain(..) {
+        let _ = reply.send(Ok(AmpBox::new()));
     }
 }
 

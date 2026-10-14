@@ -838,7 +838,9 @@ async fn the_service_form_honors_the_timeout() {
 /// A request whose caller gave up while it was still queued behind a slow
 /// write is never sent. The pipe holds less than one request and the peer
 /// does not read until both calls have timed out, so the first request is
-/// stuck mid-write and the second is still queued when they time out.
+/// stuck mid-write when the second is made, and the second is still queued
+/// when they time out. The second is made only once the writer has taken
+/// the first: made together, the two would be written as one batch.
 #[tokio::test(start_paused = true)]
 async fn an_abandoned_request_is_not_written() {
     let (client_io, peer) = tokio::io::duplex(16);
@@ -849,7 +851,11 @@ async fn an_abandoned_request_is_not_written() {
     let second = Echo {
         payload: "second".into(),
     };
-    let (first, second) = tokio::join!(client.call(&first), client.call(&second));
+    let second = async {
+        tokio::task::yield_now().await;
+        client.call(&second).await
+    };
+    let (first, second) = tokio::join!(client.call(&first), second);
     assert!(matches!(first, Err(Error::Timeout)), "{first:?}");
     assert!(matches!(second, Err(Error::Timeout)), "{second:?}");
     // Closing the client ends the connection once the writer is done.

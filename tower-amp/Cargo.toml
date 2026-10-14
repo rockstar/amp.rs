@@ -74,6 +74,8 @@ wasm-bindgen-test = "0.3"
 # runtime. `signal` is for the examples and the README, which stop on
 # Ctrl-C.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+# `Bytes` is tests/twisted.rs's AMP `String` argument.
+bytes = { workspace = true, features = ["serde"] }
 # `process` is for tests/twisted.rs, which runs the Python peer.
 tokio = { workspace = true, features = ["process", "rt-multi-thread", "signal"] }
 # Compiles the `#[command]` cases under tests/ui and checks the compiler's

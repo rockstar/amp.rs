@@ -150,8 +150,14 @@ is to talk to it, so `tower-amp/tests/twisted.rs` runs this crate's server
 against Twisted's client and this crate's client against Twisted's server,
 over TCP on loopback. The Python side is `tower-amp/tests/twisted/peer.py`,
 whose commands are the `Sum` and `Divide` from Twisted's AMP documentation,
-and `Relay`, which each side answers by calling `Sum` on the other, so that
-both runs also cover a command going the other way on the same connection.
+`Relay`, which each side answers by calling `Sum` on the other, so that
+both runs also cover a command going the other way on the same connection,
+and `KitchenSink`, which has one argument for every row of serde_amp's
+type-mapping table. Each side answers `KitchenSink` by checking every
+argument against its own copy of the expected values and echoing them, so
+Twisted parses what serde_amp writes with its own typed arguments, and
+serde_amp reads what Twisted writes. A new row in the table belongs in
+`KitchenSink` on both sides.
 
 The tests are marked `#[ignore]`, since they need a Python with Twisted
 installed, so `cargo test` and the hooks skip them and only CI runs them.

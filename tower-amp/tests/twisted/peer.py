@@ -3,17 +3,23 @@
 The commands are the `Sum` and `Divide` from Twisted's AMP documentation,
 which `examples/sum_server.rs` and `tests/twisted.rs` implement in Rust,
 plus `Relay`, which either side answers by calling `Sum` on the other: the
-proof that commands go both ways on one connection.
+proof that commands go both ways on one connection, and `KitchenSink`, one
+argument of every AMP type, which either side answers by checking each
+argument against `KITCHEN_SINK` and echoing it back: the proof that
+serde_amp's encoding of every row of its type-mapping table is what Twisted
+reads, and that it reads what Twisted writes.
 
-    peer.py client PORT   calls both commands on the server at PORT and
+    peer.py client PORT   calls every command on the server at PORT and
                           exits 0 if every answer is what Twisted expects
-    peer.py server        serves both commands on a free port, prints the
+    peer.py server        serves every command on a free port, prints the
                           port on its first line, and runs until killed
 
 Run by `tests/twisted.rs`, which is ignored unless asked for; see
 DEVELOPING.md.
 """
 
+import datetime
+import decimal
 import sys
 
 from twisted.internet import defer, reactor
@@ -37,6 +43,49 @@ class Relay(amp.Command):
     response = [(b"total", amp.Integer())]
 
 
+# One argument per row of serde_amp's type-mapping table. The floats take
+# the spellings that differ between Rust and Python (`1e+300` is a
+# 301-digit integer from Rust; `inf` is spelled the same by both); the bytes
+# are not UTF-8, so they could not pass as text; `never` is left out, which
+# is how an optional argument is `None`. The timezone offset is not zero,
+# since Twisted writes a zero offset as `-00:00` and the Rust side holds the
+# date as text, so an echo of `+00:00` would not compare equal.
+KITCHEN_SINK = {
+    "count": -9223372036854775808,
+    "text": "h\u00e9llo w\u00f6rld \u2713",
+    "bytes": b"\x00\xff\x01",
+    "yes": True,
+    "no": False,
+    "floats": [246.8, 1e300, float("inf"), float("-inf")],
+    "price": decimal.Decimal("19.99"),
+    "when": datetime.datetime(
+        2026, 10, 14, 9, 30, 15, 250000, datetime.timezone(datetime.timedelta(hours=2))
+    ),
+    "ints": [-1, 0, 9223372036854775807],
+    "items": [{"name": "a", "size": 1}, {"name": "b", "size": 2}],
+    "maybe": 7,
+    "never": None,
+}
+
+
+class KitchenSink(amp.Command):
+    arguments = [
+        (b"count", amp.Integer()),
+        (b"text", amp.Unicode()),
+        (b"bytes", amp.String()),
+        (b"yes", amp.Boolean()),
+        (b"no", amp.Boolean()),
+        (b"floats", amp.ListOf(amp.Float())),
+        (b"price", amp.Decimal()),
+        (b"when", amp.DateTime()),
+        (b"ints", amp.ListOf(amp.Integer())),
+        (b"items", amp.AmpList([(b"name", amp.Unicode()), (b"size", amp.Integer())])),
+        (b"maybe", amp.Integer(optional=True)),
+        (b"never", amp.Integer(optional=True)),
+    ]
+    response = arguments
+
+
 class Math(amp.AMP):
     @Sum.responder
     def sum(self, a, b):
@@ -50,6 +99,11 @@ class Math(amp.AMP):
     def relay(self, a, b):
         return self.callRemote(Sum, a=a, b=b)
 
+    @KitchenSink.responder
+    def kitchen_sink(self, **arguments):
+        assert arguments == KITCHEN_SINK, arguments
+        return arguments
+
 
 @defer.inlineCallbacks
 def call_everything(port):
@@ -62,6 +116,8 @@ def call_everything(port):
     assert total == {"total": 11}, total
     quotient = yield proto.callRemote(Divide, numerator=1234, denominator=5)
     assert quotient == {"result": 246.8}, quotient
+    echo = yield proto.callRemote(KitchenSink, **KITCHEN_SINK)
+    assert echo == KITCHEN_SINK, echo
     try:
         yield proto.callRemote(Divide, numerator=1, denominator=0)
     except ZeroDivisionError:

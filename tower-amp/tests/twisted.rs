@@ -1,7 +1,8 @@
 //! Interoperability with Twisted, the reference implementation of AMP: this
 //! crate's server against Twisted's client, and this crate's client against
 //! Twisted's server, with each side calling a command on the other inside
-//! a handler. The Python side is `tests/twisted/peer.py`.
+//! a handler, and with one command that carries an argument of every AMP
+//! type. The Python side is `tests/twisted/peer.py`.
 //!
 //! These tests need a Python with Twisted installed, so they are ignored by
 //! default and run only in CI, or by hand with
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -84,6 +86,71 @@ impl HandleWith<Client> for Relay {
     }
 }
 
+/// One argument per row of serde_amp's type-mapping table, answered by
+/// checking every argument against [`kitchen_sink`] and echoing it back.
+/// Twisted does the same with its `KITCHEN_SINK`, so a call in either
+/// direction proves that the encoding of each type is what Twisted reads,
+/// and that Twisted's encoding is what this crate reads.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[command(response = KitchenSink)]
+struct KitchenSink {
+    count: i64,
+    text: String,
+    bytes: Bytes,
+    yes: bool,
+    no: bool,
+    floats: Vec<f64>,
+    price: String,
+    when: String,
+    ints: Vec<i64>,
+    items: Vec<Item>,
+    maybe: Option<i64>,
+    never: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct Item {
+    name: String,
+    size: i64,
+}
+
+/// The values `peer.py`'s `KITCHEN_SINK` holds, and the comment there says
+/// why these.
+fn kitchen_sink() -> KitchenSink {
+    KitchenSink {
+        count: i64::MIN,
+        text: "h\u{e9}llo w\u{f6}rld \u{2713}".into(),
+        bytes: Bytes::from_static(b"\x00\xff\x01"),
+        yes: true,
+        no: false,
+        floats: vec![246.8, 1e300, f64::INFINITY, f64::NEG_INFINITY],
+        price: "19.99".into(),
+        when: "2026-10-14T09:30:15.250000+02:00".into(),
+        ints: vec![-1, 0, i64::MAX],
+        items: vec![
+            Item {
+                name: "a".into(),
+                size: 1,
+            },
+            Item {
+                name: "b".into(),
+                size: 2,
+            },
+        ],
+        maybe: Some(7),
+        never: None,
+    }
+}
+
+impl Handle for KitchenSink {
+    async fn handle(self) -> Result<KitchenSink, Error> {
+        if self != kitchen_sink() {
+            return Err(Error::new("MISMATCH", format!("{self:?}")));
+        }
+        Ok(self)
+    }
+}
+
 /// `peer.py` run with `args`, with its output captured for the test's
 /// report and the process killed when the test is done with it.
 fn peer(args: &[&str]) -> Command {
@@ -117,7 +184,8 @@ async fn twisted_client_calls_this_server() {
             let router = Router::with_state(connection.client())
                 .command::<Sum>()
                 .command::<Divide>()
-                .command::<Relay>();
+                .command::<Relay>()
+                .command::<KitchenSink>();
             tokio::spawn(connection.serve(router));
         }
     });
@@ -181,4 +249,6 @@ async fn this_client_calls_a_twisted_server() {
     );
     let total = client.call(&Relay { a: 13, b: 81 }).await.unwrap();
     assert_eq!(total, Total { total: 94 });
+    let echo = client.call(&kitchen_sink()).await.unwrap();
+    assert_eq!(echo, kitchen_sink());
 }

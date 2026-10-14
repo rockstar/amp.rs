@@ -56,10 +56,12 @@ impl ser::Serializer for BoxSerializer {
         serialize_i16(i16),
         serialize_i32(i32),
         serialize_i64(i64),
+        serialize_i128(i128),
         serialize_u8(u8),
         serialize_u16(u16),
         serialize_u32(u32),
         serialize_u64(u64),
+        serialize_u128(u128),
         serialize_f32(f32),
         serialize_f64(f64),
         serialize_char(char),
@@ -740,6 +742,8 @@ mod test {
     #[test]
     fn top_level_must_be_a_struct_or_map() {
         assert!(matches!(to_box(&1_u8), Err(Error::NotABox)));
+        assert!(matches!(to_box(&1_i128), Err(Error::NotABox)));
+        assert!(matches!(to_box(&1_u128), Err(Error::NotABox)));
         assert!(matches!(to_box("s"), Err(Error::NotABox)));
         assert!(matches!(to_box(&vec![1_u8]), Err(Error::NotABox)));
         assert!(matches!(to_box(&Option::<u8>::None), Err(Error::NotABox)));

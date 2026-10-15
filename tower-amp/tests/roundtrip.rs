@@ -552,19 +552,75 @@ async fn commands_share_state_and_stateless_commands_join_them() {
     assert_eq!(total.total, 4);
 }
 
+/// A middleware error was not written for the peer, so the peer is told
+/// only that the command failed on this side, and the connection carries
+/// on.
 #[tokio::test(start_paused = true)]
-async fn middleware_errors_reach_the_peer_as_unknown() {
+async fn middleware_errors_reach_the_peer_as_internal() {
     let service = ServiceBuilder::new()
         .timeout(Duration::from_millis(20))
         .service(router());
     let client = connect(service);
     let failed = client.call(&Sleep { millis: 500 }).await;
-    assert!(matches!(
-        failed,
-        Err(Error::Command { code, .. }) if code == "UNKNOWN"
-    ));
+    assert!(
+        matches!(
+            failed,
+            Err(Error::Command { ref code, ref description })
+                if code == "UNKNOWN" && description == "internal error"
+        ),
+        "{failed:?}"
+    );
     let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
     assert_eq!(total.total, 3);
+}
+
+/// Whatever a layer's error says stays on this side: a layer that failed to
+/// reach a database names the host, and the peer may be anyone.
+#[tokio::test]
+async fn middleware_error_text_stays_off_the_wire() {
+    let service = ServiceBuilder::new()
+        .map_err(|_: Error| tower::BoxError::from("db at 10.0.0.7:5432 refused the connection"))
+        .service(router());
+    let client = connect(service);
+    let failed = client
+        .call(&Divide {
+            numerator: 1,
+            denominator: 0,
+        })
+        .await;
+    assert!(
+        matches!(
+            failed,
+            Err(Error::Command { ref code, ref description })
+                if code == "UNKNOWN" && description == "internal error"
+        ),
+        "{failed:?}"
+    );
+}
+
+/// A layer that wants the peer told something specific says so by mapping
+/// its error to an `Error::new`, which is forwarded like a handler's own.
+#[tokio::test(start_paused = true)]
+async fn middleware_chooses_what_the_peer_is_told() {
+    let service = ServiceBuilder::new()
+        .map_err(
+            |err: tower::BoxError| match err.downcast::<tower::timeout::error::Elapsed>() {
+                Ok(_) => Error::new("TIMEOUT", "the command took too long"),
+                Err(err) => Error::from(err),
+            },
+        )
+        .timeout(Duration::from_millis(20))
+        .service(router());
+    let client = connect(service);
+    let failed = client.call(&Sleep { millis: 500 }).await;
+    assert!(
+        matches!(
+            failed,
+            Err(Error::Command { ref code, ref description })
+                if code == "TIMEOUT" && description == "the command took too long"
+        ),
+        "{failed:?}"
+    );
 }
 
 /// A handler's own error must come back out of the boxed error type that

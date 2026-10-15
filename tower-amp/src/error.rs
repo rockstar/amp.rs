@@ -51,6 +51,12 @@ pub enum Error {
     /// The call was not answered within the client's timeout. See
     /// [`Client::with_timeout`](crate::Client::with_timeout).
     Timeout,
+    /// A command failed on this side with an error that was not written
+    /// for the peer: one from tower middleware around the service, which
+    /// is how every boxed error that is not an `Error` arrives, or one a
+    /// handler returns as this variant to say that its message is for the
+    /// log alone. The peer is answered `UNKNOWN` and `internal error`.
+    Internal(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// The description a peer sees for an error that is about this side rather
@@ -94,8 +100,9 @@ impl Error {
     /// deserialize error its message, which tells the peer its request did
     /// not match the command's schema. Any other error is about this side,
     /// not the request: an I/O error names hosts, a panic message says what
-    /// the handler was doing. A peer, who may be anyone, gets a fixed
-    /// description instead, and the error goes to the log.
+    /// the handler was doing, a middleware error says what its layer was
+    /// doing. A peer, who may be anyone, gets a fixed description instead,
+    /// and the error goes to the log.
     pub(crate) fn description(&self) -> String {
         match self {
             Error::Command { description, .. } => description.clone(),
@@ -157,6 +164,7 @@ impl fmt::Display for Error {
             }
             Error::ConnectionClosed { cause: None } => f.write_str("connection closed"),
             Error::Timeout => f.write_str("timed out"),
+            Error::Internal(err) => write!(f, "internal error: {err}"),
         }
     }
 }
@@ -169,6 +177,7 @@ impl std::error::Error for Error {
             Error::Serialize(err) => Some(err),
             Error::Deserialize(err) => Some(err),
             Error::ConnectionClosed { cause: Some(cause) } => Some(cause.as_ref()),
+            Error::Internal(err) => Some(err.as_ref()),
             _ => None,
         }
     }
@@ -190,14 +199,26 @@ impl From<amp_protocol::Error> for Error {
 }
 
 /// Lets a service wrapped in tower middleware, whose error type is a boxed
-/// error, be served. An `Error` inside the box comes back out unchanged;
-/// anything else, such as a timeout, becomes an `UNKNOWN` error carrying its
-/// message.
+/// error, be served. An `Error` inside the box comes back out unchanged, so
+/// a handler's own code and description still reach the peer through a
+/// timeout or a limit layer. Anything else becomes [`Error::Internal`]: the
+/// peer is answered `UNKNOWN` and `internal error`, and the boxed error goes
+/// to the log.
+///
+/// The box could hold anything: a timeout layer's "request timed out" is
+/// harmless, but a layer that queries a database can fail with the host it
+/// could not reach, and one that reads a file with the path. None of that
+/// was written with the peer in mind, so none of it is sent. Only an
+/// `Error::Command` carries its text to the peer, since a handler, or a
+/// layer, chose that text for the peer by constructing it. Middleware that
+/// wants the peer told something specific, say a `TIMEOUT` code for a
+/// timeout, maps its error to [`Error::new`] in a `map_err` layer; the
+/// `middleware` example does.
 impl From<tower::BoxError> for Error {
     fn from(err: tower::BoxError) -> Self {
         match err.downcast::<Error>() {
             Ok(err) => *err,
-            Err(err) => Error::new(ErrorResponse::UNKNOWN, err.to_string()),
+            Err(err) => Error::Internal(err),
         }
     }
 }

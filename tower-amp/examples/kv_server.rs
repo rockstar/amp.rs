@@ -250,7 +250,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // The router is a tower service, so ordinary tower middleware
         // applies. A timeout or a shed request comes back to the peer as
-        // an `UNKNOWN` error carrying the middleware's message.
+        // an `UNKNOWN` error described as `internal error`; the
+        // `middleware` example gives such failures a code of their own.
         let service = ServiceBuilder::new()
             .concurrency_limit(64)
             .timeout(Duration::from_secs(5))

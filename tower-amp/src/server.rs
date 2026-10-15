@@ -666,6 +666,41 @@ mod log_test {
         assert!(lines[2].contains("ZERO_DIVISION"), "{lines:#?}");
     }
 
+    /// A middleware error's text goes to the log, which is the only place
+    /// it goes: the peer is told `internal error`.
+    #[tokio::test]
+    async fn middleware_errors_are_logged() {
+        let log = Log::default();
+        let _guard = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish()
+            .set_default();
+
+        let service = service_fn(|_: Request| async {
+            Err::<AmpBox, tower::BoxError>("db at 10.0.0.7:5432 refused the connection".into())
+        });
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server_io, service));
+        let mut client = Client::new(client_io);
+        let request = Request::new("Lookup", AmpBox::new()).with_ask("x");
+        let failed = Service::call(&mut client, request).await.unwrap_err();
+        assert!(
+            matches!(
+                failed,
+                Error::Command { ref code, ref description }
+                    if code == "UNKNOWN" && description == "internal error"
+            ),
+            "{failed:?}"
+        );
+
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].contains("WARN"), "{lines:#?}");
+        assert!(lines[0].contains(r#"command="Lookup""#), "{lines:#?}");
+        assert!(lines[0].contains("10.0.0.7:5432"), "{lines:#?}");
+    }
+
     /// A request that wants no reply is still logged when it fails, since
     /// the log is the only place its failure can go.
     #[tokio::test]

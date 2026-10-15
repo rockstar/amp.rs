@@ -257,6 +257,9 @@ The `examples` directory has runnable programs:
   on its own connection.
 * `kv_watcher` subscribes to it, sets a key, and prints the changes the
   server pushes, so it serves commands on the connection it calls on.
+* `middleware` wraps a server in a timing layer of its own and tower's
+  timeout and concurrency limit, gives a timeout an error code of its own,
+  and calls itself to show what the peer is told when each layer fails.
 
 How it fits together
 --
@@ -268,7 +271,8 @@ How it fits together
 * This crate speaks tower: a service from an `amp_protocol::Request` to an
   `AmpBox` of results, with `tower_amp::Error` as the error. `Router` and
   `Client` are both such services, and `serve` accepts any such service,
-  including one wrapped in tower middleware whose error type is a boxed error.
+  including one wrapped in tower middleware whose error type is a boxed
+  error; see Middleware below.
 * The `#[command]` attribute comes from the
   [tower-amp-macros](https://crates.io/crates/tower-amp-macros) crate and is
   re-exported here, so only this crate needs to be a dependency. The code it
@@ -351,6 +355,47 @@ if that matters.
 
 `Server::serve_connection` serves one connection with the same options, for
 an accept loop of your own; the shutdown future then stops that connection.
+
+Middleware
+--
+
+`Router` is a tower service, so a layer from tower, or one of your own,
+wraps it before it is served. The first layer in a `ServiceBuilder` is the
+outermost.
+
+```rust,no_run
+# use std::time::Duration;
+# use tower::{BoxError, ServiceBuilder};
+# use tower_amp::{Error, Router, Server};
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let router = Router::new();
+# let listener = tokio::net::TcpListener::bind("127.0.0.1:1234").await?;
+let service = ServiceBuilder::new()
+    .map_err(|err: BoxError| match err.downcast::<tower::timeout::error::Elapsed>() {
+        Ok(_) => Error::new("TIMEOUT", "the command took too long"),
+        Err(err) => Error::from(err),
+    })
+    .timeout(Duration::from_secs(5))
+    .concurrency_limit(64)
+    .service(router);
+Server::new(service).serve(listener).await?;
+# Ok(())
+# }
+```
+
+`Timeout` and `ConcurrencyLimit` make the stack's error type tower's
+`BoxError`, which `serve` accepts. A `tower_amp::Error` inside the box, a
+handler's own, comes back out with its code intact. Anything else is
+answered `UNKNOWN` with the description `internal error`, and the error
+goes to the log: it was not written for the peer, who may be anyone. A
+timeout's "request timed out" would be harmless, but a layer that queries a
+database fails with the host it could not reach, and there is no telling
+the two apart in general. A layer that wants the peer told something
+specific says so by mapping its error to `Error::new`, as the `map_err`
+above does for a timeout; the peer then gets that code and description, as
+it would from a handler. The `middleware` example does this and writes a
+layer of its own.
 
 Logging
 --

@@ -148,6 +148,34 @@ impl HandleWith<Counter> for Read {
 #[command]
 struct Hang {}
 
+/// How many `Linger` handlers are running. One counts itself in when it
+/// starts and out when it ends, however it ends, so a cancelled one counts
+/// out too.
+#[derive(Clone, Default)]
+struct Running(Arc<AtomicU64>);
+
+/// Counts a `Linger` handler out when dropped.
+struct Counted(Running);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Counts itself in and runs until cancelled.
+#[derive(Serialize, Deserialize)]
+#[command]
+struct Linger {}
+
+impl HandleWith<Running> for Linger {
+    async fn handle(self, running: Running) -> Result<(), Error> {
+        running.0.fetch_add(1, Ordering::SeqCst);
+        let _counted = Counted(running);
+        std::future::pending().await
+    }
+}
+
 impl HandleWith<Counter> for Hang {
     async fn handle(self, counter: Counter) -> Result<(), Error> {
         counter.0.fetch_add(1, Ordering::SeqCst);
@@ -753,6 +781,239 @@ async fn shutdown_stops_one_connection_once_its_requests_are_answered() {
     assert!(peer_closed(&failed), "{failed:?}");
 }
 
+/// A peer on one end of a pipe that writes boxes straight onto it, for a
+/// test that needs to hang up with requests in flight, which a `Client`
+/// never does.
+type Peer = tokio_util::codec::Framed<tokio::io::DuplexStream, AmpCodec>;
+
+/// Serves `service` on one end of a pipe with `server` and returns the
+/// connection's task and the peer's end.
+fn serve_peer<S, F>(server: Server<S, F>) -> (tokio::task::JoinHandle<Result<(), Error>>, Peer)
+where
+    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
+    S::Error: Into<Error>,
+    S::Future: Send,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (peer, server_io) = tokio::io::duplex(4096);
+    let served = tokio::spawn(server.serve_connection(server_io));
+    (served, Peer::new(peer, AmpCodec::new()))
+}
+
+/// Sends `count` requests for `command` on `peer`, each asking for a reply.
+async fn ask(peer: &mut Peer, command: &str, count: u64) {
+    for i in 0..count {
+        let request = Request::new(command, AmpBox::new()).with_ask(i.to_string());
+        peer.send(request.into_box().unwrap()).await.unwrap();
+    }
+}
+
+/// Waits until `running` counts `expected` handlers, or fails the test
+/// after a few seconds.
+async fn running(running: &Running, expected: u64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while running.0.load(Ordering::SeqCst) != expected {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{} handlers running, expected {expected}",
+            running.0.load(Ordering::SeqCst)
+        )
+    });
+}
+
+/// Waits for `served` to end, which it must within a few seconds of the
+/// peer hanging up, and returns how it ended.
+async fn ended(served: tokio::task::JoinHandle<Result<(), Error>>) -> Result<(), Error> {
+    tokio::time::timeout(Duration::from_secs(5), served)
+        .await
+        .expect("the connection outlived its peer")
+        .unwrap()
+}
+
+/// A peer that hangs up with requests in flight takes their handlers with
+/// it: the replies would have nowhere to go, and a peer that could leave
+/// handlers running would be charged nothing for them.
+#[tokio::test]
+async fn handlers_for_a_peer_that_hangs_up_are_cancelled() {
+    let counter = Running::default();
+    let router = Router::with_state(counter.clone()).command::<Linger>();
+    let (served, mut peer) = serve_peer(Server::new(router));
+    ask(&mut peer, "Linger", 3).await;
+    running(&counter, 3).await;
+
+    drop(peer);
+    ended(served).await.unwrap();
+    assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+}
+
+/// A peer that fills the in-flight limit and hangs up is the case that
+/// matters: the connection is waiting for a permit no handler will ever
+/// give back, and must notice the hang-up all the same.
+#[tokio::test]
+async fn a_peer_at_the_limit_that_hangs_up_is_noticed() {
+    let counter = Running::default();
+    let router = Router::with_state(counter.clone()).command::<Linger>();
+    let (served, mut peer) = serve_peer(Server::new(router).max_in_flight(8));
+    ask(&mut peer, "Linger", 8).await;
+    running(&counter, 8).await;
+
+    drop(peer);
+    ended(served).await.unwrap();
+    assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+}
+
+/// Cancelling is for a peer that leaves. A shutdown stops the connection
+/// reading, and the peer is still there for the answer.
+#[tokio::test]
+async fn shutdown_does_not_cancel_handlers() {
+    let counter = Running::default();
+    let router = Router::with_state(counter.clone()).command::<Linger>();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = Server::new(router).shutdown(async {
+        let _ = stopped.await;
+    });
+    let (served, mut peer) = serve_peer(server);
+    ask(&mut peer, "Linger", 2).await;
+    running(&counter, 2).await;
+
+    stop.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(counter.0.load(Ordering::SeqCst), 2);
+    assert!(!served.is_finished());
+}
+
+/// A notification's handler finishes after the peer hangs up: the peer never
+/// waited for it, and one that notifies and exits expects it done.
+#[tokio::test]
+async fn a_notifications_handler_finishes_after_the_peer_hangs_up() {
+    let gate = Gate::default();
+    let router = Router::with_state(gate.clone()).command::<Hold>();
+    let (served, mut peer) = serve_peer(Server::new(router));
+    let notification = Request::new("Hold", AmpBox::new()).into_box().unwrap();
+    peer.send(notification).await.unwrap();
+    gate.started.notified().await;
+
+    drop(peer);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!served.is_finished(), "the notification was cancelled");
+    gate.release.notify_one();
+    ended(served).await.unwrap();
+}
+
+/// The limit is still backpressure, not refusal: a request past it waits
+/// for a permit and is then served.
+#[tokio::test]
+async fn requests_past_the_limit_are_served_in_turn() {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    tokio::spawn(
+        Server::new(router())
+            .max_in_flight(1)
+            .serve_connection(server_io),
+    );
+    let client = Client::new(client_io);
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..3 {
+        let client = client.clone();
+        set.spawn(async move { client.call(&Sleep { millis: 10 }).await.unwrap() });
+    }
+    let all = async {
+        while let Some(slept) = set.join_next().await {
+            assert_eq!(slept.unwrap().millis, 10);
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), all)
+        .await
+        .expect("a request past the limit was never served");
+}
+
+/// Whether `result` is the error an idle connection ends with.
+fn timed_out(result: &Result<(), Error>) -> bool {
+    matches!(result, Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::TimedOut)
+}
+
+/// A connection over which nothing arrives for the idle timeout is closed
+/// with an error, and a call on it from then on fails.
+#[tokio::test]
+async fn an_idle_connection_is_closed_after_the_idle_timeout() {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let server = Server::new(router()).idle_timeout(Duration::from_millis(100));
+    let served = tokio::spawn(server.serve_connection(server_io));
+    let client = Client::new(client_io);
+    let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
+    assert_eq!(total.total, 3);
+
+    let result = ended(served).await;
+    assert!(timed_out(&result), "{result:?}");
+    let failed = client.call(&Sum { a: 1, b: 2 }).await;
+    assert!(peer_closed(&failed), "{failed:?}");
+}
+
+/// Part of a box is not a box: a peer that sends a byte at a time to keep
+/// the connection open is idle all the same.
+#[tokio::test]
+async fn a_peer_sending_a_byte_at_a_time_is_idle() {
+    let (mut peer, server_io) = tokio::io::duplex(4096);
+    let server = Server::new(router()).idle_timeout(Duration::from_millis(100));
+    let served = tokio::spawn(server.serve_connection(server_io));
+    let request = Request::new("Sum", AmpBox::new()).with_ask("1");
+    let mut bytes = bytes::BytesMut::new();
+    tokio_util::codec::Encoder::encode(
+        &mut AmpCodec::new(),
+        request.into_box().unwrap(),
+        &mut bytes,
+    )
+    .unwrap();
+
+    // A byte every 30 ms is well under the timeout for each byte, and well
+    // over it for the box; the writes fail once the server has hung up.
+    for byte in &bytes {
+        if served.is_finished() {
+            break;
+        }
+        let _ = peer.write_all(&[*byte]).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let result = ended(served).await;
+    assert!(timed_out(&result), "{result:?}");
+}
+
+/// A connection with a request in flight is waiting on its own handler,
+/// not on the peer, so it is busy rather than idle for as long as the
+/// handler takes. The clock starts once the request is answered.
+#[tokio::test]
+async fn a_connection_with_a_request_in_flight_is_not_idle() {
+    let gate = Gate::default();
+    let router = Router::with_state(gate.clone()).command::<Hold>();
+    let server = Server::new(router).idle_timeout(Duration::from_millis(50));
+    let (served, mut peer) = serve_peer(server);
+    ask(&mut peer, "Hold", 1).await;
+    gate.started.notified().await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !served.is_finished(),
+        "a busy connection was closed as idle"
+    );
+
+    gate.release.notify_one();
+    let answer = peer.next().await.unwrap().unwrap();
+    assert_eq!(answer.get("_answer"), Some(&b"0"[..]));
+    let result = ended(served).await;
+    assert!(timed_out(&result), "{result:?}");
+}
+
+/// A server that may never accept a connection would serve nobody, so a
+/// limit of zero is refused where it is set.
+#[test]
+#[should_panic(expected = "a server must be allowed a connection")]
+fn a_zero_connection_limit_is_refused() {
+    let _ = Server::new(router()).max_connections(0);
+}
+
 /// An error code too long for the wire must still be answered, cut down to
 /// what fits, rather than panicking the task that would have answered it.
 #[tokio::test]
@@ -1197,4 +1458,32 @@ async fn a_server_frames_every_connection_with_its_codec() {
         .await
         .unwrap();
     assert_eq!(small.payload, "ok");
+}
+
+/// At the connection limit the server stops accepting. A peer that connects
+/// then waits in the listener's backlog, and is served once a connection
+/// closes.
+#[tokio::test]
+async fn the_connection_limit_holds_a_peer_until_one_closes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(Server::new(router()).max_connections(1).serve(listener));
+
+    let first = connect_tcp(addr).await;
+    let total = first.call(&Sum { a: 1, b: 2 }).await.unwrap();
+    assert_eq!(total.total, 3);
+    let second = connect_tcp(addr).await;
+    let waiting =
+        tokio::time::timeout(Duration::from_millis(200), second.call(&Sum { a: 3, b: 4 }));
+    assert!(
+        waiting.await.is_err(),
+        "a connection past the limit was served"
+    );
+
+    drop(first);
+    let total = tokio::time::timeout(Duration::from_secs(5), second.call(&Sum { a: 3, b: 4 }))
+        .await
+        .expect("the waiting peer was not served once a connection closed")
+        .unwrap();
+    assert_eq!(total.total, 7);
 }

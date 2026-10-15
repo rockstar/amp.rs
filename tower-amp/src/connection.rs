@@ -3,6 +3,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use amp_protocol::codec::AmpCodec;
 use amp_protocol::{AmpBox, Answer, ErrorResponse, MAX_VALUE_LENGTH, Message, Request};
@@ -129,15 +130,17 @@ where
     /// peer's requests with `service` and writing the requests made through
     /// its handles.
     ///
-    /// Returns once the peer closes the connection and every request
-    /// already received has been answered, or with the error that ended
-    /// the connection: an I/O error, or a box from the peer that broke the
-    /// protocol. Dropping the future closes the connection; dropping its
-    /// handles does not.
+    /// Returns once the peer closes the connection, or with the error that
+    /// ended it: an I/O error, or a box from the peer that broke the
+    /// protocol. Either way the handlers of the requests still in flight are
+    /// cancelled, as [`serve_connection`] describes, except those of
+    /// notifications, which finish first. Dropping the future closes the
+    /// connection; dropping its handles does not.
     ///
     /// Requests from the peer are handled as [`serve_connection`] describes.
     /// Answers the peer sends to commands nobody is waiting on any more are
-    /// discarded.
+    /// discarded. There is no idle timeout; [`Server`](crate::Server) has
+    /// one, for a connection that only serves.
     ///
     /// [`serve_connection`]: crate::serve_connection
     pub async fn serve<S>(self, service: S) -> Result<(), Error>
@@ -151,6 +154,7 @@ where
             std::future::pending(),
             Owner::Driver,
             DEFAULT_MAX_IN_FLIGHT,
+            None,
         )
         .await
     }
@@ -163,7 +167,18 @@ where
     /// once the requests it had already received are answered. `owner` says
     /// whether the handles keep the connection open, and `max_in_flight`,
     /// which must not be zero, how many of the peer's requests may be in
-    /// flight at once.
+    /// flight at once. With an `idle_timeout`, the connection ends with an
+    /// error once that long has passed with nothing in flight and no box
+    /// from the peer.
+    ///
+    /// When the peer closes the connection, or an error ends it, the
+    /// handlers of the requests that asked for a reply are cancelled: their
+    /// reply has nowhere to go, and a peer could otherwise fill the
+    /// in-flight limit with slow requests, hang up, and leave the handlers
+    /// running for as long as they take. A notification's handler finishes
+    /// regardless, since the peer never waited for it and may well have
+    /// hung up on purpose once it was sent. A shutdown cancels nothing: the
+    /// peer is still there to be answered.
     ///
     /// Reading and writing are separate futures so that a write the peer is
     /// slow to accept never stops this side from reading. If both sides
@@ -181,6 +196,7 @@ where
         shutdown: F,
         owner: Owner,
         max_in_flight: usize,
+        idle_timeout: Option<Duration>,
     ) -> Result<(), Error>
     where
         S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
@@ -216,57 +232,97 @@ where
         // Cancelled when the read future ends, however it ends, so that
         // the writer stops taking requests that could never be answered.
         let done_reading = CancellationToken::new();
+        // Cancels the handlers whose reply could no longer be delivered:
+        // when the peer closes the connection, and when an error ends this
+        // future or it is dropped, since the guard goes with it. A shutdown
+        // leaves it alone.
+        let handlers = CancellationToken::new();
+        let _cancel_handlers = handlers.clone().drop_guard();
 
         let done = done_reading.clone();
+        let handlers = &handlers;
         let read = async move {
             let _done = done.drop_guard();
             // Polled only until it completes: each branch that sees it
             // complete returns.
             let mut shutdown = pin!(shutdown);
+            // A request read while the connection was at its in-flight
+            // limit; see below. Handled before anything else is read.
+            let mut held = None;
             loop {
-                // `biased` so that a shutdown is seen even while the peer
-                // keeps the stream ready. A `next` that loses to it is
-                // dropped with nothing read, since the frame stays in the
-                // codec's buffer.
-                let incoming = tokio::select! {
-                    biased;
-                    () = &mut shutdown => return Ok(()),
-                    next = stream.next() => match next {
-                        Some(incoming) => incoming?,
-                        // The peer closed the connection.
-                        None => return Ok(()),
-                    },
+                let message = match held.take() {
+                    Some(request) => Message::Request(request),
+                    None => {
+                        // `biased` so that a shutdown is seen even while
+                        // the peer keeps the stream ready. A `next` that
+                        // loses to it is dropped with nothing read, since
+                        // the frame stays in the codec's buffer. The idle
+                        // timer starts over with each box.
+                        let incoming = tokio::select! {
+                            biased;
+                            () = &mut shutdown => return Ok(()),
+                            () = idle(idle_timeout, &in_flight, max_in_flight) => {
+                                return Err(idle_error(idle_timeout));
+                            }
+                            next = stream.next() => match next {
+                                Some(incoming) => incoming?,
+                                None => {
+                                    // The peer closed the connection.
+                                    handlers.cancel();
+                                    return Ok(());
+                                }
+                            },
+                        };
+                        Message::from_box(incoming)?
+                    }
                 };
-                match Message::from_box(incoming)? {
+                match message {
                     Message::Request(request) => {
                         // Waiting here, rather than spawning without bound,
                         // is what holds the peer to `max_in_flight`. Replies
                         // are written by `write` below, which does not
                         // depend on this loop, so waiting cannot deadlock.
                         // A shutdown ends the wait, and the request with it.
-                        let permit = tokio::select! {
-                            biased;
-                            () = &mut shutdown => return Ok(()),
-                            permit = Arc::clone(&in_flight).acquire_owned() => {
-                                permit.expect("the semaphore is never closed")
+                        //
+                        // The stream is read while waiting, so that a peer
+                        // that hangs up is noticed rather than its handlers
+                        // left to run with nowhere to send their replies. A
+                        // request that arrives instead is held, one at most,
+                        // until the permit comes; past that the peer waits
+                        // on its writes, and if it hangs up then, the
+                        // hang-up is noticed when the next reply is written
+                        // to it. An answer that arrives is matched to its
+                        // call at once, since it needs no permit.
+                        let permit = loop {
+                            tokio::select! {
+                                biased;
+                                () = &mut shutdown => return Ok(()),
+                                permit = Arc::clone(&in_flight).acquire_owned() => {
+                                    break permit.expect("the semaphore is never closed");
+                                }
+                                next = stream.next(), if held.is_none() => match next {
+                                    Some(incoming) => match Message::from_box(incoming?)? {
+                                        Message::Request(request) => held = Some(request),
+                                        Message::Answer(answer) => answered(pending, answer),
+                                        Message::Error(error) => failed(pending, error),
+                                    },
+                                    None => {
+                                        handlers.cancel();
+                                        return Ok(());
+                                    }
+                                },
                             }
                         };
-                        spawn(respond(service.clone(), request, responses.clone(), permit));
+                        spawn(respond(
+                            service.clone(),
+                            request,
+                            responses.clone(),
+                            permit,
+                            handlers.clone(),
+                        ));
                     }
-                    // A reply nobody is waiting for any more is discarded.
-                    Message::Answer(answer) => {
-                        if let Some(reply) = lock(pending).remove(&answer.answer) {
-                            let _ = reply.send(Ok(answer.results));
-                        }
-                    }
-                    Message::Error(error) => {
-                        if let Some(reply) = lock(pending).remove(&error.error) {
-                            let _ = reply.send(Err(Error::new(
-                                String::from_utf8_lossy(&error.code),
-                                String::from_utf8_lossy(&error.description),
-                            )));
-                        }
-                    }
+                    Message::Answer(answer) => answered(pending, answer),
+                    Message::Error(error) => failed(pending, error),
                 }
             }
             // `responses` and `service` are dropped with this future, which
@@ -401,6 +457,68 @@ impl Drop for ClearOnDrop<'_> {
     }
 }
 
+/// Hands the peer's answer to the call waiting for it. A reply nobody is
+/// waiting for any more is discarded.
+fn answered(pending: &Mutex<Pending>, answer: Answer) {
+    if let Some(reply) = lock(pending).remove(&answer.answer) {
+        let _ = reply.send(Ok(answer.results));
+    }
+}
+
+/// Hands the peer's error to the call waiting for it, as [`answered`] does.
+fn failed(pending: &Mutex<Pending>, error: ErrorResponse) {
+    if let Some(reply) = lock(pending).remove(&error.error) {
+        let _ = reply.send(Err(Error::new(
+            String::from_utf8_lossy(&error.code),
+            String::from_utf8_lossy(&error.description),
+        )));
+    }
+}
+
+/// Completes once the connection has been idle for `limit`: nothing in
+/// flight, and nothing read. Never completes without a limit.
+///
+/// A connection with a request in flight is waiting on its own handler,
+/// not on the peer, so the clock does not run until every permit of
+/// `in_flight`, of which there are `max_in_flight`, has been given back. The
+/// permits are taken only to learn that, and given back before the clock
+/// starts. This is one branch of a `select!` whose other branches read, so
+/// the semaphore is not contended within the connection: a request that
+/// arrives drops this future, permits and all, before it waits for one.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn idle(limit: Option<Duration>, in_flight: &Semaphore, max_in_flight: usize) {
+    let Some(limit) = limit else {
+        return std::future::pending().await;
+    };
+    // The semaphore holds fewer permits than `u32::MAX`, so this is only
+    // defensive.
+    let all = u32::try_from(max_in_flight).unwrap_or(u32::MAX);
+    let quiet = in_flight
+        .acquire_many(all)
+        .await
+        .expect("the semaphore is never closed");
+    drop(quiet);
+    tokio::time::sleep(limit).await;
+}
+
+/// Never completes: nothing on this target sets an idle timeout, since the
+/// server does not build here and [`Connection::serve`] has none, and
+/// tokio's timer needs a runtime there is none of.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+async fn idle(limit: Option<Duration>, _in_flight: &Semaphore, _max_in_flight: usize) {
+    debug_assert!(limit.is_none(), "no idle timeout can be set on this target");
+    std::future::pending().await
+}
+
+/// The error that ends a connection whose peer sent nothing for `limit`.
+fn idle_error(limit: Option<Duration>) -> Error {
+    let limit = limit.expect("the idle timer only completes with a limit");
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("the peer sent nothing for {limit:?}"),
+    ))
+}
+
 /// Tells the callers of the notifications in `notified` that they have been
 /// written. One whose caller has stopped waiting is dropped unheard.
 fn answer_written(notified: &mut Vec<oneshot::Sender<Result<AmpBox, Error>>>) {
@@ -425,11 +543,17 @@ pub(crate) enum Owner {
 /// request wants one. The permit is the request's share of the connection's
 /// in-flight limit, released when this returns: once the response is queued,
 /// or at once for a request that wants none.
+///
+/// `cancelled` is cancelled once no response can reach the peer. A request
+/// that wants one is then dropped wherever its handler is, and nothing is
+/// logged: the peer left, and the handler did nothing wrong. A request that
+/// wants none is handled regardless, since the peer never waited for it.
 async fn respond<S>(
     service: S,
     request: Request,
     responses: mpsc::Sender<AmpBox>,
     _permit: OwnedSemaphorePermit,
+    cancelled: CancellationToken,
 ) where
     S: Service<Request, Response = AmpBox> + Send + 'static,
     S::Error: Into<Error>,
@@ -437,7 +561,13 @@ async fn respond<S>(
 {
     let command = request.command.clone();
     let ask = request.ask.clone();
-    let result = match call(service, request).await {
+    // `biased` so that a request whose peer is already gone is not started.
+    let outcome = tokio::select! {
+        biased;
+        () = cancelled.cancelled(), if ask.is_some() => return,
+        outcome = call(service, request) => outcome,
+    };
+    let result = match outcome {
         Ok(Ok(results)) => Ok(results),
         Ok(Err(err)) => {
             log::command_failed(&command, ask.as_deref(), &err);

@@ -3,10 +3,13 @@ use std::io;
 use std::pin::pin;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use amp_protocol::codec::AmpCodec;
 use amp_protocol::{AmpBox, Request};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tower::Service;
@@ -20,7 +23,8 @@ use crate::{Connection, Error, log};
 const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 
 /// A server with its options: the codec its connections are framed by, how
-/// many requests each may have in flight, and a signal that stops it.
+/// many requests each may have in flight, how long one may sit idle, how
+/// many there may be at once, and a signal that stops it.
 ///
 /// [`serve`] and [`serve_connection`] are the defaults; this is for a server
 /// that needs something else. Set what differs, then run it on a listener
@@ -28,6 +32,7 @@ const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 /// of your own with [`serve_connection`](Server::serve_connection):
 ///
 /// ```no_run
+/// # use std::time::Duration;
 /// # use tower_amp::{AmpCodec, Router, Server};
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), tower_amp::Error> {
@@ -36,6 +41,8 @@ const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 /// Server::new(router)
 ///     .codec(AmpCodec::with_max_frame_length(1024 * 1024))
 ///     .max_in_flight(32)
+///     .idle_timeout(Duration::from_secs(60))
+///     .max_connections(1_000)
 ///     .shutdown(async {
 ///         let _ = tokio::signal::ctrl_c().await;
 ///     })
@@ -44,6 +51,12 @@ const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 /// # }
 /// ```
 ///
+/// The defaults bound what one request or one connection can cost, not
+/// what a peer can cost by opening connections: there is no idle timeout
+/// and no limit on connections unless they are set here. A server open to
+/// peers it does not trust should set both, and bound how long a handler
+/// may run with tower's `Timeout` on the service.
+///
 /// A server without a shutdown signal is `Clone`, so one configured once
 /// can serve each connection an accept loop takes.
 #[derive(Clone)]
@@ -51,6 +64,8 @@ pub struct Server<S, F = Pending<()>> {
     service: S,
     codec: AmpCodec,
     max_in_flight: usize,
+    idle_timeout: Option<Duration>,
+    max_connections: Option<usize>,
     shutdown: F,
 }
 
@@ -62,13 +77,15 @@ where
 {
     /// A server that answers every connection's requests with a clone of
     /// `service`, with the defaults [`serve`] and [`serve_connection`] use:
-    /// a default [`AmpCodec`], 256 requests in flight per connection, and
-    /// no shutdown signal.
+    /// a default [`AmpCodec`], 256 requests in flight per connection, no
+    /// idle timeout, no limit on connections, and no shutdown signal.
     pub fn new(service: S) -> Self {
         Server {
             service,
             codec: AmpCodec::new(),
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            idle_timeout: None,
+            max_connections: None,
             shutdown: std::future::pending(),
         }
     }
@@ -100,7 +117,14 @@ where
     /// lets a trusted peer pipeline deeper. This bounds what a connection
     /// takes on, not what runs: wrap the service in tower's
     /// `ConcurrencyLimit` to bound the handlers running across every
-    /// connection.
+    /// connection, and in its `Timeout` to bound how long each runs.
+    ///
+    /// A peer that hangs up releases what it took on: the handlers of its
+    /// requests still in flight are cancelled, as [`serve_connection`]
+    /// describes. One that first sends more requests than the limit, so
+    /// that the connection has stopped reading, is not noticed until a
+    /// reply is next written to it; until then its connection counts
+    /// against [`max_connections`](Server::max_connections) like any other.
     ///
     /// # Panics
     ///
@@ -112,6 +136,55 @@ where
             "a connection must be allowed a request in flight"
         );
         self.max_in_flight = limit;
+        self
+    }
+
+    /// How long a connection may go without a box from its peer before it
+    /// is closed. There is no limit unless one is set.
+    ///
+    /// The clock starts over with every box the peer sends, and runs only
+    /// while no request is in flight: a connection waiting on a handler is
+    /// busy, not idle, however long the handler takes. A peer that sends
+    /// nothing, or only part of a box, for `limit` has its connection
+    /// closed with [`Error::Io`] of kind `TimedOut`, which
+    /// [`serve`](Server::serve) logs with the `tracing` feature and
+    /// [`serve_connection`](Server::serve_connection) returns.
+    ///
+    /// Set it on a server open to peers it does not trust, so that a peer
+    /// that connects and sends nothing, or sends a byte every so often,
+    /// cannot hold a connection and its buffers for good. A client that
+    /// keeps a connection open between calls needs the limit to be longer
+    /// than the gaps between them, or to reconnect when a call fails with
+    /// [`Error::ConnectionClosed`].
+    pub fn idle_timeout(mut self, limit: Duration) -> Self {
+        self.idle_timeout = Some(limit);
+        self
+    }
+
+    /// How many connections [`serve`](Server::serve) has open at once.
+    /// There is no limit unless one is set, and running out of file
+    /// descriptors is the only bound.
+    ///
+    /// At the limit the server stops accepting until a connection closes,
+    /// so a peer that connects then waits in the listener's backlog, and
+    /// once that is full the operating system refuses it. A connection
+    /// counts until its task ends, which for a peer that hung up with
+    /// handlers still running is when those are cancelled or finish. With
+    /// an [`idle_timeout`](Server::idle_timeout) and a `Timeout` on the
+    /// service, what one peer can hold is then bounded in every direction:
+    /// connections, requests on each, and how long each runs.
+    ///
+    /// Only `serve` applies the limit, since
+    /// [`serve_connection`](Server::serve_connection) is given its
+    /// connections by an accept loop of your own.
+    ///
+    /// # Panics
+    ///
+    /// If `limit` is zero, since a server that may never accept a
+    /// connection would serve nobody.
+    pub fn max_connections(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "a server must be allowed a connection");
+        self.max_connections = Some(limit);
         self
     }
 
@@ -129,10 +202,11 @@ where
     /// afterwards.
     ///
     /// A handler that never finishes holds shutdown open: nothing here
-    /// gives up on a request. Wrap the call in [`tokio::time::timeout`] if
-    /// that matters. Dropping the future, which the timeout does, still
-    /// tells the connections to stop reading and answer what they have, but
-    /// no longer waits for them.
+    /// gives up on a request, and a peer that hangs up during shutdown is
+    /// not noticed, since the connection is no longer reading. Wrap the
+    /// call in [`tokio::time::timeout`] if that matters. Dropping the
+    /// future, which the timeout does, still tells the connections to stop
+    /// reading and answer what they have, but no longer waits for them.
     ///
     /// For [`serve_connection`](Server::serve_connection) the signal stops
     /// that one connection the same way: it reads no more requests and
@@ -145,6 +219,8 @@ where
             service: self.service,
             codec: self.codec,
             max_in_flight: self.max_in_flight,
+            idle_timeout: self.idle_timeout,
+            max_connections: self.max_connections,
             shutdown: signal,
         }
     }
@@ -162,6 +238,8 @@ where
             service,
             codec,
             max_in_flight,
+            idle_timeout,
+            max_connections,
             shutdown: signal,
         } = self;
         let shutdown = CancellationToken::new();
@@ -170,11 +248,26 @@ where
         // up.
         let _cancel_on_drop = shutdown.clone().drop_guard();
         let connections = TaskTracker::new();
+        // One permit per connection allowed, held by its task until it
+        // ends. A semaphore cannot hold more than `MAX_PERMITS`, which is
+        // more connections than any process will have.
+        let open = max_connections
+            .map(|limit| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))));
         let mut signal = pin!(signal);
         let result = loop {
             // `biased` so that the signal is seen even while peers keep the
-            // listener ready. Neither branch is polled again after it
-            // completes.
+            // listener ready, or while connections keep closing. Neither
+            // branch is polled again after it completes.
+            let permit = match &open {
+                Some(open) => tokio::select! {
+                    biased;
+                    () = &mut signal => break Ok(()),
+                    permit = Arc::clone(open).acquire_owned() => {
+                        Some(permit.expect("the semaphore is never closed"))
+                    }
+                },
+                None => None,
+            };
             let accepted = tokio::select! {
                 biased;
                 () = &mut signal => break Ok(()),
@@ -194,9 +287,14 @@ where
                         service: service.clone(),
                         codec: codec.clone(),
                         max_in_flight,
+                        idle_timeout,
+                        max_connections,
                         shutdown: shutdown.clone().cancelled_owned(),
                     };
                     connections.spawn(async move {
+                        // The connection's share of `max_connections`, given
+                        // back when the connection has ended.
+                        let _permit = permit;
                         if let Err(err) = connection.serve_connection(stream).await {
                             log::connection_failed(&err);
                         }
@@ -229,12 +327,13 @@ where
     /// Serves one connection until the peer closes it, as
     /// [`serve_connection`] does, with this server's options.
     ///
-    /// Returns once the peer closes the connection and every request
-    /// already received has been answered, or with the error that ended the
-    /// connection, as `serve_connection` does. With a
+    /// Returns once the peer closes the connection, or with the error that
+    /// ended the connection, as `serve_connection` does, which includes the
+    /// [idle timeout](Server::idle_timeout) running out. With a
     /// [shutdown](Server::shutdown) signal, it also returns `Ok(())` once
     /// the signal has completed and the requests received before it were
-    /// answered.
+    /// answered. The [connection limit](Server::max_connections) does not
+    /// apply, since the connection was accepted elsewhere.
     ///
     /// `io` need not be a socket, so nothing is done to its options. An
     /// accept loop of your own should set `TCP_NODELAY` on each
@@ -249,6 +348,7 @@ where
                 self.shutdown,
                 Owner::Driver,
                 self.max_in_flight,
+                self.idle_timeout,
             )
             .await
     }
@@ -274,8 +374,9 @@ where
 ///
 /// Each connection uses a default [`AmpCodec`], which refuses a box longer
 /// than 16 MiB or with more than 1,024 pairs, and may have 256 requests in
-/// flight at once. [`Server`] serves with another codec or limit, and with a
-/// way to stop.
+/// flight at once. There is no idle timeout and no limit on the number of
+/// connections; [`Server`] serves with those, with another codec or
+/// in-flight limit, and with a way to stop.
 pub async fn serve<S>(listener: TcpListener, service: S) -> Result<(), Error>
 where
     S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
@@ -407,14 +508,24 @@ fn out_of_descriptors(err: &io::Error) -> bool {
 /// [`serve`] does, so that replies written back to back are not each held
 /// for the peer's acknowledgement of the one before.
 ///
-/// Returns once the peer closes the connection and every request already
-/// received has been answered, or with the error that ended the connection.
-/// A box longer than the codec allows is such an error, reported as
-/// [`Error::Protocol`] wrapping [`amp_protocol::Error::FrameTooLong`], and so
-/// is one with more pairs, wrapping [`amp_protocol::Error::TooManyPairs`]. The
-/// default [`AmpCodec`] allows 16 MiB and 1,024 pairs.
-/// [`Server::serve_connection`] serves with another codec or in-flight limit,
-/// and with a way to stop.
+/// Returns once the peer closes the connection, or with the error that ended
+/// the connection. A box longer than the codec allows is such an error,
+/// reported as [`Error::Protocol`] wrapping
+/// [`amp_protocol::Error::FrameTooLong`], and so is one with more pairs,
+/// wrapping [`amp_protocol::Error::TooManyPairs`]. The default [`AmpCodec`]
+/// allows 16 MiB and 1,024 pairs. [`Server::serve_connection`] serves with
+/// another codec or in-flight limit, with an idle timeout, and with a way to
+/// stop.
+///
+/// Either way, the handlers of the requests still in flight are cancelled:
+/// their reply has nowhere to go, and a peer could otherwise fill the
+/// in-flight limit with slow requests, hang up, and leave the handlers
+/// running for as long as they take. A cancelled handler is dropped
+/// wherever it is, and nothing is logged. A handler whose work must finish
+/// once begun should spawn that work on its own task rather than await it.
+/// The handler of a request without `_ask` is not cancelled, since the
+/// peer never waited for it and may have hung up on purpose once it was
+/// sent; `serve_connection` returns once those have finished.
 pub async fn serve_connection<T, S>(io: T, service: S) -> Result<(), Error>
 where
     T: AsyncRead + AsyncWrite,

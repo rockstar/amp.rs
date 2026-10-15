@@ -282,6 +282,14 @@ requests are in flight on a connection at once; past that the connection
 stops reading until one has been answered, so a peer that sends without
 reading its replies is held to a bounded amount of memory.
 
+A peer that hangs up takes the handlers of its requests in flight with it:
+their replies would have nowhere to go, and a peer that could leave them
+running would be charged nothing for them. A cancelled handler is dropped
+wherever it is, so a handler whose work must finish once begun should spawn
+that work rather than await it. The handler of a notification, a request
+that asked for no reply, is not cancelled: the peer never waited for it, and
+may have hung up on purpose once it was sent.
+
 A box is read in full before it is handled, so a connection refuses one
 longer than 16 MiB and closes rather than buffering without bound. It also
 refuses one with more than 1,024 pairs, since a decoded pair costs far more
@@ -294,9 +302,11 @@ Server options
 
 `serve` and `serve_connection` use the defaults above. `Server` is the same
 server with its options set: the codec, how many requests a connection may
-have in flight, and a future that stops it.
+have in flight, how long one may sit idle, how many there may be at once,
+and a future that stops it.
 
 ```rust,no_run
+# use std::time::Duration;
 # use tower_amp::{AmpCodec, Router, Server};
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -305,6 +315,8 @@ have in flight, and a future that stops it.
 Server::new(router)
     .codec(AmpCodec::with_max_frame_length(1024 * 1024))
     .max_in_flight(32)
+    .idle_timeout(Duration::from_secs(60))
+    .max_connections(1_000)
     .shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
     })
@@ -317,7 +329,18 @@ Server::new(router)
 `max_in_flight` bounds what one connection takes on, not what runs: fewer
 holds a peer to less memory when a handler is expensive, more lets a trusted
 peer pipeline deeper. Tower's `ConcurrencyLimit` on the service bounds the
-handlers running across every connection.
+handlers running across every connection, and its `Timeout` how long each
+runs.
+
+`idle_timeout` closes a connection over which nothing has arrived for that
+long while no request was in flight, so a peer that connects and sends
+nothing, or a byte every so often, cannot hold a connection for good. There
+is none by default, since a client that keeps a connection open between
+calls would otherwise find it closed. `max_connections` is how many
+connections `serve` has open at once; at the limit it stops accepting until
+one closes, and a peer that connects waits in the listener's backlog. There
+is no limit by default. A server open to peers it does not trust should set
+both.
 
 The shutdown future stops the server once it completes: the listener is
 closed, so a peer that connects from then on is refused, and each

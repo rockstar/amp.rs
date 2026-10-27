@@ -9,7 +9,7 @@ use amp_protocol::codec::AmpCodec;
 use amp_protocol::{AmpBox, Answer, ErrorResponse, MAX_VALUE_LENGTH, Message, Request};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
@@ -22,7 +22,9 @@ use crate::{Client, Error, log};
 /// otherwise: received and not yet answered. Past this the connection stops
 /// reading until a reply has been queued, so a peer that sends requests
 /// without reading the replies is held to this much memory rather than as
-/// much as it cares to send.
+/// much as it cares to send. While a call of this side's own is waiting the
+/// connection reads on, and refuses what it cannot hold; see
+/// [`Connection::run`].
 pub(crate) const DEFAULT_MAX_IN_FLIGHT: usize = 256;
 
 /// One AMP connection, used in both directions: a [`Client`] handle calls
@@ -137,10 +139,21 @@ where
     /// notifications, which finish first. Dropping the future closes the
     /// connection; dropping its handles does not.
     ///
-    /// Requests from the peer are handled as [`serve_connection`] describes.
-    /// Answers the peer sends to commands nobody is waiting on any more are
-    /// discarded. There is no idle timeout; [`Server`](crate::Server) has
-    /// one, for a connection that only serves.
+    /// Requests from the peer are handled as [`serve_connection`] describes,
+    /// with one difference at the in-flight limit. A handler that calls the
+    /// peer that asked, as the example above does, cannot answer until the
+    /// peer has, so a connection that stopped reading at the limit while
+    /// such handlers filled it would never read their answers, and would
+    /// hang for good. Instead, while a call made through one of its handles
+    /// is waiting for an answer, the connection keeps reading past the
+    /// limit: it holds one request for the next free slot, as a connection
+    /// that only serves does, and answers each further one with the error
+    /// code `TOO_MANY_REQUESTS` and the description `too many requests in
+    /// flight`, or drops it if it wanted no reply. A peer that pipelines
+    /// more than 257 requests to a command that calls it back should expect
+    /// that error and retry. Answers the peer sends to commands nobody is
+    /// waiting on any more are discarded. There is no idle timeout;
+    /// [`Server`](crate::Server) has one, for a connection that only serves.
     ///
     /// [`serve_connection`]: crate::serve_connection
     pub async fn serve<S>(self, service: S) -> Result<(), Error>
@@ -247,6 +260,11 @@ where
         // leaves it alone.
         let handlers = CancellationToken::new();
         let _cancel_handlers = handlers.clone().drop_guard();
+        // Told by the writer each time a request that wants an answer goes
+        // out, for the reader when it has stopped reading at the in-flight
+        // limit; see the permit wait below.
+        let calling = Notify::new();
+        let calling = &calling;
 
         let done = done_reading.clone();
         let handlers = &handlers;
@@ -295,23 +313,44 @@ where
                         //
                         // The stream is read while waiting, so that a peer
                         // that hangs up is noticed rather than its handlers
-                        // left to run with nowhere to send their replies. A
-                        // request that arrives instead is held, one at most,
-                        // until the permit comes; past that the peer waits
-                        // on its writes, and if it hangs up then, the
-                        // hang-up is noticed when the next reply is written
-                        // to it. An answer that arrives is matched to its
-                        // call at once, since it needs no permit.
+                        // left to run with nowhere to send their replies,
+                        // and so that an answer to a call from this side is
+                        // matched to it; neither needs a permit. A request
+                        // that arrives instead is held, one at most, until
+                        // the permit comes.
+                        //
+                        // What happens past the held request depends on
+                        // whether a call from this side is waiting. With
+                        // none, the stream is left alone: the peer waits on
+                        // its writes, and if it hangs up then, the hang-up
+                        // is noticed when the next reply is written to it.
+                        // With one, the stream is read on, since the call's
+                        // answer may be queued behind the peer's requests,
+                        // and if the handlers in flight are the callers, as
+                        // handlers that call the peer that asked are, no
+                        // permit would free until it was read: the
+                        // connection would hang for good. A further request
+                        // is then refused rather than held, since holding
+                        // any number would let the peer send without bound.
+                        // `calling` wakes this loop when a call is made
+                        // while the stream was being left alone, so that
+                        // whether to read is decided again.
                         let permit = loop {
+                            let calls_waiting = !lock(pending).is_empty();
+                            let reading = held.is_none() || calls_waiting;
                             tokio::select! {
                                 biased;
                                 () = &mut shutdown => return Ok(()),
                                 permit = Arc::clone(&in_flight).acquire_owned() => {
                                     break permit.expect("the semaphore is never closed");
                                 }
-                                next = stream.next(), if held.is_none() => match next {
+                                () = calling.notified(), if !reading => {}
+                                next = stream.next(), if reading => match next {
                                     Some(incoming) => match Message::from_box(incoming?)? {
-                                        Message::Request(request) => held = Some(request),
+                                        Message::Request(request) => match held {
+                                            None => held = Some(request),
+                                            Some(_) => refuse(request, &responses).await,
+                                        },
                                         Message::Answer(answer) => answered(pending, answer),
                                         Message::Error(error) => failed(pending, error),
                                     },
@@ -387,6 +426,12 @@ where
                             };
                             if abandoned {
                                 continue;
+                            }
+                            if request.ask.is_some() {
+                                // The reader may have stopped at the
+                                // in-flight limit, and now has an answer to
+                                // read for.
+                                calling.notify_one();
                             }
                             let ask = request.ask.clone();
                             let amp_box = match request.into_box() {
@@ -472,6 +517,18 @@ impl Drop for ClearOnDrop<'_> {
 fn answered(pending: &Mutex<Pending>, answer: Answer) {
     if let Some(reply) = lock(pending).remove(&answer.answer) {
         let _ = reply.send(Ok(answer.results));
+    }
+}
+
+/// Answers `request`, which arrived at the in-flight limit with a request
+/// already held, with `TOO_MANY_REQUESTS`, as [`Connection::run`] describes.
+/// A notification is dropped, since it asked for no answer; either way the
+/// refusal is logged as the command failing.
+async fn refuse(request: Request, responses: &mpsc::Sender<AmpBox>) {
+    let err = Error::too_many_requests();
+    log::command_failed(&request.command, request.ask.as_deref(), &err);
+    if let Some(ask) = request.ask {
+        let _ = responses.send(error_response(ask, &err)).await;
     }
 }
 

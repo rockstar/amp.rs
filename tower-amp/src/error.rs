@@ -63,6 +63,11 @@ pub enum Error {
 /// than its request.
 pub(crate) const INTERNAL_ERROR: &str = "internal error";
 
+/// The code a peer sees for a request refused because the connection was at
+/// its in-flight limit, as [`Connection::serve`](crate::Connection::serve)
+/// describes.
+pub(crate) const TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
+
 impl Error {
     /// Fails a command with `code` and `description`.
     pub fn new(code: impl Into<String>, description: impl Into<String>) -> Self {
@@ -84,6 +89,11 @@ impl Error {
             ErrorResponse::UNHANDLED,
             format!("unhandled command: {}", String::from_utf8_lossy(command)),
         )
+    }
+
+    /// The error for a request refused at the in-flight limit.
+    pub(crate) fn too_many_requests() -> Self {
+        Error::new(TOO_MANY_REQUESTS, "too many requests in flight")
     }
 
     /// The code that goes on the wire.

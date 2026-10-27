@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use amp_protocol::{AmpBox, Request};
+use amp_protocol::{AmpBox, Answer, Message, Request};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -401,6 +401,83 @@ async fn a_handler_calls_a_command_on_the_peer_that_asked() {
 
     let total = client.call(&Relay { a: 13, b: 81 }).await.unwrap();
     assert_eq!(total, Total { total: 94 });
+}
+
+/// A peer that fills the in-flight limit with requests whose handlers call
+/// it back, then pipelines two more, used to hang the connection for good:
+/// the second extra request could not be held, so the connection stopped
+/// reading, and with it reading nothing the handlers' calls were never
+/// answered, so no permit ever freed. The answers must be read regardless,
+/// the request that cannot be held refused rather than left to wedge the
+/// connection, and the hang-up noticed afterwards.
+#[tokio::test]
+async fn pipelining_past_the_limit_to_a_relaying_command_does_not_hang() {
+    // Room for every request at once, so that the peer never waits on a
+    // write before it starts answering.
+    let (peer, server_io) = tokio::io::duplex(1 << 20);
+    let connection = Connection::new(server_io);
+    let client = connection.client();
+    let served = tokio::spawn(connection.serve(Router::with_state(client).command::<Relay>()));
+    let mut peer = Peer::new(peer, AmpCodec::new());
+
+    // Two past the default limit of 256: one is held, and one is the
+    // request that used to stop the connection reading.
+    const REQUESTS: u64 = 258;
+    for i in 0..REQUESTS {
+        let mut args = AmpBox::new();
+        args.insert("a", i.to_string()).unwrap();
+        args.insert("b", "1").unwrap();
+        let request = Request::new("Relay", args).with_ask(i.to_string());
+        peer.send(request.into_box().unwrap()).await.unwrap();
+    }
+
+    // Answer each relayed `Sum`, and collect the answers to the `Relay`s.
+    let mut answered = 0;
+    let mut refused = 0;
+    let exchange = async {
+        while answered + refused < REQUESTS {
+            let incoming = peer.next().await.unwrap().unwrap();
+            match Message::from_box(incoming).unwrap() {
+                Message::Request(sum) => {
+                    let a: i64 = std::str::from_utf8(sum.arguments.get("a").unwrap())
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let mut results = AmpBox::new();
+                    results.insert("total", (a + 1).to_string()).unwrap();
+                    let answer = Answer::new(sum.ask.unwrap(), results).into_box().unwrap();
+                    peer.send(answer).await.unwrap();
+                }
+                Message::Answer(answer) => {
+                    let ask: i64 = std::str::from_utf8(&answer.answer)
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    assert_eq!(
+                        answer.results.get("total").unwrap(),
+                        (ask + 1).to_string().as_bytes()
+                    );
+                    answered += 1;
+                }
+                Message::Error(error) => {
+                    assert_eq!(error.code, b"TOO_MANY_REQUESTS", "{error:?}");
+                    refused += 1;
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("the connection stopped reading with its handlers waiting on the peer");
+    // The request that is held is served once a permit frees; only what
+    // could not be held is refused.
+    assert!(
+        answered >= REQUESTS - 1,
+        "{answered} answered, {refused} refused"
+    );
+
+    drop(peer);
+    ended(served).await.unwrap();
 }
 
 /// A served connection is kept open by whoever drives it, not by its

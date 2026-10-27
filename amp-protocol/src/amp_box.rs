@@ -139,8 +139,32 @@ impl AmpBox {
     /// terminator, and [`Error::KeyTooLong`] if a key's length prefix exceeds
     /// 255. A key that repeats within one box keeps the last value, matching
     /// the reference implementation.
+    ///
+    /// This puts no limit on the number of pairs. Each decoded pair costs two
+    /// heap allocations and a few dozen bytes of bookkeeping, while on the
+    /// wire a pair can be as short as five bytes, so a box of many tiny pairs
+    /// decodes to many times its own size. That is fine for bytes you trust,
+    /// or that the `tokio` feature's `AmpCodec` has already framed, since it
+    /// counts pairs before anything is decoded. For bytes from an untrusted
+    /// peer that you frame yourself, use
+    /// [`decode_bounded`](Self::decode_bounded) instead.
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
-        let (pairs, consumed) = Self::decode_borrowed(bytes)?;
+        Self::decode_bounded(bytes, usize::MAX)
+    }
+
+    /// Decodes one box from the front of `bytes`, refusing one with more than
+    /// `max_pairs` pairs.
+    ///
+    /// Behaves as [`decode`](Self::decode) does, except that a box fails with
+    /// [`Error::TooManyPairs`] as soon as the start of pair `max_pairs + 1` is
+    /// read, before anything is allocated for it. A repeated key counts each
+    /// time it appears, so the limit bounds the work of decoding, not just
+    /// the size of the result. Set `max_pairs` to the most pairs the peer
+    /// could legitimately send in one box, counting the reserved keys
+    /// (`_command` and `_ask` on a request, `_answer` on an answer, and
+    /// `_error`, `_error_code`, and `_error_description` on an error).
+    pub fn decode_bounded(bytes: &[u8], max_pairs: usize) -> Result<(Self, usize), Error> {
+        let (pairs, consumed) = decode_pairs(bytes, max_pairs)?;
         let entries = pairs
             .into_iter()
             .map(|(key, value)| (key.to_vec(), value.to_vec()))
@@ -155,36 +179,57 @@ impl AmpBox {
     /// [`decode`](Self::decode) would hold, including a repeated key keeping
     /// its last value, and the errors are the same. Use this when the pairs
     /// are read once and the box itself is not needed.
+    ///
+    /// Like [`decode`](Self::decode), this puts no limit on the number of
+    /// pairs. It copies nothing, but still holds a few dozen bytes per pair,
+    /// so the caveat there applies: frame untrusted bytes with `AmpCodec` or
+    /// cap their length tightly.
     // A pair of slices is the whole point of this function, and a named
     // alias for it would be one more public type to learn.
     #[expect(clippy::type_complexity)]
     pub fn decode_borrowed(bytes: &[u8]) -> Result<(Vec<(&[u8], &[u8])>, usize), Error> {
-        let mut pairs: Vec<(&[u8], &[u8])> = Vec::new();
-        let mut keys = Keys::new();
-        let mut pos = 0;
-        loop {
-            let key_len = read_u16(bytes, pos)?;
-            pos += 2;
-            if key_len == 0 {
-                return Ok((pairs, pos));
-            }
-            if key_len > MAX_KEY_LENGTH {
-                return Err(Error::KeyTooLong { len: key_len });
-            }
-            let key = read_slice(bytes, pos, key_len)?;
-            pos += key_len;
+        decode_pairs(bytes, usize::MAX)
+    }
+}
 
-            let value_len = read_u16(bytes, pos)?;
-            pos += 2;
-            let value = read_slice(bytes, pos, value_len)?;
-            pos += value_len;
+/// Decodes the pairs of the box at the front of `bytes` as slices into it,
+/// failing with [`Error::TooManyPairs`] at the start of pair `max_pairs + 1`.
+/// The checks happen in the order `scan_frame` makes them, so a box the
+/// codec would reject fails here with the same error.
+// See `AmpBox::decode_borrowed` for why the type is spelled out.
+#[expect(clippy::type_complexity)]
+fn decode_pairs(bytes: &[u8], max_pairs: usize) -> Result<(Vec<(&[u8], &[u8])>, usize), Error> {
+    let mut pairs: Vec<(&[u8], &[u8])> = Vec::new();
+    let mut keys = Keys::new();
+    let mut pos = 0;
+    // Counts every pair on the wire, where `pairs` holds only distinct keys.
+    let mut seen = 0;
+    loop {
+        let key_len = read_u16(bytes, pos)?;
+        pos += 2;
+        if key_len == 0 {
+            return Ok((pairs, pos));
+        }
+        if key_len > MAX_KEY_LENGTH {
+            return Err(Error::KeyTooLong { len: key_len });
+        }
+        if seen == max_pairs {
+            return Err(Error::TooManyPairs { limit: max_pairs });
+        }
+        seen += 1;
+        let key = read_slice(bytes, pos, key_len)?;
+        pos += key_len;
 
-            match keys.position(key) {
-                Some(index) => pairs[index].1 = value,
-                None => {
-                    keys.push(key, pairs.len());
-                    pairs.push((key, value));
-                }
+        let value_len = read_u16(bytes, pos)?;
+        pos += 2;
+        let value = read_slice(bytes, pos, value_len)?;
+        pos += value_len;
+
+        match keys.position(key) {
+            Some(index) => pairs[index].1 = value,
+            None => {
+                keys.push(key, pairs.len());
+                pairs.push((key, value));
             }
         }
     }
@@ -528,6 +573,67 @@ mod test {
     #[test]
     fn decode_keeps_last_duplicate() {
         let (amp_box, _) = AmpBox::decode(b"\x00\x01k\x00\x011\x00\x01k\x00\x012\x00\x00").unwrap();
+        assert_eq!(amp_box.len(), 1);
+        assert_eq!(amp_box.get("k"), Some(&b"2"[..]));
+    }
+
+    #[test]
+    fn decode_bounded_accepts_up_to_the_limit() {
+        let (amp_box, consumed) = AmpBox::decode_bounded(SUM_REQUEST, 4).unwrap();
+        assert_eq!(amp_box, sum_request());
+        assert_eq!(consumed, SUM_REQUEST.len());
+        let (empty, consumed) = AmpBox::decode_bounded(b"\x00\x00", 0).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn decode_bounded_rejects_one_pair_too_many() {
+        assert!(matches!(
+            AmpBox::decode_bounded(SUM_REQUEST, 3),
+            Err(Error::TooManyPairs { limit: 3 })
+        ));
+        assert!(matches!(
+            AmpBox::decode_bounded(b"\x00\x01k\x00\x00", 0),
+            Err(Error::TooManyPairs { limit: 0 })
+        ));
+    }
+
+    /// The limit is checked as soon as the length prefix of one pair too many
+    /// is read, so it fires before the box is complete and before a bad key
+    /// in that pair is seen, but after a bad length prefix is.
+    #[test]
+    fn decode_bounded_rejects_at_the_start_of_the_extra_pair() {
+        let mut bytes = pair("a", "1");
+        bytes.extend([0x00, 0x05]);
+        assert!(matches!(
+            AmpBox::decode_bounded(&bytes, 1),
+            Err(Error::TooManyPairs { limit: 1 })
+        ));
+        assert!(matches!(
+            AmpBox::decode_bounded(&bytes, 2),
+            Err(Error::Incomplete)
+        ));
+        let mut bytes = pair("a", "1");
+        bytes.extend([0x01, 0x00]);
+        assert!(matches!(
+            AmpBox::decode_bounded(&bytes, 1),
+            Err(Error::KeyTooLong { len: 256 })
+        ));
+    }
+
+    /// A repeated key is one entry in the box but two pairs on the wire, and
+    /// it is the wire that costs work, so it counts twice.
+    #[test]
+    fn decode_bounded_counts_a_repeated_key_each_time() {
+        let mut bytes = pair("k", "1");
+        bytes.extend(pair("k", "2"));
+        bytes.extend([0, 0]);
+        assert!(matches!(
+            AmpBox::decode_bounded(&bytes, 1),
+            Err(Error::TooManyPairs { limit: 1 })
+        ));
+        let (amp_box, _) = AmpBox::decode_bounded(&bytes, 2).unwrap();
         assert_eq!(amp_box.len(), 1);
         assert_eq!(amp_box.get("k"), Some(&b"2"[..]));
     }

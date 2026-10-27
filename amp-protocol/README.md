@@ -13,7 +13,8 @@ types; that is what [serde_amp](https://crates.io/crates/serde_amp) is for.
 * `AmpBox` is one packet: ordered key/value pairs of bytes, with the
   protocol's length limits enforced on insert, and `encode`/`decode` to and
   from bytes. Decoding reports how many bytes it consumed, so a stream can be
-  framed.
+  framed, and `decode_bounded` caps the number of pairs, since untrusted bytes
+  can hold far more tiny pairs than they are long.
 * `Request`, `Answer`, and `ErrorResponse` carry the protocol's reserved keys
   (`_command`, `_ask`, `_answer`, `_error`, `_error_code`,
   `_error_description`) alongside the user's own key/value pairs.

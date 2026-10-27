@@ -213,7 +213,7 @@ struct MisreadSum {
 #[derive(Deserialize, Debug)]
 struct Misread {
     /// Never read, since the results never parse.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     sum: i64,
 }
 

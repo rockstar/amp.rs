@@ -157,7 +157,7 @@ impl AmpBox {
     /// are read once and the box itself is not needed.
     // A pair of slices is the whole point of this function, and a named
     // alias for it would be one more public type to learn.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     pub fn decode_borrowed(bytes: &[u8]) -> Result<(Vec<(&[u8], &[u8])>, usize), Error> {
         let mut pairs: Vec<(&[u8], &[u8])> = Vec::new();
         let mut keys = Keys::new();

@@ -34,7 +34,7 @@ pub use handle::{Handle, HandleWith};
 pub use router::Router;
 #[cfg(not(target_family = "wasm"))]
 // Re-exporting the deprecated functions counts as using them.
-#[allow(deprecated)]
+#[expect(deprecated)]
 pub use server::{
     Server, serve, serve_connection, serve_connection_with_codec, serve_with_codec,
     serve_with_codec_and_shutdown, serve_with_shutdown,

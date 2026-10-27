@@ -646,7 +646,7 @@ mod test {
         // key of the list.
         #[derive(Deserialize, Debug)]
         struct Item {
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             inner: u8,
         }
         assert!(matches!(
@@ -839,7 +839,7 @@ mod test {
 
         #[derive(Deserialize, Debug)]
         enum Data {
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             Newtype(u8),
         }
         assert!(matches!(
@@ -924,7 +924,7 @@ mod test {
         ));
         #[derive(Deserialize, Debug)]
         struct Item {
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             inner: u8,
         }
         assert!(matches!(
@@ -1018,13 +1018,13 @@ mod test {
         // because serde buffers flattened values without their types.
         #[derive(Deserialize, Debug)]
         struct Number {
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             s: u32,
         }
         #[derive(Deserialize, Debug)]
         struct OuterNumber {
             #[serde(flatten)]
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             inner: Number,
         }
         amp_box.insert("s", "13").unwrap();
@@ -1035,13 +1035,13 @@ mod test {
 
         #[derive(Deserialize, Debug)]
         struct Flag {
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             s: bool,
         }
         #[derive(Deserialize, Debug)]
         struct OuterFlag {
             #[serde(flatten)]
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             inner: Flag,
         }
         amp_box.insert("s", "True").unwrap();
@@ -1055,7 +1055,7 @@ mod test {
     fn nested_struct_as_a_field_is_unsupported() {
         #[derive(Deserialize, Debug)]
         struct Outer {
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             inner: One<u8>,
         }
         let mut amp_box = AmpBox::new();

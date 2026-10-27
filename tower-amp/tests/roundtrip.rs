@@ -1062,6 +1062,82 @@ async fn a_connection_with_a_request_in_flight_is_not_idle() {
     assert!(timed_out(&result), "{result:?}");
 }
 
+/// A peer that sends requests and never reads the replies, on a pipe small
+/// enough to stand in for a filled TCP receive window. Its writes block once
+/// the server stops reading, so it runs on its own task, and it keeps its
+/// end open by never finishing. Returns the connection's task.
+fn serve_a_peer_that_never_reads<S, F>(
+    server: Server<S, F>,
+) -> tokio::task::JoinHandle<Result<(), Error>>
+where
+    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
+    S::Error: Into<Error>,
+    S::Future: Send,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (peer, server_io) = tokio::io::duplex(256);
+    let served = tokio::spawn(server.serve_connection(server_io));
+    tokio::spawn(async move {
+        let mut peer = tokio_util::codec::Framed::new(peer, AmpCodec::new());
+        for i in 0..200u32 {
+            let request = Request::new("Sum", sum_args()).with_ask(i.to_string());
+            if peer.send(request.into_box().unwrap()).await.is_err() {
+                break;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+    served
+}
+
+/// The arguments of a `Sum`, for a request built by hand.
+fn sum_args() -> AmpBox {
+    let mut args = AmpBox::new();
+    args.insert("a", "1").unwrap();
+    args.insert("b", "2").unwrap();
+    args
+}
+
+/// A peer that sends more requests than the in-flight limit and the reply
+/// queue together, then never reads, has every handler finish and every
+/// reply stuck behind its full receive buffer, with every permit held. That
+/// is no idle connection as far as the permits can tell, so the write side
+/// is timed with the same limit, and the connection is closed as timed out
+/// rather than held for as long as the peer stays.
+#[tokio::test]
+async fn a_peer_that_never_reads_its_replies_is_timed_out() {
+    let service = ServiceBuilder::new()
+        .timeout(Duration::from_millis(100))
+        .service(router());
+    let server = Server::new(service)
+        .idle_timeout(Duration::from_millis(200))
+        .max_in_flight(16);
+    let served = serve_a_peer_that_never_reads(server);
+    let result = ended(served).await;
+    assert!(timed_out(&result), "{result:?}");
+}
+
+/// Shutdown waits for every reply to be written, which with a peer that
+/// never reads would be forever; the idle timeout bounds that wait too.
+#[tokio::test]
+async fn shutdown_gives_up_on_a_peer_that_never_reads() {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = Server::new(router())
+        .idle_timeout(Duration::from_millis(200))
+        .max_in_flight(16)
+        .shutdown(async {
+            let _ = stopped.await;
+        });
+    let served = serve_a_peer_that_never_reads(server);
+    // Let the peer fill the pipe and the server fill the reply queue, so
+    // that shutdown finds a connection with replies it cannot write.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!served.is_finished(), "closed before the shutdown signal");
+    stop.send(()).unwrap();
+    let result = ended(served).await;
+    assert!(timed_out(&result), "{result:?}");
+}
+
 /// A server that may never accept a connection would serve nobody, so a
 /// limit of zero is refused where it is set.
 #[test]

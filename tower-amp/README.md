@@ -337,14 +337,15 @@ handlers running across every connection, and its `Timeout` how long each
 runs.
 
 `idle_timeout` closes a connection over which nothing has arrived for that
-long while no request was in flight, so a peer that connects and sends
-nothing, or a byte every so often, cannot hold a connection for good. There
-is none by default, since a client that keeps a connection open between
-calls would otherwise find it closed. `max_connections` is how many
-connections `serve` has open at once; at the limit it stops accepting until
-one closes, and a peer that connects waits in the listener's backlog. There
-is no limit by default. A server open to peers it does not trust should set
-both.
+long while no request was in flight, and one whose peer has not taken a
+write of replies in that long, so a peer that connects and sends nothing, a
+byte every so often, or requests whose replies it never reads cannot hold a
+connection for good. There is none by default, since a client that keeps a
+connection open between calls would otherwise find it closed.
+`max_connections` is how many connections `serve` has open at once; at the
+limit it stops accepting until one closes, and a peer that connects waits in
+the listener's backlog. There is no limit by default. A server open to peers
+it does not trust should set both.
 
 The shutdown future stops the server once it completes: the listener is
 closed, so a peer that connects from then on is refused, and each

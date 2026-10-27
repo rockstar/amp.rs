@@ -139,23 +139,31 @@ where
         self
     }
 
-    /// How long a connection may go without a box from its peer before it
-    /// is closed. There is no limit unless one is set.
+    /// How long a connection may wait on its peer, in either direction,
+    /// before it is closed. There is no limit unless one is set.
     ///
-    /// The clock starts over with every box the peer sends, and runs only
-    /// while no request is in flight: a connection waiting on a handler is
-    /// busy, not idle, however long the handler takes. A peer that sends
-    /// nothing, or only part of a box, for `limit` has its connection
-    /// closed with [`Error::Io`] of kind `TimedOut`, which
-    /// [`serve`](Server::serve) logs with the `tracing` feature and
+    /// Reading, the clock starts over with every box the peer sends, and
+    /// runs only while no request is in flight: a connection waiting on a
+    /// handler is busy, not idle, however long the handler takes. Writing,
+    /// each write of replies is given the same limit to be taken by the
+    /// peer; one write is at most 8 KiB of replies and the one that pushed
+    /// it past that, so a peer that reads at all takes it in time. A peer
+    /// that sends nothing, or only part of a box, for `limit`, or that stops
+    /// reading so that its replies back up, has its connection closed with
+    /// [`Error::Io`] of kind `TimedOut`, which [`serve`](Server::serve)
+    /// logs with the `tracing` feature and
     /// [`serve_connection`](Server::serve_connection) returns.
     ///
     /// Set it on a server open to peers it does not trust, so that a peer
-    /// that connects and sends nothing, or sends a byte every so often,
-    /// cannot hold a connection and its buffers for good. A client that
-    /// keeps a connection open between calls needs the limit to be longer
-    /// than the gaps between them, or to reconnect when a call fails with
-    /// [`Error::ConnectionClosed`].
+    /// that connects and sends nothing, sends a byte every so often, or
+    /// sends requests and never reads the replies, cannot hold a
+    /// connection and its buffers for good. The last would otherwise hold
+    /// it past every other limit: its handlers finish, so a `Timeout` on
+    /// the service has nothing to cut short, and its replies then wait on
+    /// it with the in-flight permits held, so the connection never looks
+    /// idle. A client that keeps a connection open between calls needs the
+    /// limit to be longer than the gaps between them, or to reconnect when
+    /// a call fails with [`Error::ConnectionClosed`].
     pub fn idle_timeout(mut self, limit: Duration) -> Self {
         self.idle_timeout = Some(limit);
         self
@@ -172,7 +180,8 @@ where
     /// handlers still running is when those are cancelled or finish. With
     /// an [`idle_timeout`](Server::idle_timeout) and a `Timeout` on the
     /// service, what one peer can hold is then bounded in every direction:
-    /// connections, requests on each, and how long each runs.
+    /// connections, requests on each, how long each runs, and how long its
+    /// replies may wait to be read.
     ///
     /// Only `serve` applies the limit, since
     /// [`serve_connection`](Server::serve_connection) is given its
@@ -203,10 +212,13 @@ where
     ///
     /// A handler that never finishes holds shutdown open: nothing here
     /// gives up on a request, and a peer that hangs up during shutdown is
-    /// not noticed, since the connection is no longer reading. Wrap the
-    /// call in [`tokio::time::timeout`] if that matters. Dropping the
-    /// future, which the timeout does, still tells the connections to stop
-    /// reading and answer what they have, but no longer waits for them.
+    /// not noticed, since the connection is no longer reading. A peer that
+    /// stops reading its replies holds it open too, for as long as the
+    /// [`idle_timeout`](Server::idle_timeout) allows a write to wait, or
+    /// for good without one. Wrap the call in [`tokio::time::timeout`] if
+    /// that matters. Dropping the future, which the timeout does, still
+    /// tells the connections to stop reading and answer what they have,
+    /// but no longer waits for them.
     ///
     /// For [`serve_connection`](Server::serve_connection) the signal stops
     /// that one connection the same way: it reads no more requests and

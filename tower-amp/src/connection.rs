@@ -169,7 +169,8 @@ where
     /// which must not be zero, how many of the peer's requests may be in
     /// flight at once. With an `idle_timeout`, the connection ends with an
     /// error once that long has passed with nothing in flight and no box
-    /// from the peer.
+    /// from the peer, or once a write to the peer has waited that long for
+    /// it to take what was written.
     ///
     /// When the peer closes the connection, or an error ends it, the
     /// handlers of the requests that asked for a reply are cancelled: their
@@ -184,6 +185,13 @@ where
     /// slow to accept never stops this side from reading. If both sides
     /// stopped reading while blocked on a write, neither would ever drain
     /// the other's buffer.
+    ///
+    /// The in-flight permits say nothing about a peer that stops reading:
+    /// its handlers finish, and the responders then wait to queue replies
+    /// that the writer cannot get rid of, each holding its permit, so the
+    /// idle clock never starts. That is why every step the writer takes on
+    /// the socket is timed with the idle limit too, and ends the connection
+    /// with the same error when it runs out.
     ///
     /// A call learns that the connection ended when the sender of its reply
     /// is dropped, and then reads the cause for why, so every failure here
@@ -348,7 +356,7 @@ where
                 // request queued behind it from being written after its
                 // caller has given up.
                 if unflushed && outgoing.is_empty() && replies.is_empty() {
-                    sink.flush().await?;
+                    within(idle_timeout, sink.flush()).await?;
                     unflushed = false;
                     answer_written(&mut notified);
                 }
@@ -392,14 +400,14 @@ where
                                     continue;
                                 }
                             };
-                            sink.feed(amp_box).await?;
+                            within(idle_timeout, sink.feed(amp_box)).await?;
                             unflushed = true;
                             notified.extend(written);
                         }
                     },
                     reply = replies.recv() => match reply {
                         Some(reply) => {
-                            sink.feed(reply).await?;
+                            within(idle_timeout, sink.feed(reply)).await?;
                             unflushed = true;
                         }
                         // The read future has ended and every request it
@@ -408,7 +416,7 @@ where
                     },
                 }
             }
-            sink.flush().await?;
+            within(idle_timeout, sink.flush()).await?;
             answer_written(&mut notified);
             Ok(())
         };
@@ -513,10 +521,51 @@ async fn idle(limit: Option<Duration>, _in_flight: &Semaphore, _max_in_flight: u
 /// The error that ends a connection whose peer sent nothing for `limit`.
 fn idle_error(limit: Option<Duration>) -> Error {
     let limit = limit.expect("the idle timer only completes with a limit");
+    timed_out(limit, "sent")
+}
+
+/// The error that ends a connection whose peer `did` nothing for `limit`:
+/// "sent" nothing, or "read" nothing.
+fn timed_out(limit: Duration, did: &str) -> Error {
     Error::Io(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        format!("the peer sent nothing for {limit:?}"),
+        format!("the peer {did} nothing for {limit:?}"),
     ))
+}
+
+/// Runs `write`, one step of the writer's work on the socket, and fails
+/// with [`Error::Io`] of kind `TimedOut` if it has not finished within
+/// `limit`. Without a limit it just runs `write`.
+///
+/// A step is a `feed`, which writes only once 8 KiB are buffered, or a
+/// `flush`, which writes what is buffered: at most that much and the last
+/// box fed. A peer that reads at all takes that within any sensible limit;
+/// one that has stopped reading never does, and this is how it is noticed.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn within<F, E>(limit: Option<Duration>, write: F) -> Result<(), Error>
+where
+    F: Future<Output = Result<(), E>>,
+    Error: From<E>,
+{
+    match limit {
+        Some(limit) => match tokio::time::timeout(limit, write).await {
+            Ok(result) => Ok(result?),
+            Err(_) => Err(timed_out(limit, "read")),
+        },
+        None => Ok(write.await?),
+    }
+}
+
+/// Just runs `write`: nothing on this target sets an idle timeout, as
+/// [`idle`] says.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+async fn within<F, E>(limit: Option<Duration>, write: F) -> Result<(), Error>
+where
+    F: Future<Output = Result<(), E>>,
+    Error: From<E>,
+{
+    debug_assert!(limit.is_none(), "no idle timeout can be set on this target");
+    Ok(write.await?)
 }
 
 /// Tells the callers of the notifications in `notified` that they have been

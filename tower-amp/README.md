@@ -179,6 +179,22 @@ it is answered, from your own `tokio::time::timeout` or `select!`, is safe
 in the same way: the call is forgotten, and if its request had not been
 written yet it is not sent.
 
+A timeout on a call says nothing about a peer that stops reading: the
+request before it was written, the next one blocks in the socket, and the
+connection holds its task and buffers for good, even once every clone of
+the client is dropped. A client over a peer that may do that gets an idle
+timeout from the `Connection` it is spawned over:
+
+```rust,ignore
+let client = Client::spawn(Connection::new(stream).idle_timeout(Duration::from_secs(60)));
+```
+
+The connection then closes once the peer has taken nothing written to it
+for that long, or sent nothing in that long, and the calls on it fail with
+`Error::ConnectionClosed`. A call in flight does not stop the clock, so the
+limit must be longer than the slowest answer and than the gaps between
+calls. There is no idle timeout unless one is set.
+
 Both directions
 --
 
@@ -212,7 +228,9 @@ tokio::spawn(connection.serve(Router::new().command::<Notify>()));
 
 `Connection::serve` runs until the peer closes the connection, or returns
 the error that ended it. Dropping the handles does not end it; dropping the
-`serve` future does. A call on a handle that outlives the connection fails
+`serve` future does, and so does the `idle_timeout` above, set on the
+`Connection` before it is served, once the peer has sent nothing or taken
+nothing for that long. A call on a handle that outlives the connection fails
 with `Error::ConnectionClosed`, carrying a copy of that error. A handle
 that would rather not wait for a call to fail, such as one that
 reconnects, awaits `Client::closed`, which resolves to the same cause once
@@ -236,7 +254,8 @@ socket from the host wrapped the same way.
 In a browser the connection is driven on the page's event loop, through
 `wasm-bindgen-futures`, and `with_timeout` uses the browser's timer. The I/O
 type need not be `Send` there, since the browser has one thread, and the
-client's futures are not `Send` either.
+client's futures are not `Send` either. There is no `Connection::idle_timeout`
+there, since it needs tokio's timer.
 
 Under WASI the client behaves as it does natively: the connection is driven
 by a task on the current tokio runtime, which must be a current-thread one,

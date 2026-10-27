@@ -428,3 +428,82 @@ async fn dropping_the_serve_future_fails_the_calls_in_flight() {
         "{failed:?}"
     );
 }
+
+/// The cause an idle timeout ends a connection with.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn assert_timed_out(cause: Option<&Error>) {
+    match cause {
+        Some(Error::Io(err)) if err.kind() == std::io::ErrorKind::TimedOut => {}
+        other => panic!("not an idle timeout: {other:?}"),
+    }
+}
+
+/// Writes notifications until the peer stops taking them, then waits for
+/// good: once the writer is stuck, what ends the connection is the test.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn fill(client: &Client) {
+    loop {
+        if client.notify(&Sum { a: 1, b: 1 }).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Without an idle timeout the writer blocks on a peer that stops reading
+/// and the connection task is never reclaimed, not even once every handle
+/// is dropped; with one, the write times out and the connection ends.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[tokio::test]
+async fn a_client_with_an_idle_timeout_gives_up_on_a_peer_that_stops_reading() {
+    // Small enough that a couple of boxes fill it.
+    let (client_io, _peer_io) = tokio::io::duplex(64);
+    let connection = Connection::new(client_io).idle_timeout(Duration::from_millis(100));
+    let client = Client::spawn(connection);
+    let ended = async {
+        tokio::select! {
+            cause = client.closed() => cause,
+            () = fill(&client) => unreachable!(),
+        }
+    };
+    // `closed` resolves only once the connection task has ended, so this
+    // is also the check that the task was reclaimed.
+    let cause = timeout(Duration::from_secs(2), ended)
+        .await
+        .expect("the connection never ended");
+    assert_timed_out(cause.as_deref());
+    let failed = client.notify(&Sum { a: 1, b: 1 }).await;
+    assert!(
+        matches!(failed, Err(Error::ConnectionClosed { .. })),
+        "{failed:?}"
+    );
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[tokio::test]
+async fn a_served_connection_with_an_idle_timeout_gives_up_on_a_peer_that_stops_reading() {
+    let (client_io, _peer_io) = tokio::io::duplex(64);
+    let connection = Connection::new(client_io).idle_timeout(Duration::from_millis(100));
+    let client = connection.client();
+    let served = async {
+        tokio::select! {
+            result = connection.serve(Router::new()) => result,
+            () = fill(&client) => unreachable!(),
+        }
+    };
+    let result = timeout(Duration::from_secs(2), served)
+        .await
+        .expect("the connection never ended");
+    assert_timed_out(result.as_ref().err());
+    assert_timed_out(client.closed().await.as_deref());
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[tokio::test]
+async fn a_served_connection_with_an_idle_timeout_gives_up_on_a_peer_that_sends_nothing() {
+    let (client_io, _peer_io) = tokio::io::duplex(4096);
+    let connection = Connection::new(client_io).idle_timeout(Duration::from_millis(100));
+    let result = timeout(Duration::from_secs(2), connection.serve(Router::new()))
+        .await
+        .expect("the connection never ended");
+    assert_timed_out(result.as_ref().err());
+}

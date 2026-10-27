@@ -131,8 +131,32 @@ macro_rules! constructors {
             where
                 T: $($bound)+,
             {
-                let connection = Connection::with_codec(io, codec);
+                Self::spawn(Connection::with_codec(io, codec))
+            }
+
+            /// [`new`](Client::new) over a [`Connection`] with its options
+            /// set, for a client with an
+            /// [`idle_timeout`](Connection::idle_timeout). The connection
+            /// is driven as `new` drives one: it refuses the peer's
+            /// requests and closes when the last clone of the client is
+            /// dropped, and handles taken from it beforehand with
+            /// [`Connection::client`] count as clones.
+            ///
+            /// ```no_run
+            /// # use std::time::Duration;
+            /// # use tower_amp::{Client, Connection};
+            /// # async fn example(stream: tokio::net::TcpStream) {
+            /// let client = Client::spawn(
+            ///     Connection::new(stream).idle_timeout(Duration::from_secs(60)),
+            /// );
+            /// # }
+            /// ```
+            pub fn spawn<T>(connection: Connection<T>) -> Client
+            where
+                T: $($bound)+,
+            {
                 let client = connection.client();
+                let idle_timeout = connection.idle_timeout;
                 // What ended the connection reaches the client through
                 // `cause`, so the error returned here has nobody to go to.
                 spawn(async move {
@@ -142,7 +166,7 @@ macro_rules! constructors {
                             std::future::pending(),
                             Owner::Handles,
                             DEFAULT_MAX_IN_FLIGHT,
-                            None,
+                            idle_timeout,
                         )
                         .await;
                 });

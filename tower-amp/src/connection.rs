@@ -81,6 +81,7 @@ pub struct Connection<T> {
     /// Dropped once the connection has ended, which is what the handles'
     /// [`Client::closed`] waits for.
     open: watch::Sender<()>,
+    pub(crate) idle_timeout: Option<Duration>,
 }
 
 impl<T> Connection<T>
@@ -113,7 +114,39 @@ where
             client,
             outgoing,
             open,
+            idle_timeout: None,
         }
+    }
+
+    /// How long the connection may wait on its peer, in either direction,
+    /// before it is closed. There is no limit unless one is set.
+    ///
+    /// Reading, the clock starts over with every box the peer sends, and
+    /// runs only while none of the peer's requests is in flight: a
+    /// connection waiting on a handler is busy, not idle. A call made
+    /// through a handle does not stop the clock, so the limit must be
+    /// longer than the longest answer the peer is given to send, and than
+    /// the gaps between calls. Writing, each write is given the same limit
+    /// to be taken by the peer. A peer that sends nothing for `limit`, or
+    /// that stops reading so that the requests and replies written to it
+    /// back up, has its connection closed with [`Error::Io`] of kind
+    /// `TimedOut`, which [`serve`](Connection::serve) returns and every
+    /// handle sees as the cause of [`Error::ConnectionClosed`].
+    ///
+    /// Without a limit, a peer that stops reading holds the connection
+    /// for good: its writer blocks on the socket, and nothing ends it, not
+    /// even dropping every handle of a client made by [`Client::spawn`].
+    /// Set one on a connection to a peer that may do that. Like
+    /// [`Server::idle_timeout`](crate::Server::idle_timeout), the limit
+    /// also bounds how long the handler of a notification may run on
+    /// after the peer hangs up.
+    ///
+    /// Not available on wasm32-unknown-unknown, where there is no tokio
+    /// runtime to time a wait with.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub fn idle_timeout(mut self, limit: Duration) -> Self {
+        self.idle_timeout = Some(limit);
+        self
     }
 
     /// A handle for calling commands on the peer. Every handle shares the
@@ -152,8 +185,9 @@ where
     /// flight`, or drops it if it wanted no reply. A peer that pipelines
     /// more than 257 requests to a command that calls it back should expect
     /// that error and retry. Answers the peer sends to commands nobody is
-    /// waiting on any more are discarded. There is no idle timeout;
-    /// [`Server`](crate::Server) has one, for a connection that only serves.
+    /// waiting on any more are discarded. There is no idle timeout unless
+    /// [`idle_timeout`](Connection::idle_timeout) set one, so without it a
+    /// peer that stops reading holds the connection for good.
     ///
     /// [`serve_connection`]: crate::serve_connection
     pub async fn serve<S>(self, service: S) -> Result<(), Error>
@@ -162,12 +196,13 @@ where
         S::Error: Into<Error>,
         S::Future: Send,
     {
+        let idle_timeout = self.idle_timeout;
         self.run(
             service,
             std::future::pending(),
             Owner::Driver,
             DEFAULT_MAX_IN_FLIGHT,
-            None,
+            idle_timeout,
         )
         .await
     }
@@ -235,6 +270,7 @@ where
             client,
             mut outgoing,
             open: _open,
+            idle_timeout: _,
         } = self;
         // Dropping the connection's own handle here is what lets `outgoing`
         // close once every handle the caller took is gone.

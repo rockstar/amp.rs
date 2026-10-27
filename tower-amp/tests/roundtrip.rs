@@ -942,8 +942,9 @@ async fn shutdown_does_not_cancel_handlers() {
     assert!(!served.is_finished());
 }
 
-/// A notification's handler finishes after the peer hangs up: the peer never
-/// waited for it, and one that notifies and exits expects it done.
+/// Without an idle timeout, a notification's handler finishes after the peer
+/// hangs up: the peer never waited for it, and one that notifies and exits
+/// expects it done.
 #[tokio::test]
 async fn a_notifications_handler_finishes_after_the_peer_hangs_up() {
     let gate = Gate::default();
@@ -958,6 +959,35 @@ async fn a_notifications_handler_finishes_after_the_peer_hangs_up() {
     assert!(!served.is_finished(), "the notification was cancelled");
     gate.release.notify_one();
     ended(served).await.unwrap();
+}
+
+/// With an idle timeout, a notification's handler has that long after the
+/// hang-up and no more. A peer could otherwise fill the in-flight limit with
+/// notifications to a slow command, hang up, reconnect, and repeat, holding
+/// handlers and connections bounded by nothing but the service.
+#[tokio::test]
+async fn a_notifications_handler_is_cancelled_once_the_idle_timeout_passes() {
+    let counter = Running::default();
+    let router = Router::with_state(counter.clone()).command::<Linger>();
+    let server = Server::new(router)
+        .max_in_flight(8)
+        .idle_timeout(Duration::from_millis(200));
+    let (served, mut peer) = serve_peer(server);
+    for _ in 0..8 {
+        let notification = Request::new("Linger", AmpBox::new()).into_box().unwrap();
+        peer.send(notification).await.unwrap();
+    }
+    running(&counter, 8).await;
+
+    drop(peer);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        8,
+        "cancelled before the idle timeout had passed"
+    );
+    ended(served).await.unwrap();
+    assert_eq!(counter.0.load(Ordering::SeqCst), 0);
 }
 
 /// The limit is still backpressure, not refusal: a request past it waits

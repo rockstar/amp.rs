@@ -176,10 +176,11 @@ where
     /// handlers of the requests that asked for a reply are cancelled: their
     /// reply has nowhere to go, and a peer could otherwise fill the
     /// in-flight limit with slow requests, hang up, and leave the handlers
-    /// running for as long as they take. A notification's handler finishes
-    /// regardless, since the peer never waited for it and may well have
-    /// hung up on purpose once it was sent. A shutdown cancels nothing: the
-    /// peer is still there to be answered.
+    /// running for as long as they take. A notification's handler is given
+    /// the idle timeout to finish first, since the peer never waited for it
+    /// and may well have hung up on purpose once it was sent; without one it
+    /// finishes however long it takes, and the connection with it. A
+    /// shutdown cancels nothing: the peer is still there to be answered.
     ///
     /// Reading and writing are separate futures so that a write the peer is
     /// slow to accept never stops this side from reading. If both sides
@@ -327,6 +328,7 @@ where
                             responses.clone(),
                             permit,
                             handlers.clone(),
+                            idle_timeout,
                         ));
                     }
                     Message::Answer(answer) => answered(pending, answer),
@@ -568,6 +570,25 @@ where
     Ok(write.await?)
 }
 
+/// Completes once `grace` has passed, which is how long a notification's
+/// handler has after its peer hangs up. Never completes without a grace
+/// period.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn after(grace: Option<Duration>) {
+    match grace {
+        Some(grace) => tokio::time::sleep(grace).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Never completes: nothing on this target sets an idle timeout, as
+/// [`idle`] says.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+async fn after(grace: Option<Duration>) {
+    debug_assert!(grace.is_none(), "no idle timeout can be set on this target");
+    std::future::pending().await
+}
+
 /// Tells the callers of the notifications in `notified` that they have been
 /// written. One whose caller has stopped waiting is dropped unheard.
 fn answer_written(notified: &mut Vec<oneshot::Sender<Result<AmpBox, Error>>>) {
@@ -596,13 +617,15 @@ pub(crate) enum Owner {
 /// `cancelled` is cancelled once no response can reach the peer. A request
 /// that wants one is then dropped wherever its handler is, and nothing is
 /// logged: the peer left, and the handler did nothing wrong. A request that
-/// wants none is handled regardless, since the peer never waited for it.
+/// wants none is given `grace` to finish first, since the peer never waited
+/// for it, and is handled regardless without a grace period.
 async fn respond<S>(
     service: S,
     request: Request,
     responses: mpsc::Sender<AmpBox>,
     _permit: OwnedSemaphorePermit,
     cancelled: CancellationToken,
+    grace: Option<Duration>,
 ) where
     S: Service<Request, Response = AmpBox> + Send + 'static,
     S::Error: Into<Error>,
@@ -610,10 +633,18 @@ async fn respond<S>(
 {
     let command = request.command.clone();
     let ask = request.ask.clone();
+    let gone = async {
+        cancelled.cancelled().await;
+        if ask.is_none() {
+            after(grace).await;
+        }
+    };
     // `biased` so that a request whose peer is already gone is not started.
+    // A notification whose peer is gone still is: its grace period has only
+    // just begun.
     let outcome = tokio::select! {
         biased;
-        () = cancelled.cancelled(), if ask.is_some() => return,
+        () = gone => return,
         outcome = call(service, request) => outcome,
     };
     let result = match outcome {

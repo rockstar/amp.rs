@@ -292,7 +292,9 @@ running would be charged nothing for them. A cancelled handler is dropped
 wherever it is, so a handler whose work must finish once begun should spawn
 that work rather than await it. The handler of a notification, a request
 that asked for no reply, is not cancelled: the peer never waited for it, and
-may have hung up on purpose once it was sent.
+may have hung up on purpose once it was sent. A `Server` with an idle timeout
+gives such a handler that long after the hang-up, then cancels it too, so a
+peer cannot leave handlers running for longer than the limit.
 
 A box is read in full before it is handled, so a connection refuses one
 longer than 16 MiB and closes rather than buffering without bound. It also

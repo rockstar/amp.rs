@@ -164,6 +164,15 @@ where
     /// idle. A client that keeps a connection open between calls needs the
     /// limit to be longer than the gaps between them, or to reconnect when
     /// a call fails with [`Error::ConnectionClosed`].
+    ///
+    /// The limit also bounds what a peer leaves behind. A peer that hangs
+    /// up has the handlers of its requests cancelled, as
+    /// [`serve_connection`] describes, except those of its notifications,
+    /// which it never waited for and which otherwise finish however long
+    /// they take, with the connection open until they do. With a limit they
+    /// are given that long after the hang-up and then cancelled, so a peer
+    /// that fills the in-flight limit with notifications to a slow command,
+    /// hangs up, and reconnects holds no more than the limit allows.
     pub fn idle_timeout(mut self, limit: Duration) -> Self {
         self.idle_timeout = Some(limit);
         self
@@ -537,7 +546,9 @@ fn out_of_descriptors(err: &io::Error) -> bool {
 /// once begun should spawn that work on its own task rather than await it.
 /// The handler of a request without `_ask` is not cancelled, since the
 /// peer never waited for it and may have hung up on purpose once it was
-/// sent; `serve_connection` returns once those have finished.
+/// sent; `serve_connection` returns once those have finished. A server with
+/// an [idle timeout](Server::idle_timeout) gives such a handler that long
+/// after the hang-up, then cancels it too.
 pub async fn serve_connection<T, S>(io: T, service: S) -> Result<(), Error>
 where
     T: AsyncRead + AsyncWrite,

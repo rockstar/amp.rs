@@ -949,7 +949,7 @@ async fn shutdown_does_not_cancel_handlers() {
 async fn a_notifications_handler_finishes_after_the_peer_hangs_up() {
     let gate = Gate::default();
     let router = Router::with_state(gate.clone()).command::<Hold>();
-    let (served, mut peer) = serve_peer(Server::new(router));
+    let (served, mut peer) = serve_peer(Server::new(router).no_idle_timeout());
     let notification = Request::new("Hold", AmpBox::new()).into_box().unwrap();
     peer.send(notification).await.unwrap();
     gate.started.notified().await;

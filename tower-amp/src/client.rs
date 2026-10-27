@@ -113,7 +113,7 @@ macro_rules! constructors {
             /// server sets it on the connections it accepts.
             ///
             /// The connection uses a default [`AmpCodec`], which refuses a
-            /// box longer than 16 MiB or with more than 1,024 pairs and
+            /// box longer than 1 MiB or with more than 1,024 pairs and
             /// closes the connection; [`with_codec`](Client::with_codec)
             /// takes another.
             pub fn new<T>(io: T) -> Client

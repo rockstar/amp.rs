@@ -292,16 +292,19 @@ running would be charged nothing for them. A cancelled handler is dropped
 wherever it is, so a handler whose work must finish once begun should spawn
 that work rather than await it. The handler of a notification, a request
 that asked for no reply, is not cancelled: the peer never waited for it, and
-may have hung up on purpose once it was sent. A `Server` with an idle timeout
-gives such a handler that long after the hang-up, then cancels it too, so a
-peer cannot leave handlers running for longer than the limit.
+may have hung up on purpose once it was sent. The idle timeout, five minutes
+by default, gives such a handler that long after the hang-up, then cancels
+it too, so a peer cannot leave handlers running for longer than the limit.
 
 A box is read in full before it is handled, so a connection refuses one
-longer than 16 MiB and closes rather than buffering without bound. It also
+longer than 1 MiB and closes rather than buffering without bound. It also
 refuses one with more than 1,024 pairs, since a decoded pair costs far more
 than the few bytes it can take on the wire. Pass an `AmpCodec` to
 `Server::codec`, `Connection::with_codec`, or `Client::with_codec` to set
-other limits.
+other limits. Under the defaults a connection holds at most the frame limit
+for a box still arriving, and the in-flight limit times the frame limit,
+256 MiB, for the arguments of requests whose handlers are still running;
+the `Server` docs spell this out.
 
 Server options
 --
@@ -319,7 +322,7 @@ and a future that stops it.
 # let router = Router::new();
 # let listener = tokio::net::TcpListener::bind("127.0.0.1:1234").await?;
 Server::new(router)
-    .codec(AmpCodec::with_max_frame_length(1024 * 1024))
+    .codec(AmpCodec::with_max_frame_length(64 * 1024))
     .max_in_flight(32)
     .idle_timeout(Duration::from_secs(60))
     .max_connections(1_000)
@@ -342,12 +345,13 @@ runs.
 long while no request was in flight, and one whose peer has not taken a
 write of replies in that long, so a peer that connects and sends nothing, a
 byte every so often, or requests whose replies it never reads cannot hold a
-connection for good. There is none by default, since a client that keeps a
-connection open between calls would otherwise find it closed.
+connection for good. The default is five minutes, so a client that keeps a
+connection open between calls further apart than that finds it closed and
+reconnects; `Server::no_idle_timeout` removes the limit for trusted peers.
 `max_connections` is how many connections `serve` has open at once; at the
 limit it stops accepting until one closes, and a peer that connects waits in
 the listener's backlog. There is no limit by default. A server open to peers
-it does not trust should set both.
+it does not trust should set one.
 
 The shutdown future stops the server once it completes: the listener is
 closed, so a peer that connects from then on is refused, and each

@@ -22,6 +22,12 @@ use crate::{Connection, Error, log};
 /// briefly at its limit.
 const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 
+/// How long a connection may sit idle unless told otherwise: long enough
+/// that a client which keeps a connection open between calls is rarely cut
+/// off between them, and short enough that a peer which connects and sends
+/// nothing does not hold a connection for long.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 /// A server with its options: the codec its connections are framed by, how
 /// many requests each may have in flight, how long one may sit idle, how
 /// many there may be at once, and a signal that stops it.
@@ -39,7 +45,7 @@ const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 /// # let router = Router::new();
 /// # let listener = tokio::net::TcpListener::bind("127.0.0.1:1234").await.unwrap();
 /// Server::new(router)
-///     .codec(AmpCodec::with_max_frame_length(1024 * 1024))
+///     .codec(AmpCodec::with_max_frame_length(64 * 1024))
 ///     .max_in_flight(32)
 ///     .idle_timeout(Duration::from_secs(60))
 ///     .max_connections(1_000)
@@ -51,11 +57,27 @@ const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
 /// # }
 /// ```
 ///
-/// The defaults bound what one request or one connection can cost, not
-/// what a peer can cost by opening connections: there is no idle timeout
-/// and no limit on connections unless they are set here. A server open to
-/// peers it does not trust should set both, and bound how long a handler
-/// may run with tower's `Timeout` on the service.
+/// The defaults bound what one connection can cost, not what a peer can
+/// cost by opening connections. Under them a connection holds at most:
+///
+/// | What a connection holds | At most |
+/// |---|---|
+/// | The read buffer, for a box still arriving | The frame limit, 1 MiB, and up to twice that as the buffer grows |
+/// | The arguments of the requests in flight, while their handlers run | The in-flight limit times the frame limit: 256 × 1 MiB |
+///
+/// A handler owns its arguments for as long as it runs, so a peer reaches
+/// the second with requests to a slow command that each carry a full box.
+/// Lower [`max_in_flight`](Server::max_in_flight), or the frame limit with
+/// [`codec`](Server::codec), for a server whose peers need less.
+///
+/// An idle connection is closed after the
+/// [`idle_timeout`](Server::idle_timeout), five minutes by default, so a
+/// peer holds that for at most that long without sending anything. Nothing
+/// bounds how many connections there are at once unless
+/// [`max_connections`](Server::max_connections) is set: the cost above is
+/// multiplied by as many connections as the peers care to open. A server
+/// open to peers it does not trust should set it, and bound how long a
+/// handler may run with tower's `Timeout` on the service.
 ///
 /// A server without a shutdown signal is `Clone`, so one configured once
 /// can serve each connection an accept loop takes.
@@ -77,14 +99,15 @@ where
 {
     /// A server that answers every connection's requests with a clone of
     /// `service`, with the defaults [`serve`] and [`serve_connection`] use:
-    /// a default [`AmpCodec`], 256 requests in flight per connection, no
-    /// idle timeout, no limit on connections, and no shutdown signal.
+    /// a default [`AmpCodec`], 256 requests in flight per connection, an
+    /// idle timeout of five minutes, no limit on connections, and no
+    /// shutdown signal.
     pub fn new(service: S) -> Self {
         Server {
             service,
             codec: AmpCodec::new(),
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-            idle_timeout: None,
+            idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             max_connections: None,
             shutdown: std::future::pending(),
         }
@@ -101,7 +124,7 @@ where
     /// The codec every connection is framed by, for setting the largest box
     /// a peer may send with [`AmpCodec::with_max_frame_length`] or
     /// [`AmpCodec::with_limits`]. The default refuses a box longer than
-    /// 16 MiB or with more than 1,024 pairs.
+    /// 1 MiB or with more than 1,024 pairs.
     pub fn codec(mut self, codec: AmpCodec) -> Self {
         self.codec = codec;
         self
@@ -140,7 +163,8 @@ where
     }
 
     /// How long a connection may wait on its peer, in either direction,
-    /// before it is closed. There is no limit unless one is set.
+    /// before it is closed. The default is five minutes;
+    /// [`no_idle_timeout`](Server::no_idle_timeout) removes the limit.
     ///
     /// Reading, the clock starts over with every box the peer sends, and
     /// runs only while no request is in flight: a connection waiting on a
@@ -154,16 +178,16 @@ where
     /// logs with the `tracing` feature and
     /// [`serve_connection`](Server::serve_connection) returns.
     ///
-    /// Set it on a server open to peers it does not trust, so that a peer
-    /// that connects and sends nothing, sends a byte every so often, or
-    /// sends requests and never reads the replies, cannot hold a
-    /// connection and its buffers for good. The last would otherwise hold
-    /// it past every other limit: its handlers finish, so a `Timeout` on
-    /// the service has nothing to cut short, and its replies then wait on
-    /// it with the in-flight permits held, so the connection never looks
-    /// idle. A client that keeps a connection open between calls needs the
-    /// limit to be longer than the gaps between them, or to reconnect when
-    /// a call fails with [`Error::ConnectionClosed`].
+    /// The limit is what keeps a peer that connects and sends nothing,
+    /// sends a byte every so often, or sends requests and never reads the
+    /// replies from holding a connection and its buffers for good. The
+    /// last would otherwise hold it past every other limit: its handlers
+    /// finish, so a `Timeout` on the service has nothing to cut short, and
+    /// its replies then wait on it with the in-flight permits held, so the
+    /// connection never looks idle. Shorten the limit on a server open to
+    /// peers it does not trust. A client that keeps a connection open
+    /// between calls needs it to be longer than the gaps between them, or
+    /// to reconnect when a call fails with [`Error::ConnectionClosed`].
     ///
     /// The limit also bounds what a peer leaves behind. A peer that hangs
     /// up has the handlers of its requests cancelled, as
@@ -178,6 +202,16 @@ where
         self
     }
 
+    /// Removes the [`idle_timeout`](Server::idle_timeout), so that a
+    /// connection may wait on its peer for good, in either direction, and
+    /// a peer that hangs up may leave the handlers of its notifications
+    /// running until they finish. For a server whose peers are trusted and
+    /// keep a connection open between calls any distance apart.
+    pub fn no_idle_timeout(mut self) -> Self {
+        self.idle_timeout = None;
+        self
+    }
+
     /// How many connections [`serve`](Server::serve) has open at once.
     /// There is no limit unless one is set, and running out of file
     /// descriptors is the only bound.
@@ -187,7 +221,7 @@ where
     /// once that is full the operating system refuses it. A connection
     /// counts until its task ends, which for a peer that hung up with
     /// handlers still running is when those are cancelled or finish. With
-    /// an [`idle_timeout`](Server::idle_timeout) and a `Timeout` on the
+    /// the [`idle_timeout`](Server::idle_timeout) and a `Timeout` on the
     /// service, what one peer can hold is then bounded in every direction:
     /// connections, requests on each, how long each runs, and how long its
     /// replies may wait to be read.
@@ -394,10 +428,11 @@ where
 /// the acknowledgement of the one before it.
 ///
 /// Each connection uses a default [`AmpCodec`], which refuses a box longer
-/// than 16 MiB or with more than 1,024 pairs, and may have 256 requests in
-/// flight at once. There is no idle timeout and no limit on the number of
-/// connections; [`Server`] serves with those, with another codec or
-/// in-flight limit, and with a way to stop.
+/// than 1 MiB or with more than 1,024 pairs, may have 256 requests in
+/// flight at once, and is closed once it has sat idle for five minutes.
+/// There is no limit on the number of connections; [`Server`] serves with
+/// one, with another codec, in-flight limit, or idle timeout, and with a
+/// way to stop.
 pub async fn serve<S>(listener: TcpListener, service: S) -> Result<(), Error>
 where
     S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
@@ -534,9 +569,9 @@ fn out_of_descriptors(err: &io::Error) -> bool {
 /// reported as [`Error::Protocol`] wrapping
 /// [`amp_protocol::Error::FrameTooLong`], and so is one with more pairs,
 /// wrapping [`amp_protocol::Error::TooManyPairs`]. The default [`AmpCodec`]
-/// allows 16 MiB and 1,024 pairs. [`Server::serve_connection`] serves with
-/// another codec or in-flight limit, with an idle timeout, and with a way to
-/// stop.
+/// allows 1 MiB and 1,024 pairs, and the connection is closed once it has
+/// sat idle for five minutes. [`Server::serve_connection`] serves with
+/// another codec, in-flight limit, or idle timeout, and with a way to stop.
 ///
 /// Either way, the handlers of the requests still in flight are cancelled:
 /// their reply has nowhere to go, and a peer could otherwise fill the
@@ -546,9 +581,9 @@ fn out_of_descriptors(err: &io::Error) -> bool {
 /// once begun should spawn that work on its own task rather than await it.
 /// The handler of a request without `_ask` is not cancelled, since the
 /// peer never waited for it and may have hung up on purpose once it was
-/// sent; `serve_connection` returns once those have finished. A server with
-/// an [idle timeout](Server::idle_timeout) gives such a handler that long
-/// after the hang-up, then cancels it too.
+/// sent. The [idle timeout](Server::idle_timeout) gives such a handler that
+/// long after the hang-up, then cancels it too, and `serve_connection`
+/// returns once those have finished or been cancelled.
 pub async fn serve_connection<T, S>(io: T, service: S) -> Result<(), Error>
 where
     T: AsyncRead + AsyncWrite,
@@ -794,6 +829,18 @@ mod log_test {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    use crate::Router;
+
+    #[test]
+    fn idle_timeout_is_on_by_default_and_can_be_removed() {
+        let server = Server::new(Router::new());
+        assert_eq!(server.idle_timeout, Some(DEFAULT_IDLE_TIMEOUT));
+        let server = server.no_idle_timeout();
+        assert_eq!(server.idle_timeout, None);
+        let server = server.idle_timeout(Duration::from_secs(1));
+        assert_eq!(server.idle_timeout, Some(Duration::from_secs(1)));
+    }
 
     #[test]
     fn a_peer_that_hangs_up_before_accept_is_skipped() {

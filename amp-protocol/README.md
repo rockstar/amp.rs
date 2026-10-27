@@ -20,7 +20,7 @@ types; that is what [serde_amp](https://crates.io/crates/serde_amp) is for.
   `Message::from_box` classifies an incoming box into one of them.
 * The `tokio` feature adds `codec::AmpCodec`, a `tokio_util::codec` encoder
   and decoder for framing boxes on a socket. It refuses a box longer than a
-  limit, 16 MiB by default, so a peer that never finishes one cannot fill
+  limit, 1 MiB by default, so a peer that never finishes one cannot fill
   memory, and one with more pairs than a limit, 1,024 by default, so a box of
   millions of tiny pairs cannot cost many times its size to decode. Both are
   checked as the box arrives, before any of it is decoded.

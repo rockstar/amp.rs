@@ -23,7 +23,7 @@ use crate::{AmpBox, Error};
 /// A box is read into memory in full before it is decoded, so the codec
 /// holds a box to two limits rather than buffer without bound:
 ///
-/// * Its encoding may be at most the maximum frame length, 16 MiB by default.
+/// * Its encoding may be at most the maximum frame length, 1 MiB by default.
 ///   A longer box fails with [`Error::FrameTooLong`].
 /// * It may hold at most the maximum number of pairs, 1,024 by default. A box
 ///   with more fails with [`Error::TooManyPairs`]. A decoded pair costs far
@@ -51,9 +51,11 @@ pub struct AmpCodec {
     scanned: Scanned,
 }
 
-/// The frame length [`AmpCodec::new`] allows: 16 MiB, room for a box of a
-/// few hundred full-size values, which is far beyond any sensible packet.
-const DEFAULT_MAX_FRAME_LENGTH: usize = 16 * 1024 * 1024;
+/// The frame length [`AmpCodec::new`] allows: 1 MiB. A value is at most
+/// 65,535 bytes, so that is room for a box of sixteen full-size values,
+/// which is beyond any sensible packet, while a peer that never finishes a
+/// box costs at most this much to buffer.
+const DEFAULT_MAX_FRAME_LENGTH: usize = 1024 * 1024;
 
 /// The number of pairs [`AmpCodec::new`] allows. A box has a pair per
 /// argument of a command plus a few the protocol reserves, so this too is far
@@ -61,7 +63,7 @@ const DEFAULT_MAX_FRAME_LENGTH: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_PAIRS: usize = 1024;
 
 impl AmpCodec {
-    /// Creates a codec with the default limits: a frame length of 16 MiB and
+    /// Creates a codec with the default limits: a frame length of 1 MiB and
     /// 1,024 pairs.
     pub fn new() -> Self {
         Self::default()
@@ -235,9 +237,9 @@ mod test {
     }
 
     #[test]
-    fn default_limits_are_16_mib_and_1024_pairs() {
+    fn default_limits_are_1_mib_and_1024_pairs() {
         for codec in [AmpCodec::new(), AmpCodec::default()] {
-            assert_eq!(codec.max_frame_length, 16 * 1024 * 1024);
+            assert_eq!(codec.max_frame_length, 1024 * 1024);
             assert_eq!(codec.max_pairs, 1024);
         }
         let codec = AmpCodec::with_max_frame_length(1024);

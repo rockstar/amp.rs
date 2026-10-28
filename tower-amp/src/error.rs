@@ -8,7 +8,7 @@ use amp_protocol::ErrorResponse;
 /// A handler fails a command by returning [`Error::new`] with the code and
 /// description the peer should see, or by returning any other variant, which
 /// goes on the wire with the code `UNKNOWN`. Of those, only
-/// [`Error::Deserialize`] takes its message with it, since it is about the
+/// [`Error::Arguments`] takes its message with it, since it is about the
 /// peer's own request; the rest are answered with the description
 /// `internal error`, so that nothing about this side's internals reaches
 /// the peer. The error itself is logged when the `tracing` feature is on. A
@@ -33,11 +33,18 @@ pub enum Error {
     /// into a box to send. The type is at fault, not the peer: a nested
     /// struct, for example, has no AMP representation.
     Serialize(serde_amp::Error),
-    /// A box from the peer did not match the type it was read as: on a
-    /// server, the arguments of a command; on a client, the results of a
-    /// call. The two sides disagree about the command's schema, or the peer
-    /// sent something malformed. A server answers the peer with this as an
-    /// `UNKNOWN` error.
+    /// A request's arguments did not match the command's type: the peer
+    /// disagrees about the command's schema, or sent something malformed.
+    /// [`Router`](crate::Router) fails the request with this, and the peer
+    /// is answered `UNKNOWN` with the message, which tells it what was
+    /// wrong with its request.
+    Arguments(serde_amp::Error),
+    /// The results of a call did not match the command's response type:
+    /// the two sides disagree about the command's schema, or the peer sent
+    /// something malformed. A handler that passes this on, having called
+    /// another peer, answers its own peer `UNKNOWN` and `internal error`:
+    /// the message quotes the other peer's reply, which is not for this
+    /// one to see.
     Deserialize(serde_amp::Error),
     /// The connection closed before the command was answered, or before it
     /// could be sent.
@@ -106,17 +113,18 @@ impl Error {
 
     /// The description that goes on the wire.
     ///
-    /// A command error carries the description the handler chose, and a
-    /// deserialize error its message, which tells the peer its request did
+    /// A command error carries the description the handler chose, and an
+    /// arguments error its message, which tells the peer its request did
     /// not match the command's schema. Any other error is about this side,
     /// not the request: an I/O error names hosts, a panic message says what
     /// the handler was doing, a middleware error says what its layer was
-    /// doing. A peer, who may be anyone, gets a fixed description instead,
-    /// and the error goes to the log.
+    /// doing, and a deserialize error quotes what some other peer replied.
+    /// A peer, who may be anyone, gets a fixed description instead, and
+    /// the error goes to the log.
     pub(crate) fn description(&self) -> String {
         match self {
             Error::Command { description, .. } => description.clone(),
-            Error::Deserialize(_) => self.to_string(),
+            Error::Arguments(_) => self.to_string(),
             _ => INTERNAL_ERROR.to_string(),
         }
     }
@@ -168,7 +176,8 @@ impl fmt::Display for Error {
             Error::Io(err) => write!(f, "connection failed: {err}"),
             Error::Protocol(err) => write!(f, "protocol error: {err}"),
             Error::Serialize(err) => write!(f, "could not serialize: {err}"),
-            Error::Deserialize(err) => write!(f, "could not deserialize: {err}"),
+            Error::Arguments(err) => write!(f, "could not deserialize: {err}"),
+            Error::Deserialize(err) => write!(f, "could not deserialize results: {err}"),
             Error::ConnectionClosed { cause: Some(cause) } => {
                 write!(f, "connection closed: {cause}")
             }
@@ -185,6 +194,7 @@ impl std::error::Error for Error {
             Error::Io(err) => Some(err),
             Error::Protocol(err) => Some(err),
             Error::Serialize(err) => Some(err),
+            Error::Arguments(err) => Some(err),
             Error::Deserialize(err) => Some(err),
             Error::ConnectionClosed { cause: Some(cause) } => Some(cause.as_ref()),
             Error::Internal(err) => Some(err.as_ref()),

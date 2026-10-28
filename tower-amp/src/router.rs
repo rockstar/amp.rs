@@ -78,7 +78,7 @@ where
                         .map_err(Into::into)?;
                     serde_amp::to_box(&response).map_err(Error::Serialize)
                 }),
-                Err(err) => Box::pin(ready(Err(Error::Deserialize(err)))),
+                Err(err) => Box::pin(ready(Err(Error::Arguments(err)))),
             }
         };
         // The table is only shared once the router has been cloned, so this

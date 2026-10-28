@@ -1527,8 +1527,41 @@ async fn results_that_do_not_match_fail_the_client_with_deserialize() {
     let err = failed.unwrap_err();
     assert!(std::error::Error::source(&err).is_some());
     assert!(
-        err.to_string().starts_with("could not deserialize: "),
+        err.to_string()
+            .starts_with("could not deserialize results: "),
         "{err}"
+    );
+}
+
+/// `Relay`'s handler calls `Sum` on another peer and passes on what it
+/// gets. The results that peer sends are quoted in the error when they do
+/// not parse, so the error must not reach the peer that asked verbatim.
+#[tokio::test]
+async fn a_relayed_results_mismatch_is_an_internal_error_to_the_peer() {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let served = Connection::new(server_io);
+    let peer = served.client();
+    tokio::spawn(served.serve(Router::with_state(peer).command::<Relay>()));
+    let calling = Connection::new(client_io);
+    let client = calling.client();
+    // Answers `Sum` with a `total` that is not a number.
+    let backend = tower::service_fn(|_: Request| async {
+        let mut results = AmpBox::new();
+        results
+            .insert("total", "db=postgres://svc:hunter2@10.0.0.7/prod")
+            .unwrap();
+        Ok::<_, Error>(results)
+    });
+    tokio::spawn(calling.serve(backend));
+
+    let failed = client.call(&Relay { a: 13, b: 81 }).await;
+    assert!(
+        matches!(
+            failed,
+            Err(Error::Command { ref code, ref description })
+                if code == "UNKNOWN" && description == "internal error"
+        ),
+        "{failed:?}"
     );
 }
 

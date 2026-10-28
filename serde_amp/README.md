@@ -82,6 +82,10 @@ Not representable, and reported as an error: a struct or map as a field (AMP
 has no nesting except through `AmpList`), a unit value as a field, an enum
 variant that carries data, and `None` inside a sequence.
 
+A type that contains itself, such as a tree node holding a `Vec` of nodes,
+reads up to 32 levels deep. Past that, reading fails with `Error::TooDeep`
+rather than letting a peer overflow the stack with a deeply nested value.
+
 Limitations
 --
 

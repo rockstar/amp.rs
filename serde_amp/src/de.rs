@@ -3,6 +3,15 @@ use serde::de::{self, Deserialize, DeserializeSeed, Visitor};
 
 use crate::Error;
 
+/// How many sequences may be open at once while reading one value.
+///
+/// A type that contains itself through a `Vec`, such as a tree node holding
+/// its children, lets a peer nest boxes as deep as it likes, and each level
+/// costs a few stack frames. Past this many levels the read fails with
+/// [`Error::TooDeep`] instead of overflowing the stack and aborting the
+/// process. No real schema comes anywhere near it.
+pub(crate) const MAX_DEPTH: usize = 32;
+
 /// Deserializes a value of type `T` from a box.
 ///
 /// `T` must be a struct or a map, or a newtype or `Option` wrapping one. Each
@@ -48,6 +57,7 @@ impl<'de> de::Deserializer<'de> for BoxDeserializer<'de> {
         visitor.visit_map(BoxAccess {
             iter: self.amp_box.iter(),
             pair: None,
+            depth: 0,
         })
     }
 
@@ -139,6 +149,8 @@ struct BoxAccess<'de, I> {
     /// The key most recently handed out and its value, until the value is
     /// read.
     pair: Option<(&'de [u8], &'de [u8])>,
+    /// How many sequences enclose this box. See [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl<'de, I> de::MapAccess<'de> for BoxAccess<'de, I>
@@ -154,7 +166,11 @@ where
         match self.iter.next() {
             Some((key, value)) => {
                 self.pair = Some((key, value));
-                seed.deserialize(ValueDeserializer { bytes: key }).map(Some)
+                seed.deserialize(ValueDeserializer {
+                    bytes: key,
+                    depth: self.depth,
+                })
+                .map(Some)
             }
             None => Ok(None),
         }
@@ -165,15 +181,18 @@ where
             .pair
             .take()
             .ok_or_else(|| de::Error::custom("map value requested before its key"))?;
-        seed.deserialize(ValueDeserializer { bytes: value })
-            .map_err(|err| match err {
-                Error::InvalidValue(expected) => Error::InvalidValueForKey {
-                    key: String::from_utf8_lossy(key).into_owned(),
-                    expected,
-                    value: value.to_vec(),
-                },
-                other => other,
-            })
+        seed.deserialize(ValueDeserializer {
+            bytes: value,
+            depth: self.depth,
+        })
+        .map_err(|err| match err {
+            Error::InvalidValue(expected) => Error::InvalidValueForKey {
+                key: String::from_utf8_lossy(key).into_owned(),
+                expected,
+                value: value.to_vec(),
+            },
+            other => other,
+        })
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -183,8 +202,11 @@ where
 
 /// Deserializes one value's bytes, or one key's. Text and bytes are handed to
 /// the visitor borrowed, so a `&'de str` field points into the input.
+#[derive(Clone, Copy)]
 struct ValueDeserializer<'de> {
     bytes: &'de [u8],
+    /// How many sequences enclose this value. See [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl<'de> ValueDeserializer<'de> {
@@ -294,9 +316,13 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     }
 
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        if self.depth >= MAX_DEPTH {
+            return Err(Error::TooDeep);
+        }
         visitor.visit_seq(SeqAccess {
             bytes: self.bytes,
             pos: 0,
+            depth: self.depth + 1,
         })
     }
 
@@ -362,9 +388,8 @@ impl<'de> de::EnumAccess<'de> for ValueDeserializer<'de> {
     type Variant = Self;
 
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self), Error> {
-        let bytes = self.bytes;
         let variant = seed.deserialize(self)?;
-        Ok((variant, ValueDeserializer { bytes }))
+        Ok((variant, self))
     }
 }
 
@@ -396,6 +421,8 @@ impl<'de> de::VariantAccess<'de> for ValueDeserializer<'de> {
 struct SeqAccess<'de> {
     bytes: &'de [u8],
     pos: usize,
+    /// How many sequences are open, counting this one. See [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl<'de> de::SeqAccess<'de> for SeqAccess<'de> {
@@ -412,6 +439,7 @@ impl<'de> de::SeqAccess<'de> for SeqAccess<'de> {
         let element = seed.deserialize(ElementDeserializer {
             bytes: &self.bytes[self.pos..],
             consumed: &mut consumed,
+            depth: self.depth,
         })?;
         if consumed == 0 {
             return Err(de::Error::custom("sequence element consumed no input"));
@@ -429,6 +457,8 @@ impl<'de> de::SeqAccess<'de> for SeqAccess<'de> {
 struct ElementDeserializer<'de, 'c> {
     bytes: &'de [u8],
     consumed: &'c mut usize,
+    /// How many sequences enclose this element. See [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl<'de, 'c> ElementDeserializer<'de, 'c> {
@@ -443,7 +473,10 @@ impl<'de, 'c> ElementDeserializer<'de, 'c> {
             .get(2..2 + len)
             .ok_or(Error::InvalidValue(expected))?;
         *self.consumed = 2 + len;
-        Ok(ValueDeserializer { bytes })
+        Ok(ValueDeserializer {
+            bytes,
+            depth: self.depth,
+        })
     }
 
     /// Reads the element as a box, borrowing its pairs from the input rather
@@ -454,6 +487,7 @@ impl<'de, 'c> ElementDeserializer<'de, 'c> {
         visitor.visit_map(BoxAccess {
             iter: pairs.into_iter(),
             pair: None,
+            depth: self.depth,
         })
     }
 }
@@ -1064,5 +1098,55 @@ mod test {
             from_box::<Outer>(&amp_box),
             Err(Error::Unsupported("a nested struct or map"))
         ));
+    }
+
+    /// A type that contains itself lets the wire nest as deep as it likes.
+    /// The read must stop at the limit rather than overflow the stack.
+    #[test]
+    fn nesting_past_the_limit_is_an_error_not_a_stack_overflow() {
+        #[derive(Deserialize, Debug)]
+        struct Node {
+            #[expect(dead_code)]
+            v: Vec<Node>,
+        }
+        /// An `AmpList` of one node holding one node, and so on, `levels`
+        /// deep. The box the list sits in is level zero.
+        fn boxes(levels: usize) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for _ in 0..levels {
+                let len = (bytes.len() as u16).to_be_bytes();
+                bytes = [b"\x00\x01v", &len[..], &bytes, b"\x00\x00"].concat();
+            }
+            bytes
+        }
+        assert_eq!(value::<Vec<Node>>(&boxes(MAX_DEPTH - 1)).unwrap().len(), 1);
+        assert!(matches!(
+            value::<Vec<Node>>(&boxes(MAX_DEPTH)),
+            Err(Error::TooDeep)
+        ));
+        // Overflows a 2 MiB stack without the limit.
+        assert!(matches!(
+            value::<Vec<Node>>(&boxes(4_000)),
+            Err(Error::TooDeep)
+        ));
+
+        // The same through `ListOf` rather than `AmpList`: a newtype around
+        // a list of itself nests length-prefixed values.
+        #[derive(Deserialize, Debug)]
+        struct List(Vec<List>);
+        fn lists(levels: usize) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for _ in 0..levels {
+                let len = (bytes.len() as u16).to_be_bytes();
+                bytes = [&len[..], &bytes].concat();
+            }
+            bytes
+        }
+        assert_eq!(value::<List>(&lists(MAX_DEPTH - 1)).unwrap().0.len(), 1);
+        assert!(matches!(
+            value::<List>(&lists(MAX_DEPTH)),
+            Err(Error::TooDeep)
+        ));
+        assert!(matches!(value::<List>(&lists(10_000)), Err(Error::TooDeep)));
     }
 }

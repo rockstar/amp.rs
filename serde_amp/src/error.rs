@@ -16,6 +16,10 @@ pub enum Error {
     /// The value has no representation in AMP. The payload says which kind of
     /// value, for example a nested struct or an enum variant carrying data.
     Unsupported(&'static str),
+    /// Sequences were nested more than 32 deep while reading, which only a
+    /// type that contains itself allows. The limit keeps a hostile peer from
+    /// overflowing the stack.
+    TooDeep,
     /// A value with no key of its own, such as a map key, could not be read
     /// as the requested type. The payload says what was expected.
     InvalidValue(&'static str),
@@ -49,6 +53,11 @@ impl fmt::Display for Error {
             Error::Protocol(err) => write!(f, "{err}"),
             Error::NotABox => f.write_str("a box must be a struct or map at the top level"),
             Error::Unsupported(what) => write!(f, "{what} cannot be represented in AMP"),
+            Error::TooDeep => write!(
+                f,
+                "sequences nested more than {} deep",
+                crate::de::MAX_DEPTH
+            ),
             Error::InvalidValue(expected) => write!(f, "expected {expected}"),
             Error::InvalidValueForKey {
                 key,

@@ -33,12 +33,7 @@ pub use error::Error;
 pub use handle::{Handle, HandleWith};
 pub use router::Router;
 #[cfg(not(target_family = "wasm"))]
-// Re-exporting the deprecated functions counts as using them.
-#[expect(deprecated)]
-pub use server::{
-    Server, serve, serve_connection, serve_connection_with_codec, serve_with_codec,
-    serve_with_codec_and_shutdown, serve_with_shutdown,
-};
+pub use server::{Server, serve, serve_connection};
 /// Declares a struct as a command's arguments. See [`Command`].
 ///
 /// The generated code refers to this crate as `::tower_amp`, so it must be a

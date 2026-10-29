@@ -450,69 +450,6 @@ where
     Server::new(service).serve(listener).await
 }
 
-/// [`serve`] with the codec every connection is framed by.
-#[deprecated(
-    since = "0.3.0",
-    note = "use `Server::new(service).codec(codec).serve(listener)`"
-)]
-pub async fn serve_with_codec<S>(
-    listener: TcpListener,
-    service: S,
-    codec: AmpCodec,
-) -> Result<(), Error>
-where
-    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
-    S::Error: Into<Error>,
-    S::Future: Send,
-{
-    Server::new(service).codec(codec).serve(listener).await
-}
-
-/// [`serve`] until `signal` completes, answering the requests in flight
-/// before returning, as [`Server::shutdown`] describes.
-#[deprecated(
-    since = "0.3.0",
-    note = "use `Server::new(service).shutdown(signal).serve(listener)`"
-)]
-pub async fn serve_with_shutdown<S, F>(
-    listener: TcpListener,
-    service: S,
-    signal: F,
-) -> Result<(), Error>
-where
-    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
-    S::Error: Into<Error>,
-    S::Future: Send,
-    F: Future<Output = ()>,
-{
-    Server::new(service).shutdown(signal).serve(listener).await
-}
-
-/// [`serve`] with the codec every connection is framed by, until `signal`
-/// completes, as [`Server::shutdown`] describes.
-#[deprecated(
-    since = "0.3.0",
-    note = "use `Server::new(service).codec(codec).shutdown(signal).serve(listener)`"
-)]
-pub async fn serve_with_codec_and_shutdown<S, F>(
-    listener: TcpListener,
-    service: S,
-    codec: AmpCodec,
-    signal: F,
-) -> Result<(), Error>
-where
-    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
-    S::Error: Into<Error>,
-    S::Future: Send,
-    F: Future<Output = ()>,
-{
-    Server::new(service)
-        .codec(codec)
-        .shutdown(signal)
-        .serve(listener)
-        .await
-}
-
 /// How the accept loop treats an error from `accept`: `Some(delay)` means
 /// wait that long and try again, `None` means the error ends `serve`.
 ///
@@ -600,25 +537,6 @@ where
     S::Future: Send,
 {
     Server::new(service).serve_connection(io).await
-}
-
-/// [`serve_connection`] with the codec the connection is framed by.
-#[deprecated(
-    since = "0.3.0",
-    note = "use `Server::new(service).codec(codec).serve_connection(io)`"
-)]
-pub async fn serve_connection_with_codec<T, S>(
-    io: T,
-    service: S,
-    codec: AmpCodec,
-) -> Result<(), Error>
-where
-    T: AsyncRead + AsyncWrite,
-    S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
-    S::Error: Into<Error>,
-    S::Future: Send,
-{
-    Server::new(service).codec(codec).serve_connection(io).await
 }
 
 /// What the `tracing` feature logs. This lives with the unit tests rather

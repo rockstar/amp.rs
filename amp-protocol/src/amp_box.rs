@@ -20,6 +20,7 @@ pub struct AmpBox {
 
 impl AmpBox {
     /// Creates an empty box.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -40,9 +41,12 @@ impl AmpBox {
 
     /// Inserts a pair, replacing the value of an existing key in place.
     ///
-    /// Returns the replaced value, if any. Fails if the key is empty or
-    /// longer than 255 bytes, or the value is longer than 65,535 bytes, in
-    /// which case the box is unchanged.
+    /// Returns the replaced value, if any.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the key is empty or longer than 255 bytes, or the value is
+    /// longer than 65,535 bytes, in which case the box is unchanged.
     pub fn insert<K, V>(&mut self, key: K, value: V) -> Result<Option<Vec<u8>>, Error>
     where
         K: Into<Vec<u8>>,
@@ -63,12 +67,11 @@ impl AmpBox {
     }
 
     fn insert_unchecked(&mut self, key: Vec<u8>, value: Vec<u8>) -> Option<Vec<u8>> {
-        match self.entries.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, existing)) => Some(std::mem::replace(existing, value)),
-            None => {
-                self.entries.push((key, value));
-                None
-            }
+        if let Some((_, existing)) = self.entries.iter_mut().find(|(k, _)| *k == key) {
+            Some(std::mem::replace(existing, value))
+        } else {
+            self.entries.push((key, value));
+            None
         }
     }
 
@@ -95,16 +98,19 @@ impl AmpBox {
     }
 
     /// The number of pairs in the box.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the box has no pairs.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Iterates over the pairs in insertion order.
+    #[must_use]
     pub fn iter(&self) -> Iter<'_> {
         Iter(self.entries.iter())
     }
@@ -119,6 +125,10 @@ impl AmpBox {
     }
 
     /// Encodes the box, including its terminator.
+    // `insert` caps keys at 255 bytes and values at 65,535, so both lengths
+    // fit their two-byte prefix.
+    #[expect(clippy::cast_possible_truncation)]
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_len());
         for (key, value) in &self.entries {
@@ -135,10 +145,8 @@ impl AmpBox {
     ///
     /// Returns the box and the number of bytes it occupied, so a caller
     /// framing a stream can advance past it. Bytes after the box are left
-    /// alone. Returns [`Error::Incomplete`] if `bytes` ends before the
-    /// terminator, and [`Error::KeyTooLong`] if a key's length prefix exceeds
-    /// 255. A key that repeats within one box keeps the last value, matching
-    /// the reference implementation.
+    /// alone. A key that repeats within one box keeps the last value,
+    /// matching the reference implementation.
     ///
     /// This puts no limit on the number of pairs. Each decoded pair costs two
     /// heap allocations and a few dozen bytes of bookkeeping, while on the
@@ -148,6 +156,11 @@ impl AmpBox {
     /// counts pairs before anything is decoded. For bytes from an untrusted
     /// peer that you frame yourself, use
     /// [`decode_bounded`](Self::decode_bounded) instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Incomplete`] if `bytes` ends before the terminator,
+    /// and [`Error::KeyTooLong`] if a key's length prefix exceeds 255.
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
         Self::decode_bounded(bytes, usize::MAX)
     }
@@ -155,14 +168,19 @@ impl AmpBox {
     /// Decodes one box from the front of `bytes`, refusing one with more than
     /// `max_pairs` pairs.
     ///
-    /// Behaves as [`decode`](Self::decode) does, except that a box fails with
-    /// [`Error::TooManyPairs`] as soon as the start of pair `max_pairs + 1` is
-    /// read, before anything is allocated for it. A repeated key counts each
-    /// time it appears, so the limit bounds the work of decoding, not just
-    /// the size of the result. Set `max_pairs` to the most pairs the peer
-    /// could legitimately send in one box, counting the reserved keys
-    /// (`_command` and `_ask` on a request, `_answer` on an answer, and
-    /// `_error`, `_error_code`, and `_error_description` on an error).
+    /// Behaves as [`decode`](Self::decode) does, except for the limit. A
+    /// repeated key counts each time it appears, so the limit bounds the work
+    /// of decoding, not just the size of the result. Set `max_pairs` to the
+    /// most pairs the peer could legitimately send in one box, counting the
+    /// reserved keys (`_command` and `_ask` on a request, `_answer` on an
+    /// answer, and `_error`, `_error_code`, and `_error_description` on an
+    /// error).
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`decode`](Self::decode) does, and with
+    /// [`Error::TooManyPairs`] as soon as the start of pair `max_pairs + 1`
+    /// is read, before anything is allocated for it.
     pub fn decode_bounded(bytes: &[u8], max_pairs: usize) -> Result<(Self, usize), Error> {
         let (pairs, consumed) = decode_pairs(bytes, max_pairs)?;
         let entries = pairs
@@ -177,13 +195,17 @@ impl AmpBox {
     /// Returns the box's pairs as slices into `bytes`, in wire order, and the
     /// number of bytes the box occupied. The pairs are exactly those
     /// [`decode`](Self::decode) would hold, including a repeated key keeping
-    /// its last value, and the errors are the same. Use this when the pairs
-    /// are read once and the box itself is not needed.
+    /// its last value. Use this when the pairs are read once and the box
+    /// itself is not needed.
     ///
     /// Like [`decode`](Self::decode), this puts no limit on the number of
     /// pairs. It copies nothing, but still holds a few dozen bytes per pair,
     /// so the caveat there applies: frame untrusted bytes with `AmpCodec` or
     /// cap their length tightly.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`decode`](Self::decode) does.
     // A pair of slices is the whole point of this function, and a named
     // alias for it would be one more public type to learn.
     #[expect(clippy::type_complexity)]
@@ -225,12 +247,11 @@ fn decode_pairs(bytes: &[u8], max_pairs: usize) -> Result<(Vec<(&[u8], &[u8])>, 
         let value = read_slice(bytes, pos, value_len)?;
         pos += value_len;
 
-        match keys.position(key) {
-            Some(index) => pairs[index].1 = value,
-            None => {
-                keys.push(key, pairs.len());
-                pairs.push((key, value));
-            }
+        if let Some(index) = keys.position(key) {
+            pairs[index].1 = value;
+        } else {
+            keys.push(key, pairs.len());
+            pairs.push((key, value));
         }
     }
 }
@@ -657,9 +678,9 @@ mod test {
 
     /// Encodes one pair by hand, since `AmpBox` will not hold a duplicate.
     fn pair(key: &str, value: &str) -> Vec<u8> {
-        let mut out = (key.len() as u16).to_be_bytes().to_vec();
+        let mut out = u16::try_from(key.len()).unwrap().to_be_bytes().to_vec();
         out.extend_from_slice(key.as_bytes());
-        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
         out.extend_from_slice(value.as_bytes());
         out
     }

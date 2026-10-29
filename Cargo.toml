@@ -53,6 +53,7 @@ broken_intra_doc_links = "deny"
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
 
 # `#[expect]` warns when the lint it silences stops firing, so a stale
 # silence cannot linger. `#[allow]` never does.

@@ -59,11 +59,10 @@ mod with_tracing {
         let command = self::command(command);
         let ask = self::ask(ask);
         let error = self::error(err);
-        match err {
-            Error::Command { .. } => {
-                tracing::debug!(%command, %ask, %error, "command failed")
-            }
-            _ => tracing::warn!(%command, %ask, %error, "command failed"),
+        if matches!(err, Error::Command { .. }) {
+            tracing::debug!(%command, %ask, %error, "command failed");
+        } else {
+            tracing::warn!(%command, %ask, %error, "command failed");
         }
     }
 
@@ -90,7 +89,7 @@ mod with_tracing {
         let error = self::error(err);
         match err {
             Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
-                tracing::debug!(%error, "connection timed out")
+                tracing::debug!(%error, "connection timed out");
             }
             _ => tracing::warn!(%error, "connection failed"),
         }

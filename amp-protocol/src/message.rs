@@ -26,6 +26,7 @@ impl Request {
     }
 
     /// Sets the identifier a response must echo back.
+    #[must_use]
     pub fn with_ask<A: Into<Vec<u8>>>(mut self, ask: A) -> Self {
         self.ask = Some(ask.into());
         self
@@ -33,10 +34,13 @@ impl Request {
 
     /// Splits a box into a request.
     ///
-    /// Fails with [`Error::MissingKey`] if the box has no `_command`.
     /// Everything other than `_command` and `_ask` becomes an argument,
     /// except that any other reserved key is dropped, as the reference
     /// implementation ignores it.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::MissingKey`] if the box has no `_command`.
     pub fn from_box(mut amp_box: AmpBox) -> Result<Self, Error> {
         let command = amp_box
             .remove(KEY_COMMAND)
@@ -51,6 +55,8 @@ impl Request {
     }
 
     /// Assembles the box this request is sent as.
+    ///
+    /// # Errors
     ///
     /// Fails with [`Error::ReservedKey`] if an argument uses a reserved key,
     /// or with a length error if `command` or `ask` is too long.
@@ -84,9 +90,13 @@ impl Answer {
 
     /// Splits a box into an answer.
     ///
+    /// Everything other than `_answer` becomes a result, except that any
+    /// other reserved key is dropped, as the reference implementation
+    /// ignores it.
+    ///
+    /// # Errors
+    ///
     /// Fails with [`Error::MissingKey`] if the box has no `_answer`.
-    /// Everything else becomes a result, except that any other reserved key
-    /// is dropped, as the reference implementation ignores it.
     pub fn from_box(mut amp_box: AmpBox) -> Result<Self, Error> {
         let answer = amp_box
             .remove(KEY_ANSWER)
@@ -99,6 +109,8 @@ impl Answer {
     }
 
     /// Assembles the box this answer is sent as.
+    ///
+    /// # Errors
     ///
     /// Fails with [`Error::ReservedKey`] if a result uses a reserved key, or
     /// with a length error if `answer` is too long.
@@ -146,9 +158,13 @@ impl ErrorResponse {
 
     /// Splits a box into an error response.
     ///
+    /// A missing `_error_description` is read as empty, and any other keys
+    /// are ignored.
+    ///
+    /// # Errors
+    ///
     /// Fails with [`Error::MissingKey`] if the box has no `_error` or no
-    /// `_error_code`. A missing `_error_description` is read as empty, and
-    /// any other keys are ignored.
+    /// `_error_code`.
     pub fn from_box(mut amp_box: AmpBox) -> Result<Self, Error> {
         let error = amp_box
             .remove(KEY_ERROR)
@@ -165,6 +181,8 @@ impl ErrorResponse {
     }
 
     /// Assembles the box this error response is sent as.
+    ///
+    /// # Errors
     ///
     /// Fails with a length error if any field is too long.
     pub fn into_box(self) -> Result<AmpBox, Error> {
@@ -191,8 +209,13 @@ impl Message {
     /// Classifies a box.
     ///
     /// `_answer` takes precedence over `_error`, which takes precedence over
-    /// `_command`, as in the reference implementation. A box with none of the
-    /// three fails with [`Error::UnrecognizedBox`].
+    /// `_command`, as in the reference implementation.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::UnrecognizedBox`] if the box has none of the
+    /// three, and with [`Error::MissingKey`] if it has `_error` but no
+    /// `_error_code`.
     pub fn from_box(amp_box: AmpBox) -> Result<Self, Error> {
         if amp_box.contains_key(KEY_ANSWER) {
             Answer::from_box(amp_box).map(Message::Answer)
@@ -206,6 +229,12 @@ impl Message {
     }
 
     /// Assembles the box this message is sent as.
+    ///
+    /// # Errors
+    ///
+    /// Fails as the variant's own `into_box` does: with
+    /// [`Error::ReservedKey`] if user data uses a reserved key, or with a
+    /// length error if a field is too long.
     pub fn into_box(self) -> Result<AmpBox, Error> {
         match self {
             Message::Request(request) => request.into_box(),

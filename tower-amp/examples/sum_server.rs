@@ -1,4 +1,8 @@
 #![expect(unused_crate_dependencies)]
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "`Divide` answers with a float, so its integer operands need not survive exactly"
+)]
 //! The canonical AMP example: a server with `Sum` and `Divide` commands,
 //! compatible with the client in Twisted's AMP documentation.
 //!

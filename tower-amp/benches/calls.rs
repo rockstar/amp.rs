@@ -106,7 +106,7 @@ fn sequential(bencher: Bencher, transport: Transport) {
             for _ in 0..CALLS {
                 let _ = black_box(client.call(black_box(&sum)).await.unwrap());
             }
-        })
+        });
     });
 }
 
@@ -120,6 +120,6 @@ fn pipelined(bencher: Bencher, transport: Transport) {
             for total in futures_util::future::join_all(calls).await {
                 let _ = black_box(total.unwrap());
             }
-        })
+        });
     });
 }

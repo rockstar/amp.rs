@@ -189,6 +189,9 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {
+    // `cause` is an `Arc` and the `Internal` error a `Box`, so the two arms
+    // that look alike cannot share a pattern.
+    #[expect(clippy::match_same_arms)]
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(err) => Some(err),

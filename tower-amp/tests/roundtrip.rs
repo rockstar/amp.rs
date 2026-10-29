@@ -1,4 +1,8 @@
 #![expect(unused_crate_dependencies)]
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "`Divide` answers with a float, so its integer operands need not survive exactly"
+)]
 //! A client and a served connection joined by an in-memory pipe.
 
 // There is no server on WebAssembly; `client.rs` covers the client there.
@@ -422,17 +426,17 @@ async fn a_handler_calls_a_command_on_the_peer_that_asked() {
 /// connection, and the hang-up noticed afterwards.
 #[tokio::test]
 async fn pipelining_past_the_limit_to_a_relaying_command_does_not_hang() {
+    // Two past the default limit of 256: one is held, and one is the
+    // request that used to stop the connection reading.
+    const REQUESTS: u64 = 258;
     // Room for every request at once, so that the peer never waits on a
     // write before it starts answering.
     let (peer, server_io) = tokio::io::duplex(1 << 20);
     let connection = Connection::new(server_io);
     let client = connection.client();
-    let served = tokio::spawn(connection.serve(Router::with_state(client).command::<Relay>()));
+    let serving = tokio::spawn(connection.serve(Router::with_state(client).command::<Relay>()));
     let mut peer = Peer::new(peer, AmpCodec::new());
 
-    // Two past the default limit of 256: one is held, and one is the
-    // request that used to stop the connection reading.
-    const REQUESTS: u64 = 258;
     for i in 0..REQUESTS {
         let mut args = AmpBox::new();
         let _ = args.insert("a", i.to_string()).unwrap();
@@ -487,7 +491,7 @@ async fn pipelining_past_the_limit_to_a_relaying_command_does_not_hang() {
     );
 
     drop(peer);
-    ended(served).await.unwrap();
+    ended(serving).await.unwrap();
 }
 
 /// A served connection is kept open by whoever drives it, not by its
@@ -890,13 +894,13 @@ async fn the_in_flight_limit_is_configurable() {
 async fn an_unbounded_in_flight_limit_is_lowered() {
     let (client_io, server_io) = tokio::io::duplex(4096);
     let server = Server::new(router()).max_in_flight(usize::MAX);
-    let served = tokio::spawn(server.serve_connection(server_io));
+    let serving = tokio::spawn(server.serve_connection(server_io));
 
     let client = Client::new(client_io);
     let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
     assert_eq!(total.total, 3);
     drop(client);
-    ended(served).await.unwrap();
+    ended(serving).await.unwrap();
 }
 
 /// A connection that may never read a request would hang its peer, so a
@@ -955,8 +959,8 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let (peer, server_io) = tokio::io::duplex(4096);
-    let served = tokio::spawn(server.serve_connection(server_io));
-    (served, Peer::new(peer, AmpCodec::new()))
+    let serving = tokio::spawn(server.serve_connection(server_io));
+    (serving, Peer::new(peer, AmpCodec::new()))
 }
 
 /// Sends `count` requests for `command` on `peer`, each asking for a reply.
@@ -984,10 +988,10 @@ async fn running(running: &Running, expected: u64) {
     });
 }
 
-/// Waits for `served` to end, which it must within a few seconds of the
+/// Waits for `serving` to end, which it must within a few seconds of the
 /// peer hanging up, and returns how it ended.
-async fn ended(served: tokio::task::JoinHandle<Result<(), Error>>) -> Result<(), Error> {
-    tokio::time::timeout(Duration::from_secs(5), served)
+async fn ended(serving: tokio::task::JoinHandle<Result<(), Error>>) -> Result<(), Error> {
+    tokio::time::timeout(Duration::from_secs(5), serving)
         .await
         .expect("the connection outlived its peer")
         .unwrap()
@@ -1000,12 +1004,12 @@ async fn ended(served: tokio::task::JoinHandle<Result<(), Error>>) -> Result<(),
 async fn handlers_for_a_peer_that_hangs_up_are_cancelled() {
     let counter = Running::default();
     let router = Router::with_state(counter.clone()).command::<Linger>();
-    let (served, mut peer) = serve_peer(Server::new(router));
+    let (serving, mut peer) = serve_peer(Server::new(router));
     ask(&mut peer, "Linger", 3).await;
     running(&counter, 3).await;
 
     drop(peer);
-    ended(served).await.unwrap();
+    ended(serving).await.unwrap();
     assert_eq!(counter.0.load(Ordering::SeqCst), 0);
 }
 
@@ -1016,12 +1020,12 @@ async fn handlers_for_a_peer_that_hangs_up_are_cancelled() {
 async fn a_peer_at_the_limit_that_hangs_up_is_noticed() {
     let counter = Running::default();
     let router = Router::with_state(counter.clone()).command::<Linger>();
-    let (served, mut peer) = serve_peer(Server::new(router).max_in_flight(8));
+    let (serving, mut peer) = serve_peer(Server::new(router).max_in_flight(8));
     ask(&mut peer, "Linger", 8).await;
     running(&counter, 8).await;
 
     drop(peer);
-    ended(served).await.unwrap();
+    ended(serving).await.unwrap();
     assert_eq!(counter.0.load(Ordering::SeqCst), 0);
 }
 
@@ -1035,14 +1039,14 @@ async fn shutdown_does_not_cancel_handlers() {
     let server = Server::new(router).shutdown(async {
         let _ = stopped.await;
     });
-    let (served, mut peer) = serve_peer(server);
+    let (serving, mut peer) = serve_peer(server);
     ask(&mut peer, "Linger", 2).await;
     running(&counter, 2).await;
 
     stop.send(()).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(counter.0.load(Ordering::SeqCst), 2);
-    assert!(!served.is_finished());
+    assert!(!serving.is_finished());
 }
 
 /// Without an idle timeout, a notification's handler finishes after the peer
@@ -1052,16 +1056,16 @@ async fn shutdown_does_not_cancel_handlers() {
 async fn a_notifications_handler_finishes_after_the_peer_hangs_up() {
     let gate = Gate::default();
     let router = Router::with_state(gate.clone()).command::<Hold>();
-    let (served, mut peer) = serve_peer(Server::new(router).no_idle_timeout());
+    let (serving, mut peer) = serve_peer(Server::new(router).no_idle_timeout());
     let notification = Request::new("Hold", AmpBox::new()).into_box().unwrap();
     peer.send(notification).await.unwrap();
     gate.started.notified().await;
 
     drop(peer);
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!served.is_finished(), "the notification was cancelled");
+    assert!(!serving.is_finished(), "the notification was cancelled");
     gate.release.notify_one();
-    ended(served).await.unwrap();
+    ended(serving).await.unwrap();
 }
 
 /// With an idle timeout, a notification's handler has that long after the
@@ -1075,7 +1079,7 @@ async fn a_notifications_handler_is_cancelled_once_the_idle_timeout_passes() {
     let server = Server::new(router)
         .max_in_flight(8)
         .idle_timeout(Duration::from_millis(200));
-    let (served, mut peer) = serve_peer(server);
+    let (serving, mut peer) = serve_peer(server);
     for _ in 0..8 {
         let notification = Request::new("Linger", AmpBox::new()).into_box().unwrap();
         peer.send(notification).await.unwrap();
@@ -1089,7 +1093,7 @@ async fn a_notifications_handler_is_cancelled_once_the_idle_timeout_passes() {
         8,
         "cancelled before the idle timeout had passed"
     );
-    ended(served).await.unwrap();
+    ended(serving).await.unwrap();
     assert_eq!(counter.0.load(Ordering::SeqCst), 0);
 }
 
@@ -1130,12 +1134,12 @@ fn timed_out(result: &Result<(), Error>) -> bool {
 async fn an_idle_connection_is_closed_after_the_idle_timeout() {
     let (client_io, server_io) = tokio::io::duplex(4096);
     let server = Server::new(router()).idle_timeout(Duration::from_millis(100));
-    let served = tokio::spawn(server.serve_connection(server_io));
+    let serving = tokio::spawn(server.serve_connection(server_io));
     let client = Client::new(client_io);
     let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
     assert_eq!(total.total, 3);
 
-    let result = ended(served).await;
+    let result = ended(serving).await;
     assert!(timed_out(&result), "{result:?}");
     let failed = client.call(&Sum { a: 1, b: 2 }).await;
     assert!(peer_closed(&failed), "{failed:?}");
@@ -1147,7 +1151,7 @@ async fn an_idle_connection_is_closed_after_the_idle_timeout() {
 async fn a_peer_sending_a_byte_at_a_time_is_idle() {
     let (mut peer, server_io) = tokio::io::duplex(4096);
     let server = Server::new(router()).idle_timeout(Duration::from_millis(100));
-    let served = tokio::spawn(server.serve_connection(server_io));
+    let serving = tokio::spawn(server.serve_connection(server_io));
     let request = Request::new("Sum", AmpBox::new()).with_ask("1");
     let mut bytes = bytes::BytesMut::new();
     tokio_util::codec::Encoder::encode(
@@ -1160,13 +1164,13 @@ async fn a_peer_sending_a_byte_at_a_time_is_idle() {
     // A byte every 30 ms is well under the timeout for each byte, and well
     // over it for the box; the writes fail once the server has hung up.
     for byte in &bytes {
-        if served.is_finished() {
+        if serving.is_finished() {
             break;
         }
         let _ = peer.write_all(&[*byte]).await;
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    let result = ended(served).await;
+    let result = ended(serving).await;
     assert!(timed_out(&result), "{result:?}");
 }
 
@@ -1178,20 +1182,20 @@ async fn a_connection_with_a_request_in_flight_is_not_idle() {
     let gate = Gate::default();
     let router = Router::with_state(gate.clone()).command::<Hold>();
     let server = Server::new(router).idle_timeout(Duration::from_millis(50));
-    let (served, mut peer) = serve_peer(server);
+    let (serving, mut peer) = serve_peer(server);
     ask(&mut peer, "Hold", 1).await;
     gate.started.notified().await;
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        !served.is_finished(),
+        !serving.is_finished(),
         "a busy connection was closed as idle"
     );
 
     gate.release.notify_one();
     let answer = peer.next().await.unwrap().unwrap();
     assert_eq!(answer.get("_answer"), Some(&b"0"[..]));
-    let result = ended(served).await;
+    let result = ended(serving).await;
     assert!(timed_out(&result), "{result:?}");
 }
 
@@ -1209,7 +1213,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let (peer, server_io) = tokio::io::duplex(256);
-    let served = tokio::spawn(server.serve_connection(server_io));
+    let serving = tokio::spawn(server.serve_connection(server_io));
     drop(tokio::spawn(async move {
         let mut peer = tokio_util::codec::Framed::new(peer, AmpCodec::new());
         for i in 0..200u32 {
@@ -1220,7 +1224,7 @@ where
         }
         std::future::pending::<()>().await;
     }));
-    served
+    serving
 }
 
 /// The arguments of a `Sum`, for a request built by hand.
@@ -1245,8 +1249,8 @@ async fn a_peer_that_never_reads_its_replies_is_timed_out() {
     let server = Server::new(service)
         .idle_timeout(Duration::from_millis(200))
         .max_in_flight(16);
-    let served = serve_a_peer_that_never_reads(server);
-    let result = ended(served).await;
+    let serving = serve_a_peer_that_never_reads(server);
+    let result = ended(serving).await;
     assert!(timed_out(&result), "{result:?}");
 }
 
@@ -1261,13 +1265,13 @@ async fn shutdown_gives_up_on_a_peer_that_never_reads() {
         .shutdown(async {
             let _ = stopped.await;
         });
-    let served = serve_a_peer_that_never_reads(server);
+    let serving = serve_a_peer_that_never_reads(server);
     // Let the peer fill the pipe and the server fill the reply queue, so
     // that shutdown finds a connection with replies it cannot write.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!served.is_finished(), "closed before the shutdown signal");
+    assert!(!serving.is_finished(), "closed before the shutdown signal");
     stop.send(()).unwrap();
-    let result = ended(served).await;
+    let result = ended(serving).await;
     assert!(timed_out(&result), "{result:?}");
 }
 

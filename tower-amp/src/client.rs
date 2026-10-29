@@ -3,7 +3,7 @@ use std::fmt;
 use std::future::{Future, Ready, ready};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -228,6 +228,7 @@ impl Client {
     ///
     /// A reply that arrives after its call has timed out is discarded, and a
     /// request whose caller gave up before it was written is not sent.
+    #[must_use]
     pub fn with_timeout(mut self, limit: Duration) -> Client {
         self.timeout = Some(limit);
         self
@@ -236,9 +237,15 @@ impl Client {
     /// Calls the command that `arguments` belongs to and waits for its
     /// results.
     ///
+    /// # Errors
+    ///
     /// An error response from the peer comes back as [`Error::Command`] with
     /// the peer's code and description. Results that do not match
-    /// `C::Response` fail with [`Error::Deserialize`].
+    /// `C::Response` fail with [`Error::Deserialize`], and arguments that
+    /// cannot be turned into a box with [`Error::Serialize`]. A call fails
+    /// with [`Error::ConnectionClosed`] once the connection has ended, and
+    /// with [`Error::Timeout`] if the client has a timeout and the answer
+    /// does not arrive within it.
     pub async fn call<C>(&self, arguments: &C) -> Result<C::Response, Error>
     where
         C: Command + Serialize,
@@ -254,6 +261,13 @@ impl Client {
 
     /// Sends the command that `arguments` belongs to without asking for a
     /// reply. Returns once the request has been written to the connection.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Serialize`] if the arguments cannot be turned into
+    /// a box, with [`Error::ConnectionClosed`] if the connection ended before
+    /// the request was written, and with [`Error::Timeout`] if the client has
+    /// a timeout and it was not written within it.
     pub async fn notify<C>(&self, arguments: &C) -> Result<(), Error>
     where
         C: Command + Serialize,
@@ -348,6 +362,7 @@ impl Client {
 
     /// Whether the connection has ended, in which case every call fails
     /// with [`Error::ConnectionClosed`].
+    #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed.has_changed().is_err()
     }
@@ -446,9 +461,7 @@ async fn timeout<F: Future>(limit: Duration, future: F) -> Option<F::Output> {
 /// Locks `mutex`. A poisoned lock only means a task panicked while holding
 /// it, which nothing here can do, so the value is still sound to use.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]

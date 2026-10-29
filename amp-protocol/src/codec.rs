@@ -65,6 +65,7 @@ const DEFAULT_MAX_PAIRS: usize = 1024;
 impl AmpCodec {
     /// Creates a codec with the default limits: a frame length of 1 MiB and
     /// 1,024 pairs.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -78,6 +79,7 @@ impl AmpCodec {
     /// Set this to the largest box the peer could legitimately send. Each
     /// value is at most 65,535 bytes and each key at most 255, so the length
     /// is bounded by the number of pairs a box carries.
+    #[must_use]
     pub fn with_max_frame_length(max_frame_length: usize) -> Self {
         Self::with_limits(max_frame_length, DEFAULT_MAX_PAIRS)
     }
@@ -94,6 +96,7 @@ impl AmpCodec {
     /// request, `_answer` on an answer, and `_error`, `_error_code`, and
     /// `_error_description` on an error). A repeated key counts each time it
     /// appears.
+    #[must_use]
     pub fn with_limits(max_frame_length: usize, max_pairs: usize) -> Self {
         AmpCodec {
             max_frame_length,
@@ -166,9 +169,12 @@ impl Decoder for AmpCodec {
 impl Encoder<AmpBox> for AmpCodec {
     type Error = Error;
 
+    // `AmpBox` caps keys at 255 bytes and values at 65,535, so both lengths
+    // fit their two-byte prefix.
+    #[expect(clippy::cast_possible_truncation)]
     fn encode(&mut self, item: AmpBox, dst: &mut BytesMut) -> Result<(), Error> {
         dst.reserve(item.encoded_len());
-        for (key, value) in item.iter() {
+        for (key, value) in &item {
             dst.put_u16(key.len() as u16);
             dst.put_slice(key);
             dst.put_u16(value.len() as u16);
@@ -367,7 +373,10 @@ mod test {
         let mut amp_box = AmpBox::new();
         for i in 0..1000u32 {
             let _ = amp_box
-                .insert(format!("k{i:03}"), vec![i as u8; 100])
+                .insert(
+                    format!("k{i:03}"),
+                    vec![u8::try_from(i % 256).unwrap(); 100],
+                )
                 .unwrap();
         }
         let bytes = amp_box.encode();
@@ -378,19 +387,18 @@ mod test {
         // A chunk size that never lines up with a pair.
         for chunk in bytes.chunks(97) {
             buf.extend_from_slice(chunk);
-            match codec.decode(&mut buf).unwrap() {
-                Some(amp_box) => decoded = Some(amp_box),
-                None => {
-                    assert_eq!(
-                        codec.scanned.bytes % PAIR_LEN,
-                        0,
-                        "scan stops at a pair boundary"
-                    );
-                    assert!(
-                        buf.len() - codec.scanned.bytes < PAIR_LEN,
-                        "scan covers every whole pair"
-                    );
-                }
+            if let Some(amp_box) = codec.decode(&mut buf).unwrap() {
+                decoded = Some(amp_box);
+            } else {
+                assert_eq!(
+                    codec.scanned.bytes % PAIR_LEN,
+                    0,
+                    "scan stops at a pair boundary"
+                );
+                assert!(
+                    buf.len() - codec.scanned.bytes < PAIR_LEN,
+                    "scan covers every whole pair"
+                );
             }
         }
         assert_eq!(decoded.unwrap(), amp_box);

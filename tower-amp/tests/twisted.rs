@@ -1,4 +1,8 @@
 #![expect(unused_crate_dependencies)]
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "`Divide` answers with a float, so its integer operands need not survive exactly"
+)]
 //! Interoperability with Twisted, the reference implementation of AMP: this
 //! crate's server against Twisted's client, and this crate's client against
 //! Twisted's server, with each side calling a command on the other inside

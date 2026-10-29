@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     match failed {
         Err(Error::Command { code, description }) => {
-            println!("1 / 0 failed as expected: {code} ({description})")
+            println!("1 / 0 failed as expected: {code} ({description})");
         }
         Ok(quotient) => println!("1 / 0 unexpectedly gave {}", quotient.result),
         Err(err) => return Err(err.into()),

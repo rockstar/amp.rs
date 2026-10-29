@@ -11,6 +11,15 @@ use crate::Error;
 /// A field holding a sequence of scalars becomes a `ListOf`, and a sequence
 /// of structs or maps becomes an `AmpList`. The crate README lists how every
 /// Rust type maps to an AMP type.
+///
+/// # Errors
+///
+/// Fails with [`Error::NotABox`] if `value` is not a struct or map, or a
+/// wrapper around one, and with [`Error::Unsupported`] if a field has a type
+/// AMP cannot carry, such as a nested struct or an enum variant carrying
+/// data. A key or value too long for the wire fails with
+/// [`Error::Protocol`], and anything `value`'s own `Serialize`
+/// implementation rejects with [`Error::Message`].
 pub fn to_box<T>(value: &T) -> Result<AmpBox, Error>
 where
     T: Serialize + ?Sized,
@@ -635,14 +644,14 @@ mod test {
     fn newtype_structs_are_transparent() {
         #[derive(Serialize)]
         struct Id(u32);
-        assert_eq!(value(Id(7)), b"7");
-
         #[derive(Serialize)]
         struct Inner {
             v: u8,
         }
         #[derive(Serialize)]
         struct Wrapper(Inner);
+        assert_eq!(value(Id(7)), b"7");
+
         let amp_box = to_box(&Wrapper(Inner { v: 1 })).unwrap();
         assert_eq!(amp_box.get("v"), Some(&b"1"[..]));
     }
@@ -751,9 +760,9 @@ mod test {
 
     #[test]
     fn unit_is_an_empty_box() {
-        assert!(to_box(&()).unwrap().is_empty());
         #[derive(Serialize)]
         struct Unit;
+        assert!(to_box(&()).unwrap().is_empty());
         assert!(to_box(&Unit).unwrap().is_empty());
     }
 

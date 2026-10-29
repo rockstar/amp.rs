@@ -1,2 +1,5 @@
 allow-expect-in-tests = true
 allow-unwrap-in-tests = true
+# AMP type names from the README's table, and this crate's own name, read
+# fine without backticks. `".."` keeps clippy's default list.
+doc-valid-idents = ["..", "AmpList", "DateTime", "ListOf", "serde_amp"]

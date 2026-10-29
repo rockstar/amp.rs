@@ -30,6 +30,17 @@ pub(crate) const MAX_DEPTH: usize = 32;
 /// values carry no type of their own, so every buffered value arrives as a
 /// string. An integer or boolean field behind `flatten` fails with serde's
 /// "invalid type: string" error.
+///
+/// # Errors
+///
+/// Fails with [`Error::NotABox`] if `T` is not a struct or map, or a wrapper
+/// around one, and with [`Error::Unsupported`] if a field has a type AMP
+/// cannot carry, such as a nested struct. A value that does not parse as its
+/// field's type fails with [`Error::InvalidValueForKey`], or with
+/// [`Error::InvalidValue`] when it is a map key. A malformed list fails with
+/// [`Error::Protocol`], and one nested past the limit with
+/// [`Error::TooDeep`]. Anything `T`'s own `Deserialize` implementation
+/// rejects, such as a missing field, fails with [`Error::Message`].
 pub fn from_box<'a, T>(amp_box: &'a AmpBox) -> Result<T, Error>
 where
     T: Deserialize<'a>,
@@ -461,7 +472,7 @@ struct ElementDeserializer<'de, 'c> {
     depth: usize,
 }
 
-impl<'de, 'c> ElementDeserializer<'de, 'c> {
+impl<'de> ElementDeserializer<'de, '_> {
     fn scalar(self) -> Result<ValueDeserializer<'de>, Error> {
         let expected = "a length-prefixed list element";
         let len = match self.bytes.get(..2) {
@@ -500,7 +511,7 @@ macro_rules! scalar_element {
     };
 }
 
-impl<'de, 'c> de::Deserializer<'de> for ElementDeserializer<'de, 'c> {
+impl<'de> de::Deserializer<'de> for ElementDeserializer<'de, '_> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
@@ -647,6 +658,11 @@ mod test {
     /// was wrong.
     #[test]
     fn invalid_values_name_their_key() {
+        #[derive(Deserialize, Debug)]
+        struct Item {
+            #[expect(dead_code)]
+            inner: u8,
+        }
         let err = value::<i32>(b"xy").unwrap_err();
         assert!(matches!(
             &err,
@@ -678,11 +694,6 @@ mod test {
 
         // An element inside a list of boxes reports its own key, not the
         // key of the list.
-        #[derive(Deserialize, Debug)]
-        struct Item {
-            #[expect(dead_code)]
-            inner: u8,
-        }
         assert!(matches!(
             value::<Vec<Item>>(b"\x00\x05inner\x00\x02xy\x00\x00"),
             Err(Error::InvalidValueForKey { key, .. }) if key == "inner"
@@ -698,6 +709,8 @@ mod test {
     }
 
     #[test]
+    // Parsing must reproduce each value exactly, so these compare exactly.
+    #[expect(clippy::float_cmp)]
     fn floats_as_twisted_writes_them() {
         assert_eq!(value::<f64>(b"12.9").unwrap(), 12.9);
         assert_eq!(value::<f32>(b"12.9").unwrap(), 12.9);
@@ -751,7 +764,7 @@ mod test {
         impl<'de> Deserialize<'de> for Raw {
             fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 struct V;
-                impl<'de> Visitor<'de> for V {
+                impl Visitor<'_> for V {
                     type Value = Raw;
                     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                         f.write_str("bytes")
@@ -867,15 +880,15 @@ mod test {
             #[serde(rename = "slow")]
             Slow,
         }
-        assert_eq!(value::<Mode>(b"Fast").unwrap(), Mode::Fast);
-        assert_eq!(value::<Mode>(b"slow").unwrap(), Mode::Slow);
-        assert!(matches!(value::<Mode>(b"Medium"), Err(Error::Message(_))));
-
         #[derive(Deserialize, Debug)]
         enum Data {
             #[expect(dead_code)]
             Newtype(u8),
         }
+        assert_eq!(value::<Mode>(b"Fast").unwrap(), Mode::Fast);
+        assert_eq!(value::<Mode>(b"slow").unwrap(), Mode::Slow);
+        assert!(matches!(value::<Mode>(b"Medium"), Err(Error::Message(_))));
+
         assert!(matches!(
             value::<Data>(b"Newtype"),
             Err(Error::Unsupported("an enum variant carrying data"))
@@ -886,10 +899,10 @@ mod test {
     fn newtype_structs_are_transparent() {
         #[derive(Deserialize, Debug, PartialEq)]
         struct Id(u32);
-        assert_eq!(value::<Id>(b"7").unwrap(), Id(7));
-
         #[derive(Deserialize, Debug, PartialEq)]
         struct Wrapper(One<u8>);
+        assert_eq!(value::<Id>(b"7").unwrap(), Id(7));
+
         let mut amp_box = AmpBox::new();
         let _ = amp_box.insert("v", "1").unwrap();
         assert_eq!(
@@ -911,7 +924,7 @@ mod test {
         assert_eq!(value::<Vec<u32>>(b"").unwrap(), Vec::<u32>::new());
         assert_eq!(
             value::<Vec<String>>(b"\x00\x00\x00\x01x").unwrap(),
-            vec!["".to_string(), "x".to_string()]
+            vec![String::new(), "x".to_string()]
         );
         assert_eq!(value::<[u8; 2]>(b"\x00\x011\x00\x012").unwrap(), [1, 2]);
         assert_eq!(
@@ -948,6 +961,11 @@ mod test {
 
     #[test]
     fn malformed_lists_are_errors_not_panics() {
+        #[derive(Deserialize, Debug)]
+        struct Item {
+            #[expect(dead_code)]
+            inner: u8,
+        }
         assert!(matches!(
             value::<Vec<u8>>(b"\x00"),
             Err(Error::InvalidValueForKey { .. })
@@ -956,11 +974,6 @@ mod test {
             value::<Vec<u8>>(b"\x00\x051"),
             Err(Error::InvalidValueForKey { .. })
         ));
-        #[derive(Deserialize, Debug)]
-        struct Item {
-            #[expect(dead_code)]
-            inner: u8,
-        }
         assert!(matches!(
             value::<Vec<Item>>(b"\x00\x05inner\x00\x011"),
             Err(Error::Protocol(amp_protocol::Error::Incomplete))
@@ -1012,12 +1025,12 @@ mod test {
 
     #[test]
     fn unit_reads_from_any_box() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Unit;
         let mut amp_box = AmpBox::new();
         let _ = amp_box.insert("v", "1").unwrap();
         from_box::<()>(&amp_box).unwrap();
         from_box::<()>(&AmpBox::new()).unwrap();
-        #[derive(Deserialize, Debug, PartialEq)]
-        struct Unit;
         assert_eq!(from_box::<Unit>(&amp_box).unwrap(), Unit);
     }
 
@@ -1033,6 +1046,28 @@ mod test {
             a: u8,
             #[serde(flatten)]
             inner: Strings,
+        }
+        #[derive(Deserialize, Debug)]
+        struct Number {
+            #[expect(dead_code)]
+            s: u32,
+        }
+        #[derive(Deserialize, Debug)]
+        struct OuterNumber {
+            #[serde(flatten)]
+            #[expect(dead_code)]
+            inner: Number,
+        }
+        #[derive(Deserialize, Debug)]
+        struct Flag {
+            #[expect(dead_code)]
+            s: bool,
+        }
+        #[derive(Deserialize, Debug)]
+        struct OuterFlag {
+            #[serde(flatten)]
+            #[expect(dead_code)]
+            inner: Flag,
         }
         let mut amp_box = AmpBox::new();
         let _ = amp_box.insert("a", "1").unwrap();
@@ -1050,34 +1085,12 @@ mod test {
 
         // The same box fails as soon as a flattened field is not a string,
         // because serde buffers flattened values without their types.
-        #[derive(Deserialize, Debug)]
-        struct Number {
-            #[expect(dead_code)]
-            s: u32,
-        }
-        #[derive(Deserialize, Debug)]
-        struct OuterNumber {
-            #[serde(flatten)]
-            #[expect(dead_code)]
-            inner: Number,
-        }
         let _ = amp_box.insert("s", "13").unwrap();
         assert!(matches!(
             from_box::<OuterNumber>(&amp_box),
             Err(Error::Message(message)) if message == "invalid type: string \"13\", expected u32"
         ));
 
-        #[derive(Deserialize, Debug)]
-        struct Flag {
-            #[expect(dead_code)]
-            s: bool,
-        }
-        #[derive(Deserialize, Debug)]
-        struct OuterFlag {
-            #[serde(flatten)]
-            #[expect(dead_code)]
-            inner: Flag,
-        }
         let _ = amp_box.insert("s", "True").unwrap();
         assert!(matches!(
             from_box::<OuterFlag>(&amp_box),
@@ -1114,8 +1127,21 @@ mod test {
         fn boxes(levels: usize) -> Vec<u8> {
             let mut bytes = Vec::new();
             for _ in 0..levels {
-                let len = (bytes.len() as u16).to_be_bytes();
+                let len = u16::try_from(bytes.len()).unwrap().to_be_bytes();
                 bytes = [b"\x00\x01v", &len[..], &bytes, b"\x00\x00"].concat();
+            }
+            bytes
+        }
+        /// A newtype around a list of itself, so that a `ListOf` nests
+        /// length-prefixed values.
+        #[derive(Deserialize, Debug)]
+        struct List(Vec<List>);
+        /// One list holding one list, and so on, `levels` deep.
+        fn lists(levels: usize) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for _ in 0..levels {
+                let len = u16::try_from(bytes.len()).unwrap().to_be_bytes();
+                bytes = [&len[..], &bytes].concat();
             }
             bytes
         }
@@ -1130,18 +1156,7 @@ mod test {
             Err(Error::TooDeep)
         ));
 
-        // The same through `ListOf` rather than `AmpList`: a newtype around
-        // a list of itself nests length-prefixed values.
-        #[derive(Deserialize, Debug)]
-        struct List(Vec<List>);
-        fn lists(levels: usize) -> Vec<u8> {
-            let mut bytes = Vec::new();
-            for _ in 0..levels {
-                let len = (bytes.len() as u16).to_be_bytes();
-                bytes = [&len[..], &bytes].concat();
-            }
-            bytes
-        }
+        // The same through `ListOf` rather than `AmpList`.
         assert_eq!(value::<List>(&lists(MAX_DEPTH - 1)).unwrap().0.len(), 1);
         assert!(matches!(
             value::<List>(&lists(MAX_DEPTH)),

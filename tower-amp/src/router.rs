@@ -48,6 +48,7 @@ impl<S> fmt::Debug for Router<S> {
 
 impl Router<()> {
     /// Creates a router with no state.
+    #[must_use]
     pub fn new() -> Self {
         Router::with_state(())
     }
@@ -78,6 +79,7 @@ where
     /// If a command with the same name is already registered. Two commands
     /// cannot share a name on the wire, and the second one silently winning
     /// is a bug that is easier to find at startup than later.
+    #[must_use]
     pub fn command<C>(mut self) -> Self
     where
         C: HandleWith<S> + DeserializeOwned + Send + 'static,

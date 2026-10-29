@@ -138,6 +138,7 @@ where
     /// a peer may send with [`AmpCodec::with_max_frame_length`] or
     /// [`AmpCodec::with_limits`]. The default refuses a box longer than
     /// 1 MiB or with more than 1,024 pairs.
+    #[must_use]
     pub fn codec(mut self, codec: AmpCodec) -> Self {
         self.codec = codec;
         self
@@ -170,6 +171,7 @@ where
     ///
     /// If `limit` is zero, since a connection that may never read a request
     /// would hang its peer.
+    #[must_use]
     pub fn max_in_flight(mut self, limit: usize) -> Self {
         assert!(
             limit > 0,
@@ -218,6 +220,7 @@ where
     /// are given that long after the hang-up and then cancelled, so a peer
     /// that fills the in-flight limit with notifications to a slow command,
     /// hangs up, and reconnects holds no more than the limit allows.
+    #[must_use]
     pub fn idle_timeout(mut self, limit: Duration) -> Self {
         self.idle_timeout = Some(limit);
         self
@@ -228,6 +231,7 @@ where
     /// a peer that hangs up may leave the handlers of its notifications
     /// running until they finish. For a server whose peers are trusted and
     /// keep a connection open between calls any distance apart.
+    #[must_use]
     pub fn no_idle_timeout(mut self) -> Self {
         self.idle_timeout = None;
         self
@@ -255,6 +259,7 @@ where
     ///
     /// If `limit` is zero, since a server that may never accept a
     /// connection would serve nobody.
+    #[must_use]
     pub fn max_connections(mut self, limit: usize) -> Self {
         assert!(limit > 0, "a server must be allowed a connection");
         self.max_connections = Some(limit);
@@ -304,11 +309,14 @@ where
     /// Accepts connections on `listener` and serves each one on its own
     /// task, as [`serve`] does, with this server's options.
     ///
-    /// Returns when accepting a connection fails for good, as `serve`
-    /// does, or with `Ok(())` once the [shutdown](Server::shutdown) signal
-    /// has completed and every connection has closed. An accept error that
-    /// ends `serve` ends this the same way: the connections finish what
-    /// they have received and the error is returned.
+    /// Returns `Ok(())` once the [shutdown](Server::shutdown) signal has
+    /// completed and every connection has closed.
+    ///
+    /// # Errors
+    ///
+    /// Fails when accepting a connection fails for good, as [`serve`] does,
+    /// with that error, once the connections have finished what they had
+    /// received.
     pub async fn serve(self, listener: TcpListener) -> Result<(), Error> {
         let Server {
             service,
@@ -407,9 +415,7 @@ where
     /// Serves one connection until the peer closes it, as
     /// [`serve_connection`] does, with this server's options.
     ///
-    /// Returns once the peer closes the connection, or with the error that
-    /// ended the connection, as `serve_connection` does, which includes the
-    /// [idle timeout](Server::idle_timeout) running out. With a
+    /// Returns once the peer closes the connection. With a
     /// [shutdown](Server::shutdown) signal, it also returns `Ok(())` once
     /// the signal has completed and the requests received before it were
     /// answered. The [connection limit](Server::max_connections) does not
@@ -418,6 +424,12 @@ where
     /// `io` need not be a socket, so nothing is done to its options. An
     /// accept loop of your own should set `TCP_NODELAY` on each
     /// `TcpStream`, as [`serve`] does.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the error that ended the connection, as
+    /// [`serve_connection`] does, which includes the
+    /// [idle timeout](Server::idle_timeout) running out.
     pub async fn serve_connection<T>(self, io: T) -> Result<(), Error>
     where
         T: AsyncRead + AsyncWrite,
@@ -459,6 +471,11 @@ where
 /// There is no limit on the number of connections; [`Server`] serves with
 /// one, with another codec, in-flight limit, or idle timeout, and with a
 /// way to stop.
+///
+/// # Errors
+///
+/// Fails only with an accept error that says the listener is gone, as
+/// described above, once the connections already accepted have finished.
 pub async fn serve<S>(listener: TcpListener, service: S) -> Result<(), Error>
 where
     S: Service<Request, Response = AmpBox> + Clone + Send + 'static,
@@ -556,6 +573,13 @@ fn listener_is_gone(err: &io::Error) -> bool {
 /// sent. The [idle timeout](Server::idle_timeout) gives such a handler that
 /// long after the hang-up, then cancels it too, and `serve_connection`
 /// returns once those have finished or been cancelled.
+///
+/// # Errors
+///
+/// Fails with the error that ended the connection: [`Error::Io`] for an I/O
+/// error, including one of kind `TimedOut` when the connection has sat idle
+/// for five minutes, or [`Error::Protocol`] for a box from the peer that
+/// broke the protocol, such as one longer than the codec allows.
 pub async fn serve_connection<T, S>(io: T, service: S) -> Result<(), Error>
 where
     T: AsyncRead + AsyncWrite,
@@ -762,7 +786,7 @@ mod log_test {
             .shutdown(async move {
                 let _ = stopped.await;
             });
-        let served = tokio::spawn(server.serve(listener));
+        let serving = tokio::spawn(server.serve(listener));
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut client = Client::new(stream);
         // One call so the connection is up, then nothing until it is cut
@@ -781,7 +805,7 @@ mod log_test {
         .await
         .expect("the idle timeout should end the connection");
         stop.send(()).unwrap();
-        served.await.unwrap().unwrap();
+        serving.await.unwrap().unwrap();
 
         let timed_out: Vec<_> = log
             .lines()

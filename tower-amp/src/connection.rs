@@ -154,6 +154,7 @@ where
     /// Not available on wasm32-unknown-unknown, where there is no tokio
     /// runtime to time a wait with.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[must_use]
     pub fn idle_timeout(mut self, limit: Duration) -> Self {
         self.idle_timeout = Some(limit);
         self
@@ -176,8 +177,7 @@ where
     /// its handles.
     ///
     /// Returns once the peer closes the connection, or with the error that
-    /// ended it: an I/O error, or a box from the peer that broke the
-    /// protocol. Either way the handlers of the requests still in flight are
+    /// ended it. Either way the handlers of the requests still in flight are
     /// cancelled, as [`serve_connection`] describes, except those of
     /// notifications, which finish first. Dropping the future closes the
     /// connection; dropping its handles does not.
@@ -198,6 +198,13 @@ where
     /// waiting on any more are discarded. There is no idle timeout unless
     /// [`idle_timeout`](Connection::idle_timeout) set one, so without it a
     /// peer that stops reading holds the connection for good.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the error that ended the connection: [`Error::Io`] for an
+    /// I/O error, including one of kind `TimedOut` when the
+    /// [`idle_timeout`](Connection::idle_timeout) runs out, or
+    /// [`Error::Protocol`] for a box from the peer that broke the protocol.
     ///
     /// [`serve_connection`]: crate::serve_connection
     pub async fn serve<S>(self, service: S) -> Result<(), Error>
@@ -257,6 +264,10 @@ where
     /// is recorded in the cause before anything that holds a reply sender is
     /// let go of: the entries of `pending`, the futures, and the queue
     /// behind the handles.
+    // The reader and writer below share the connection's state and have to
+    // be dropped in a set order on every way out, which keeps them in one
+    // body.
+    #[expect(clippy::too_many_lines)]
     pub(crate) async fn run<S, F>(
         self,
         service: S,
@@ -323,31 +334,29 @@ where
             // limit; see below. Handled before anything else is read.
             let mut held = None;
             loop {
-                let message = match held.take() {
-                    Some(request) => Message::Request(request),
-                    None => {
-                        // `biased` so that a shutdown is seen even while
-                        // the peer keeps the stream ready. A `next` that
-                        // loses to it is dropped with nothing read, since
-                        // the frame stays in the codec's buffer. The idle
-                        // timer starts over with each box.
-                        let incoming = tokio::select! {
-                            biased;
-                            () = &mut shutdown => return Ok(()),
-                            limit = idle(idle_timeout, &in_flight, max_in_flight) => {
-                                return Err(timed_out(limit, "sent"));
-                            }
-                            next = stream.next() => match next {
-                                Some(incoming) => incoming?,
-                                None => {
-                                    // The peer closed the connection.
-                                    handlers.cancel();
-                                    return Ok(());
-                                }
-                            },
-                        };
-                        Message::from_box(incoming)?
-                    }
+                let message = if let Some(request) = held.take() {
+                    Message::Request(request)
+                } else {
+                    // `biased` so that a shutdown is seen even while the
+                    // peer keeps the stream ready. A `next` that loses to
+                    // it is dropped with nothing read, since the frame
+                    // stays in the codec's buffer. The idle timer starts
+                    // over with each box.
+                    let incoming = tokio::select! {
+                        biased;
+                        () = &mut shutdown => return Ok(()),
+                        limit = idle(idle_timeout, &in_flight, max_in_flight) => {
+                            return Err(timed_out(limit, "sent"));
+                        }
+                        next = stream.next() => if let Some(incoming) = next {
+                            incoming?
+                        } else {
+                            // The peer closed the connection.
+                            handlers.cancel();
+                            return Ok(());
+                        },
+                    };
+                    Message::from_box(incoming)?
                 };
                 match message {
                     Message::Request(request) => {
@@ -395,19 +404,18 @@ where
                                     Err(_closed) => return Ok(()),
                                 },
                                 () = calling.notified(), if !reading => {}
-                                next = stream.next(), if reading => match next {
-                                    Some(incoming) => match Message::from_box(incoming?)? {
+                                next = stream.next(), if reading => if let Some(incoming) = next {
+                                    match Message::from_box(incoming?)? {
                                         Message::Request(request) => match held {
                                             None => held = Some(request),
                                             Some(_) => refuse(request, &responses).await,
                                         },
                                         Message::Answer(answer) => answered(pending, answer),
-                                        Message::Error(error) => failed(pending, error),
-                                    },
-                                    None => {
-                                        handlers.cancel();
-                                        return Ok(());
+                                        Message::Error(error) => failed(pending, &error),
                                     }
+                                } else {
+                                    handlers.cancel();
+                                    return Ok(());
                                 },
                             }
                         };
@@ -421,7 +429,7 @@ where
                         ));
                     }
                     Message::Answer(answer) => answered(pending, answer),
-                    Message::Error(error) => failed(pending, error),
+                    Message::Error(error) => failed(pending, &error),
                 }
             }
             // `responses` and `service` are dropped with this future, which
@@ -472,7 +480,7 @@ where
                             // it was queued is not worth the peer's time.
                             let abandoned = match &request.ask {
                                 Some(ask) => !lock(pending).contains_key(ask),
-                                None => written.as_ref().is_none_or(|reply| reply.is_closed()),
+                                None => written.as_ref().is_none_or(oneshot::Sender::is_closed),
                             };
                             if abandoned {
                                 continue;
@@ -583,7 +591,7 @@ async fn refuse(request: Request, responses: &mpsc::Sender<AmpBox>) {
 }
 
 /// Hands the peer's error to the call waiting for it, as [`answered`] does.
-fn failed(pending: &Mutex<Pending>, error: ErrorResponse) {
+fn failed(pending: &Mutex<Pending>, error: &ErrorResponse) {
     if let Some(reply) = lock(pending).remove(&error.error) {
         let _ = reply.send(Err(Error::new(
             String::from_utf8_lossy(&error.code),
@@ -689,7 +697,7 @@ async fn after(grace: Option<Duration>) {
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 async fn after(grace: Option<Duration>) {
     debug_assert!(grace.is_none(), "no idle timeout can be set on this target");
-    std::future::pending().await
+    std::future::pending::<()>().await;
 }
 
 /// Tells the callers of the notifications in `notified` that they have been

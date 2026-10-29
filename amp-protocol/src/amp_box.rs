@@ -244,7 +244,9 @@ fn decode_pairs(bytes: &[u8], max_pairs: usize) -> Result<(Vec<(&[u8], &[u8])>, 
 /// pair instead of a scan per pair.
 // The linear variant is a few hundred bytes larger than the map. It lives on
 // the stack for the length of one decode, and keeping it there is the point.
-#[allow(clippy::large_enum_variant)]
+// Slices are half the width on wasm32, so there the gap stays under the
+// lint's threshold and the `expect` would itself warn as unfulfilled.
+#[cfg_attr(not(target_family = "wasm"), expect(clippy::large_enum_variant))]
 enum Keys<'a> {
     Linear {
         keys: [&'a [u8]; LINEAR_SCAN_LIMIT],

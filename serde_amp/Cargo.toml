@@ -28,3 +28,6 @@ serde = { workspace = true, features = ["derive"] }
 [[bench]]
 name = "to_box"
 harness = false
+
+[lints]
+workspace = true

@@ -27,3 +27,9 @@ syn = "2"
 tokio = { version = "1.37", default-features = false }
 tokio-util = { version = "0.7", features = ["codec"] }
 tower = "0.5"
+
+# Lints shared by every crate. A crate opts in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+# `#[expect]` warns when the lint it silences stops firing, so a stale
+# silence cannot linger. `#[allow]` never does.
+allow_attributes = "deny"

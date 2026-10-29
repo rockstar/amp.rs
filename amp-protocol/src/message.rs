@@ -56,9 +56,9 @@ impl Request {
     /// or with a length error if `command` or `ask` is too long.
     pub fn into_box(self) -> Result<AmpBox, Error> {
         let mut amp_box = reject_reserved(self.arguments)?;
-        amp_box.insert(KEY_COMMAND, self.command)?;
+        let _ = amp_box.insert(KEY_COMMAND, self.command)?;
         if let Some(ask) = self.ask {
-            amp_box.insert(KEY_ASK, ask)?;
+            let _ = amp_box.insert(KEY_ASK, ask)?;
         }
         Ok(amp_box)
     }
@@ -104,7 +104,7 @@ impl Answer {
     /// with a length error if `answer` is too long.
     pub fn into_box(self) -> Result<AmpBox, Error> {
         let mut amp_box = reject_reserved(self.results)?;
-        amp_box.insert(KEY_ANSWER, self.answer)?;
+        let _ = amp_box.insert(KEY_ANSWER, self.answer)?;
         Ok(amp_box)
     }
 }
@@ -231,7 +231,7 @@ fn reject_reserved(amp_box: AmpBox) -> Result<AmpBox, Error> {
 /// the caller as an argument or result.
 fn strip_reserved(amp_box: &mut AmpBox) {
     for key in RESERVED_KEYS {
-        amp_box.remove(key);
+        let _ = amp_box.remove(key);
     }
 }
 
@@ -281,7 +281,7 @@ mod test {
     #[test]
     fn request_rejects_reserved_argument() {
         let mut arguments = args();
-        arguments.insert("_answer", "1").unwrap();
+        let _ = arguments.insert("_answer", "1").unwrap();
         assert!(matches!(
             Request::new("Sum", arguments).into_box(),
             Err(Error::ReservedKey(key)) if key == b"_answer"

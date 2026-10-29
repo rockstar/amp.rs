@@ -183,7 +183,7 @@ impl BoxBuilder {
         match value {
             Value::Absent => Ok(()),
             Value::Scalar(bytes) => {
-                self.amp_box.insert(key, bytes).map_err(Error::Protocol)?;
+                let _ = self.amp_box.insert(key, bytes).map_err(Error::Protocol)?;
                 Ok(())
             }
             Value::Box(_) => Err(Error::Unsupported("a nested struct or map")),
@@ -682,8 +682,8 @@ mod test {
     #[test]
     fn maps_with_scalar_keys() {
         let mut map = BTreeMap::new();
-        map.insert("b", 2_u8);
-        map.insert("a", 1_u8);
+        let _ = map.insert("b", 2_u8);
+        let _ = map.insert("a", 1_u8);
         let amp_box = to_box(&map).unwrap();
         assert_eq!(
             amp_box.iter().collect::<Vec<_>>(),
@@ -691,7 +691,7 @@ mod test {
         );
 
         let mut map = BTreeMap::new();
-        map.insert(1_u32, "x");
+        let _ = map.insert(1_u32, "x");
         assert_eq!(to_box(&map).unwrap().get("1"), Some(&b"x"[..]));
     }
 
@@ -811,7 +811,7 @@ mod test {
             }))
         ));
         let mut map = BTreeMap::new();
-        map.insert("", 1_u8);
+        let _ = map.insert("", 1_u8);
         assert!(matches!(
             to_box(&map),
             Err(Error::Protocol(amp_protocol::Error::EmptyKey))

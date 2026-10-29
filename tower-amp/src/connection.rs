@@ -847,7 +847,7 @@ fn fit(s: &str) -> &str {
 /// Spawns a task on the current tokio runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn spawn(task: impl Future<Output = ()> + Send + 'static) {
-    tokio::spawn(task);
+    drop(tokio::spawn(task));
 }
 
 /// Spawns a task on the host's event loop, since there is no tokio runtime

@@ -128,7 +128,7 @@ impl HandleWith<Session> for Set {
             // here if the failure is already known, and otherwise by the
             // accept loop below once its connection returns.
             if watcher.notify(&changed).await.is_err() {
-                store.watchers.lock().unwrap().remove(&id);
+                let _ = store.watchers.lock().unwrap().remove(&id);
             }
         }
         Ok(Previous { previous })
@@ -151,7 +151,7 @@ struct Subscribe {}
 
 impl HandleWith<Session> for Subscribe {
     async fn handle(self, session: Session) -> Result<(), Error> {
-        session
+        let _ = session
             .store
             .watchers
             .lock()
@@ -275,13 +275,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .service(router);
 
         let store = store.clone();
-        tokio::spawn(async move {
+        drop(tokio::spawn(async move {
             if let Err(err) = connection.serve(service).await {
                 eprintln!("connection from {peer} failed: {err}");
             }
             // Whether it subscribed or not; removing nothing is fine.
-            store.watchers.lock().unwrap().remove(&id);
-        });
+            let _ = store.watchers.lock().unwrap().remove(&id);
+        }));
     }
     Ok(())
 }

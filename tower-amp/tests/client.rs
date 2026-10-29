@@ -59,7 +59,7 @@ fn respond(request: &Request) -> Option<AmpBox> {
     match request.command.as_slice() {
         b"Sum" => {
             let mut results = AmpBox::new();
-            results
+            let _ = results
                 .insert("total", (argument("a") + argument("b")).to_string())
                 .unwrap();
             let ask = request.ask.as_ref()?;
@@ -270,7 +270,7 @@ async fn a_notification_from_the_peer_is_ignored() {
 async fn a_request_with_a_reserved_argument_fails_locally() {
     with_peer(|mut client| async move {
         let mut arguments = AmpBox::new();
-        arguments.insert("_answer", "no").unwrap();
+        let _ = arguments.insert("_answer", "no").unwrap();
         let request = Request::new("Sum", arguments.clone()).with_ask("x");
         let failed = Service::call(&mut client, request).await;
         assert_reserved(&failed, b"_answer");
@@ -312,8 +312,8 @@ async fn a_connection_answers_the_peer_and_calls_it() {
     let test = async move {
         // The peer asks, and the connection's router answers.
         let mut arguments = AmpBox::new();
-        arguments.insert("a", "1").unwrap();
-        arguments.insert("b", "2").unwrap();
+        let _ = arguments.insert("a", "1").unwrap();
+        let _ = arguments.insert("b", "2").unwrap();
         let request = Request::new("Sum", arguments).with_ask("7");
         peer.send(request.into_box().unwrap()).await.unwrap();
         let answer = next_box(&mut peer).await;
@@ -372,13 +372,13 @@ async fn a_client_learns_its_connection_closed_without_a_call() {
     // Whether the connection task sees the read half's end of stream or the
     // write half's broken pipe first depends on scheduling, so the cause is
     // not checked.
-    timeout(Duration::from_secs(2), client.closed())
+    let _ = timeout(Duration::from_secs(2), client.closed())
         .await
         .expect("the client never noticed");
     assert!(client.is_closed());
     assert!(clone.is_closed(), "every clone shares the connection");
     // Already closed, so this returns at once.
-    timeout(Duration::from_secs(2), clone.closed())
+    let _ = timeout(Duration::from_secs(2), clone.closed())
         .await
         .expect("closed did not return at once");
     let failed = client.call(&Sum { a: 1, b: 1 }).await;

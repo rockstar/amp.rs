@@ -293,7 +293,7 @@ impl Client {
                     .fetch_add(1, Ordering::Relaxed)
                     .to_string()
                     .into();
-                lock(&self.pending).insert(ask.clone(), reply);
+                let _ = lock(&self.pending).insert(ask.clone(), reply);
                 let waiting = Waiting {
                     ask: ask.clone(),
                     pending: &self.pending,
@@ -368,7 +368,7 @@ struct Waiting<'a> {
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        lock(self.pending).remove(&self.ask);
+        let _ = lock(self.pending).remove(&self.ask);
     }
 }
 

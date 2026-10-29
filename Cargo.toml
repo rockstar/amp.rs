@@ -34,6 +34,7 @@ missing_docs = "deny"
 unreachable_pub = "deny"
 unsafe_code = "deny"
 unused_crate_dependences = "deny"
+unused_results = "deny"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"

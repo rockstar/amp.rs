@@ -610,7 +610,7 @@ mod test {
 
     fn value<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
         let mut amp_box = AmpBox::new();
-        amp_box.insert("v", bytes).unwrap();
+        let _ = amp_box.insert("v", bytes).unwrap();
         from_box::<One<T>>(&amp_box).map(|one| one.v)
     }
 
@@ -690,7 +690,7 @@ mod test {
 
         // A map key has no key of its own.
         let mut amp_box = AmpBox::new();
-        amp_box.insert("x", "1").unwrap();
+        let _ = amp_box.insert("x", "1").unwrap();
         assert!(matches!(
             from_box::<BTreeMap<u32, String>>(&amp_box),
             Err(Error::InvalidValue("an unsigned integer"))
@@ -778,9 +778,9 @@ mod test {
             c: Cow<'a, str>,
         }
         let mut amp_box = AmpBox::new();
-        amp_box.insert("s", "hello").unwrap();
-        amp_box.insert("b", b"\x00\xff".to_vec()).unwrap();
-        amp_box.insert("c", "cow").unwrap();
+        let _ = amp_box.insert("s", "hello").unwrap();
+        let _ = amp_box.insert("b", b"\x00\xff".to_vec()).unwrap();
+        let _ = amp_box.insert("c", "cow").unwrap();
         let borrowed: Borrowed = from_box(&amp_box).unwrap();
         assert_eq!(borrowed.s, "hello");
         assert_eq!(borrowed.b, b"\x00\xff");
@@ -791,7 +791,7 @@ mod test {
         assert!(matches!(
             from_box::<Borrowed>(&{
                 let mut amp_box = amp_box.clone();
-                amp_box.insert("s", b"\xff".to_vec()).unwrap();
+                let _ = amp_box.insert("s", b"\xff".to_vec()).unwrap();
                 amp_box
             }),
             Err(Error::InvalidValueForKey { .. })
@@ -815,7 +815,7 @@ mod test {
         }
         let mut amp_box = AmpBox::new();
         let list = b"\x00\x04name\x00\x01a\x00\x03raw\x00\x01\xff\x00\x00\x00\x04name\x00\x02bc\x00\x03raw\x00\x00\x00\x00";
-        amp_box.insert("v", list.to_vec()).unwrap();
+        let _ = amp_box.insert("v", list.to_vec()).unwrap();
         let list: List = from_box(&amp_box).unwrap();
         assert_eq!(list.v.len(), 2);
         assert_eq!(list.v[0].name, "a");
@@ -849,7 +849,7 @@ mod test {
             b: Option<u8>,
         }
         let mut amp_box = AmpBox::new();
-        amp_box.insert("b", "2").unwrap();
+        let _ = amp_box.insert("b", "2").unwrap();
         assert_eq!(
             from_box::<S>(&amp_box).unwrap(),
             S {
@@ -891,7 +891,7 @@ mod test {
         #[derive(Deserialize, Debug, PartialEq)]
         struct Wrapper(One<u8>);
         let mut amp_box = AmpBox::new();
-        amp_box.insert("v", "1").unwrap();
+        let _ = amp_box.insert("v", "1").unwrap();
         assert_eq!(
             from_box::<Wrapper>(&amp_box).unwrap(),
             Wrapper(One { v: 1 })
@@ -970,13 +970,13 @@ mod test {
     #[test]
     fn maps() {
         let mut amp_box = AmpBox::new();
-        amp_box.insert("a", "1").unwrap();
-        amp_box.insert("b", "2").unwrap();
+        let _ = amp_box.insert("a", "1").unwrap();
+        let _ = amp_box.insert("b", "2").unwrap();
         let map: HashMap<String, u8> = from_box(&amp_box).unwrap();
         assert_eq!(map["a"], 1);
         assert_eq!(map["b"], 2);
         let mut amp_box = AmpBox::new();
-        amp_box.insert("7", "x").unwrap();
+        let _ = amp_box.insert("7", "x").unwrap();
         let map: BTreeMap<u32, String> = from_box(&amp_box).unwrap();
         assert_eq!(map[&7], "x");
     }
@@ -984,8 +984,8 @@ mod test {
     #[test]
     fn unknown_keys_are_ignored_and_missing_keys_are_errors() {
         let mut amp_box = AmpBox::new();
-        amp_box.insert("other", b"\xff".to_vec()).unwrap();
-        amp_box.insert("v", "1").unwrap();
+        let _ = amp_box.insert("other", b"\xff".to_vec()).unwrap();
+        let _ = amp_box.insert("v", "1").unwrap();
         assert_eq!(from_box::<One<u8>>(&amp_box).unwrap(), One { v: 1 });
         assert!(matches!(
             from_box::<One<u8>>(&AmpBox::new()),
@@ -996,15 +996,15 @@ mod test {
     #[test]
     fn non_utf8_keys_are_ignored_like_any_other_unknown_key() {
         let mut amp_box = AmpBox::new();
-        amp_box.insert(b"\xff\xfe".to_vec(), "ignored").unwrap();
-        amp_box.insert("v", "1").unwrap();
+        let _ = amp_box.insert(b"\xff\xfe".to_vec(), "ignored").unwrap();
+        let _ = amp_box.insert("v", "1").unwrap();
         assert_eq!(from_box::<One<u8>>(&amp_box).unwrap(), One { v: 1 });
     }
 
     #[test]
     fn top_level_must_be_a_struct_or_map() {
         let mut amp_box = AmpBox::new();
-        amp_box.insert("v", "1").unwrap();
+        let _ = amp_box.insert("v", "1").unwrap();
         assert!(matches!(from_box::<u8>(&amp_box), Err(Error::NotABox)));
         assert!(matches!(from_box::<String>(&amp_box), Err(Error::NotABox)));
         assert!(matches!(from_box::<Vec<u8>>(&amp_box), Err(Error::NotABox)));
@@ -1013,7 +1013,7 @@ mod test {
     #[test]
     fn unit_reads_from_any_box() {
         let mut amp_box = AmpBox::new();
-        amp_box.insert("v", "1").unwrap();
+        let _ = amp_box.insert("v", "1").unwrap();
         from_box::<()>(&amp_box).unwrap();
         from_box::<()>(&AmpBox::new()).unwrap();
         #[derive(Deserialize, Debug, PartialEq)]
@@ -1035,8 +1035,8 @@ mod test {
             inner: Strings,
         }
         let mut amp_box = AmpBox::new();
-        amp_box.insert("a", "1").unwrap();
-        amp_box.insert("s", "x").unwrap();
+        let _ = amp_box.insert("a", "1").unwrap();
+        let _ = amp_box.insert("s", "x").unwrap();
         assert_eq!(
             from_box::<Outer>(&amp_box).unwrap(),
             Outer {
@@ -1061,7 +1061,7 @@ mod test {
             #[expect(dead_code)]
             inner: Number,
         }
-        amp_box.insert("s", "13").unwrap();
+        let _ = amp_box.insert("s", "13").unwrap();
         assert!(matches!(
             from_box::<OuterNumber>(&amp_box),
             Err(Error::Message(message)) if message == "invalid type: string \"13\", expected u32"
@@ -1078,7 +1078,7 @@ mod test {
             #[expect(dead_code)]
             inner: Flag,
         }
-        amp_box.insert("s", "True").unwrap();
+        let _ = amp_box.insert("s", "True").unwrap();
         assert!(matches!(
             from_box::<OuterFlag>(&amp_box),
             Err(Error::Message(message)) if message.starts_with("invalid type: string")
@@ -1093,7 +1093,7 @@ mod test {
             inner: One<u8>,
         }
         let mut amp_box = AmpBox::new();
-        amp_box.insert("inner", "").unwrap();
+        let _ = amp_box.insert("inner", "").unwrap();
         assert!(matches!(
             from_box::<Outer>(&amp_box),
             Err(Error::Unsupported("a nested struct or map"))

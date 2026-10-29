@@ -366,7 +366,7 @@ mod test {
         const PAIR_LEN: usize = 2 + 4 + 2 + 100;
         let mut amp_box = AmpBox::new();
         for i in 0..1000u32 {
-            amp_box
+            let _ = amp_box
                 .insert(format!("k{i:03}"), vec![i as u8; 100])
                 .unwrap();
         }

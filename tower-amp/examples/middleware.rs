@@ -176,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    tokio::spawn(Server::new(service).serve(listener));
+    drop(tokio::spawn(Server::new(service).serve(listener)));
 
     let stream = TcpStream::connect(address).await?;
     stream.set_nodelay(true)?;
@@ -185,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total = client.call(&Sum { a: 13, b: 81 }).await?;
     println!("client: 13 + 81 = {}", total.total);
 
-    client.call(&Sleep { millis: 50 }).await?;
+    let _ = client.call(&Sleep { millis: 50 }).await?;
     println!("client: slept for 50 ms");
 
     // The timeout layer cuts this short; `peer_facing` gives it a code.

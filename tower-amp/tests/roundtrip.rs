@@ -126,7 +126,7 @@ struct Bump {}
 
 impl HandleWith<Counter> for Bump {
     async fn handle(self, counter: Counter) -> Result<(), Error> {
-        counter.0.fetch_add(1, Ordering::SeqCst);
+        let _ = counter.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -164,7 +164,7 @@ struct Counted(Running);
 
 impl Drop for Counted {
     fn drop(&mut self) {
-        self.0.0.fetch_sub(1, Ordering::SeqCst);
+        let _ = self.0.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -175,7 +175,7 @@ struct Linger {}
 
 impl HandleWith<Running> for Linger {
     async fn handle(self, running: Running) -> Result<(), Error> {
-        running.0.fetch_add(1, Ordering::SeqCst);
+        let _ = running.0.fetch_add(1, Ordering::SeqCst);
         let _counted = Counted(running);
         std::future::pending().await
     }
@@ -183,7 +183,7 @@ impl HandleWith<Running> for Linger {
 
 impl HandleWith<Counter> for Hang {
     async fn handle(self, counter: Counter) -> Result<(), Error> {
-        counter.0.fetch_add(1, Ordering::SeqCst);
+        let _ = counter.0.fetch_add(1, Ordering::SeqCst);
         std::future::pending().await
     }
 }
@@ -376,7 +376,9 @@ where
     S::Future: Send,
 {
     let (client_io, server_io) = tokio::io::duplex(4096);
-    tokio::spawn(tower_amp::serve_connection(server_io, service));
+    drop(tokio::spawn(tower_amp::serve_connection(
+        server_io, service,
+    )));
     Client::new(client_io)
 }
 
@@ -399,10 +401,12 @@ async fn a_handler_calls_a_command_on_the_peer_that_asked() {
     let (client_io, server_io) = tokio::io::duplex(4096);
     let served = Connection::new(server_io);
     let peer = served.client();
-    tokio::spawn(served.serve(Router::with_state(peer).command::<Relay>()));
+    drop(tokio::spawn(
+        served.serve(Router::with_state(peer).command::<Relay>()),
+    ));
     let calling = Connection::new(client_io);
     let client = calling.client();
-    tokio::spawn(calling.serve(Router::new().command::<Sum>()));
+    drop(tokio::spawn(calling.serve(Router::new().command::<Sum>())));
 
     let total = client.call(&Relay { a: 13, b: 81 }).await.unwrap();
     assert_eq!(total, Total { total: 94 });
@@ -430,8 +434,8 @@ async fn pipelining_past_the_limit_to_a_relaying_command_does_not_hang() {
     const REQUESTS: u64 = 258;
     for i in 0..REQUESTS {
         let mut args = AmpBox::new();
-        args.insert("a", i.to_string()).unwrap();
-        args.insert("b", "1").unwrap();
+        let _ = args.insert("a", i.to_string()).unwrap();
+        let _ = args.insert("b", "1").unwrap();
         let request = Request::new("Relay", args).with_ask(i.to_string());
         peer.send(request.into_box().unwrap()).await.unwrap();
     }
@@ -449,7 +453,7 @@ async fn pipelining_past_the_limit_to_a_relaying_command_does_not_hang() {
                         .parse()
                         .unwrap();
                     let mut results = AmpBox::new();
-                    results.insert("total", (a + 1).to_string()).unwrap();
+                    let _ = results.insert("total", (a + 1).to_string()).unwrap();
                     let answer = Answer::new(sum.ask.unwrap(), results).into_box().unwrap();
                     peer.send(answer).await.unwrap();
                 }
@@ -753,15 +757,15 @@ async fn results_with_a_reserved_key_are_answered_with_unknown() {
 #[test]
 #[should_panic(expected = "command \"Sum\" registered twice")]
 fn registering_a_command_name_twice_panics() {
-    Router::new().command::<Sum>().command::<SecondSum>();
+    let _ = Router::new().command::<Sum>().command::<SecondSum>();
 }
 
 #[tokio::test]
 async fn client_is_a_service() {
     let mut client = connect(router());
     let mut arguments = AmpBox::new();
-    arguments.insert("a", "1").unwrap();
-    arguments.insert("b", "2").unwrap();
+    let _ = arguments.insert("a", "1").unwrap();
+    let _ = arguments.insert("b", "2").unwrap();
     // The typed `Client::call` shadows `Service::call`, so the untyped form
     // is reached through the trait.
     let request = Request::new("Sum", arguments).with_ask("x");
@@ -783,12 +787,12 @@ async fn the_client_assigns_every_ask() {
     // through the service with that same ask must not evict it.
     let slow = client.call(&Sleep { millis: 50 });
     let mut arguments = AmpBox::new();
-    arguments.insert("a", "1").unwrap();
-    arguments.insert("b", "2").unwrap();
+    let _ = arguments.insert("a", "1").unwrap();
+    let _ = arguments.insert("b", "2").unwrap();
     let request = Request::new("Sum", arguments).with_ask("1");
     let fast = Service::call(&mut client.clone(), request);
     let (slow, fast) = tokio::join!(slow, fast);
-    slow.unwrap();
+    let _ = slow.unwrap();
     assert_eq!(fast.unwrap().get("total"), Some(&b"3"[..]));
 }
 
@@ -814,7 +818,7 @@ async fn pipelined_large_calls_do_not_deadlock() {
     for _ in 0..32 {
         let client = client.clone();
         let payload = payload.clone();
-        set.spawn(async move { client.call(&Echo { payload }).await.unwrap() });
+        let _ = set.spawn(async move { client.call(&Echo { payload }).await.unwrap() });
     }
     let all = async {
         while let Some(echoed) = set.join_next().await {
@@ -835,17 +839,17 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let (peer, server_io) = tokio::io::duplex(4096);
-    tokio::spawn(server.serve_connection(server_io));
+    drop(tokio::spawn(server.serve_connection(server_io)));
     // The peer's writes block once the server stops reading, so it runs on
     // its own task and keeps the pipe open by never finishing.
-    tokio::spawn(async move {
+    drop(tokio::spawn(async move {
         let mut peer = tokio_util::codec::Framed::new(peer, AmpCodec::new());
         for i in 0..2_000u32 {
             let request = Request::new("Hang", AmpBox::new()).with_ask(i.to_string());
             peer.send(request.into_box().unwrap()).await.unwrap();
         }
         std::future::pending::<()>().await;
-    });
+    }));
 
     // Give the server far longer than it needs to take on everything it is
     // going to, then check where it stopped.
@@ -1093,16 +1097,16 @@ async fn a_notifications_handler_is_cancelled_once_the_idle_timeout_passes() {
 #[tokio::test]
 async fn requests_past_the_limit_are_served_in_turn() {
     let (client_io, server_io) = tokio::io::duplex(4096);
-    tokio::spawn(
+    drop(tokio::spawn(
         Server::new(router())
             .max_in_flight(1)
             .serve_connection(server_io),
-    );
+    ));
     let client = Client::new(client_io);
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..3 {
         let client = client.clone();
-        set.spawn(async move { client.call(&Sleep { millis: 10 }).await.unwrap() });
+        let _ = set.spawn(async move { client.call(&Sleep { millis: 10 }).await.unwrap() });
     }
     let all = async {
         while let Some(slept) = set.join_next().await {
@@ -1205,7 +1209,7 @@ where
 {
     let (peer, server_io) = tokio::io::duplex(256);
     let served = tokio::spawn(server.serve_connection(server_io));
-    tokio::spawn(async move {
+    drop(tokio::spawn(async move {
         let mut peer = tokio_util::codec::Framed::new(peer, AmpCodec::new());
         for i in 0..200u32 {
             let request = Request::new("Sum", sum_args()).with_ask(i.to_string());
@@ -1214,15 +1218,15 @@ where
             }
         }
         std::future::pending::<()>().await;
-    });
+    }));
     served
 }
 
 /// The arguments of a `Sum`, for a request built by hand.
 fn sum_args() -> AmpBox {
     let mut args = AmpBox::new();
-    args.insert("a", "1").unwrap();
-    args.insert("b", "2").unwrap();
+    let _ = args.insert("a", "1").unwrap();
+    let _ = args.insert("b", "2").unwrap();
     args
 }
 
@@ -1407,7 +1411,10 @@ async fn server_rejects_a_box_over_its_pair_limit() {
 #[tokio::test]
 async fn client_rejects_an_answer_over_its_frame_limit() {
     let (client_io, server_io) = tokio::io::duplex(4096);
-    tokio::spawn(tower_amp::serve_connection(server_io, router()));
+    drop(tokio::spawn(tower_amp::serve_connection(
+        server_io,
+        router(),
+    )));
     let client = Client::with_codec(client_io, AmpCodec::with_max_frame_length(1024));
 
     let payload = "x".repeat(8_000);
@@ -1499,7 +1506,7 @@ async fn clones_take_their_own_timeout() {
 async fn the_service_form_honors_the_timeout() {
     let mut client = connect(router()).with_timeout(Duration::from_millis(20));
     let mut arguments = AmpBox::new();
-    arguments.insert("millis", "100").unwrap();
+    let _ = arguments.insert("millis", "100").unwrap();
     let request = Request::new("Sleep", arguments).with_ask("x");
     let failed = Service::call(&mut client, request).await;
     assert!(matches!(failed, Err(Error::Timeout)), "{failed:?}");
@@ -1562,18 +1569,20 @@ async fn a_relayed_results_mismatch_is_an_internal_error_to_the_peer() {
     let (client_io, server_io) = tokio::io::duplex(4096);
     let served = Connection::new(server_io);
     let peer = served.client();
-    tokio::spawn(served.serve(Router::with_state(peer).command::<Relay>()));
+    drop(tokio::spawn(
+        served.serve(Router::with_state(peer).command::<Relay>()),
+    ));
     let calling = Connection::new(client_io);
     let client = calling.client();
     // Answers `Sum` with a `total` that is not a number.
     let backend = tower::service_fn(|_: Request| async {
         let mut results = AmpBox::new();
-        results
+        let _ = results
             .insert("total", "db=postgres://svc:hunter2@10.0.0.7/prod")
             .unwrap();
         Ok::<_, Error>(results)
     });
-    tokio::spawn(calling.serve(backend));
+    drop(tokio::spawn(calling.serve(backend)));
 
     let failed = client.call(&Relay { a: 13, b: 81 }).await;
     assert!(
@@ -1615,7 +1624,7 @@ where
 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(tower_amp::serve(listener, service));
+    drop(tokio::spawn(tower_amp::serve(listener, service)));
     addr
 }
 
@@ -1733,7 +1742,7 @@ async fn a_server_frames_every_connection_with_its_codec() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = Server::new(router()).codec(AmpCodec::with_max_frame_length(1024));
-    tokio::spawn(server.serve(listener));
+    drop(tokio::spawn(server.serve(listener)));
 
     let client = connect_tcp(addr).await;
     let payload = "x".repeat(8_000);
@@ -1760,7 +1769,9 @@ async fn a_server_frames_every_connection_with_its_codec() {
 async fn the_connection_limit_holds_a_peer_until_one_closes() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(Server::new(router()).max_connections(1).serve(listener));
+    drop(tokio::spawn(
+        Server::new(router()).max_connections(1).serve(listener),
+    ));
 
     let first = connect_tcp(addr).await;
     let total = first.call(&Sum { a: 1, b: 2 }).await.unwrap();

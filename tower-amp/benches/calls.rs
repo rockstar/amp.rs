@@ -77,7 +77,7 @@ fn connect(transport: Transport) -> (Runtime, Client) {
         match transport {
             Transport::Pipe => {
                 let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-                tokio::spawn(tower_amp::serve_connection(server_io, router));
+                drop(tokio::spawn(tower_amp::serve_connection(server_io, router)));
                 Client::new(client_io)
             }
             Transport::Tcp => {
@@ -88,7 +88,7 @@ fn connect(transport: Transport) -> (Runtime, Client) {
                 let (server_io, _) = listener.accept().await.unwrap();
                 client_io.set_nodelay(true).unwrap();
                 server_io.set_nodelay(true).unwrap();
-                tokio::spawn(tower_amp::serve_connection(server_io, router));
+                drop(tokio::spawn(tower_amp::serve_connection(server_io, router)));
                 Client::new(client_io)
             }
         }
@@ -103,7 +103,7 @@ fn sequential(bencher: Bencher, transport: Transport) {
     bencher.counter(ItemsCount::new(CALLS)).bench(|| {
         runtime.block_on(async {
             for _ in 0..CALLS {
-                black_box(client.call(black_box(&sum)).await.unwrap());
+                let _ = black_box(client.call(black_box(&sum)).await.unwrap());
             }
         })
     });
@@ -117,7 +117,7 @@ fn pipelined(bencher: Bencher, transport: Transport) {
         runtime.block_on(async {
             let calls = (0..CALLS).map(|_| client.call(black_box(&sum)));
             for total in futures_util::future::join_all(calls).await {
-                black_box(total.unwrap());
+                let _ = black_box(total.unwrap());
             }
         })
     });

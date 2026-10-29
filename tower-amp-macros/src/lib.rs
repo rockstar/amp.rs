@@ -107,7 +107,7 @@ enum Arg {
 impl Parse for Arg {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let key: syn::Ident = input.parse()?;
-        input.parse::<Token![=]>()?;
+        let _ = input.parse::<Token![=]>()?;
         match key.to_string().as_str() {
             "name" => Ok(Arg::Name(key, input.parse()?)),
             "response" => Ok(Arg::Response(key, Box::new(input.parse()?))),

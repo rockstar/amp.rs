@@ -371,14 +371,14 @@ where
                         max_connections,
                         shutdown: shutdown.clone().cancelled_owned(),
                     };
-                    connections.spawn(async move {
+                    drop(connections.spawn(async move {
                         // The connection's share of `max_connections`, given
                         // back when the connection has ended.
                         let _permit = permit;
                         if let Err(err) = connection.serve_connection(stream).await {
                             log::connection_failed(&err);
                         }
-                    });
+                    }));
                 }
                 Err(err) => match retry_after(&err) {
                     Some(delay) => {
@@ -399,7 +399,7 @@ where
         // on them.
         drop(listener);
         shutdown.cancel();
-        connections.close();
+        let _ = connections.close();
         connections.wait().await;
         result
     }
@@ -653,11 +653,11 @@ mod log_test {
             .set_default();
 
         let (client_io, server_io) = tokio::io::duplex(4096);
-        tokio::spawn(serve_connection(server_io, service()));
+        drop(tokio::spawn(serve_connection(server_io, service())));
         let mut client = Client::new(client_io);
         for command in ["Boom", "Flaky", "Divide"] {
             let request = Request::new(command, AmpBox::new()).with_ask("x");
-            Service::call(&mut client, request).await.unwrap_err();
+            let _ = Service::call(&mut client, request).await.unwrap_err();
         }
 
         let lines = log.lines();
@@ -693,7 +693,7 @@ mod log_test {
             Err::<AmpBox, tower::BoxError>("db at 10.0.0.7:5432 refused the connection".into())
         });
         let (client_io, server_io) = tokio::io::duplex(4096);
-        tokio::spawn(serve_connection(server_io, service));
+        drop(tokio::spawn(serve_connection(server_io, service)));
         let mut client = Client::new(client_io);
         let request = Request::new("Lookup", AmpBox::new()).with_ask("x");
         let failed = Service::call(&mut client, request).await.unwrap_err();
@@ -725,10 +725,10 @@ mod log_test {
             .set_default();
 
         let (client_io, server_io) = tokio::io::duplex(4096);
-        tokio::spawn(serve_connection(server_io, service()));
+        drop(tokio::spawn(serve_connection(server_io, service())));
         let mut client = Client::new(client_io);
         let request = Request::new("Flaky", AmpBox::new());
-        Service::call(&mut client, request).await.unwrap();
+        let _ = Service::call(&mut client, request).await.unwrap();
         // A notification is answered before it is handled, so give the
         // server a moment. The subscriber is on this thread, so there is
         // no other thread to wait on.
@@ -768,7 +768,7 @@ mod log_test {
         // One call so the connection is up, then nothing until it is cut
         // off for it.
         let request = Request::new("Nope", AmpBox::new()).with_ask("x");
-        Service::call(&mut client, request).await.unwrap_err();
+        let _ = Service::call(&mut client, request).await.unwrap_err();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !log
                 .lines()
@@ -815,11 +815,11 @@ mod log_test {
             .set_default();
 
         let (client_io, server_io) = tokio::io::duplex(4096);
-        tokio::spawn(serve_connection(server_io, Router::new()));
+        drop(tokio::spawn(serve_connection(server_io, Router::new())));
         let mut client = Client::new(client_io);
         let command = "Nope\n2026-10-14 ERROR admin login \x1b[31msucceeded";
         let request = Request::new(command, AmpBox::new()).with_ask("x");
-        Service::call(&mut client, request).await.unwrap_err();
+        let _ = Service::call(&mut client, request).await.unwrap_err();
 
         let lines = log.lines();
         assert_eq!(lines.len(), 1, "{lines:#?}");
@@ -852,11 +852,11 @@ mod log_test {
             .set_default();
 
         let (client_io, server_io) = tokio::io::duplex(4096);
-        tokio::spawn(serve_connection(server_io, Router::new()));
+        drop(tokio::spawn(serve_connection(server_io, Router::new())));
         let mut client = Client::new(client_io);
         let command = "N".repeat(65_535);
         let request = Request::new(command, AmpBox::new()).with_ask("x");
-        Service::call(&mut client, request).await.unwrap_err();
+        let _ = Service::call(&mut client, request).await.unwrap_err();
 
         let lines = log.lines();
         assert_eq!(lines.len(), 1, "{lines:#?}");

@@ -32,7 +32,7 @@ const CHUNK: usize = 1460;
 fn large() -> Vec<u8> {
     let mut amp_box = AmpBox::new();
     for i in 0..LARGE_KEYS {
-        amp_box
+        let _ = amp_box
             .insert(format!("key{i:05}"), vec![b'v'; 50])
             .unwrap();
     }

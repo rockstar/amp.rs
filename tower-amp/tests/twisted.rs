@@ -157,7 +157,7 @@ fn peer(args: &[&str]) -> Command {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/twisted/peer.py");
     let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".into());
     let mut command = Command::new(python);
-    command
+    let _ = command
         .arg(script)
         .args(args)
         .stdin(Stdio::null())
@@ -177,7 +177,7 @@ async fn twisted_client_calls_this_server() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     // Each connection's router holds a handle to its own peer, for `Relay`.
-    tokio::spawn(async move {
+    drop(tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let connection = Connection::new(stream);
@@ -186,10 +186,9 @@ async fn twisted_client_calls_this_server() {
                 .command::<Divide>()
                 .command::<Relay>()
                 .command::<KitchenSink>();
-            tokio::spawn(connection.serve(router));
+            drop(tokio::spawn(connection.serve(router)));
         }
-    });
-
+    }));
     let client = peer(&["client", &port.to_string()]).spawn().unwrap();
     let output = tokio::time::timeout(Duration::from_secs(30), client.wait_with_output())
         .await
@@ -213,7 +212,7 @@ async fn this_client_calls_a_twisted_server() {
     let mut server = peer(&["server"]).spawn().unwrap();
     let mut stdout = BufReader::new(server.stdout.take().unwrap());
     let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(30), stdout.read_line(&mut line))
+    let _ = tokio::time::timeout(Duration::from_secs(30), stdout.read_line(&mut line))
         .await
         .expect("Twisted's server did not report its port")
         .unwrap();
@@ -225,7 +224,9 @@ async fn this_client_calls_a_twisted_server() {
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let connection = Connection::new(stream);
     let client = connection.client().with_timeout(Duration::from_secs(30));
-    tokio::spawn(connection.serve(Router::new().command::<Sum>()));
+    drop(tokio::spawn(
+        connection.serve(Router::new().command::<Sum>()),
+    ));
 
     let total = client.call(&Sum { a: 13, b: 81 }).await.unwrap();
     assert_eq!(total, Total { total: 94 });

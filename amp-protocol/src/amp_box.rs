@@ -33,7 +33,7 @@ impl AmpBox {
     {
         let mut amp_box = Self::new();
         for (key, value) in pairs {
-            amp_box.insert(key, value)?;
+            let _ = amp_box.insert(key, value)?;
         }
         Ok(amp_box)
     }
@@ -285,11 +285,11 @@ impl<'a> Keys<'a> {
             Keys::Linear { keys, .. } => {
                 let mut map = HashMap::with_capacity(LINEAR_SCAN_LIMIT * 2);
                 map.extend(keys.iter().copied().zip(0..));
-                map.insert(key, index);
+                let _ = map.insert(key, index);
                 *self = Keys::Indexed(map);
             }
             Keys::Indexed(map) => {
-                map.insert(key, index);
+                let _ = map.insert(key, index);
             }
         }
     }
@@ -478,7 +478,7 @@ mod test {
     #[test]
     fn enforces_key_length_limit() {
         let mut amp_box = AmpBox::new();
-        amp_box.insert(vec![b'k'; MAX_KEY_LENGTH], "").unwrap();
+        let _ = amp_box.insert(vec![b'k'; MAX_KEY_LENGTH], "").unwrap();
         assert!(matches!(
             amp_box.insert(vec![b'k'; MAX_KEY_LENGTH + 1], ""),
             Err(Error::KeyTooLong { len: 256 })
@@ -488,7 +488,7 @@ mod test {
     #[test]
     fn enforces_value_length_limit() {
         let mut amp_box = AmpBox::new();
-        amp_box.insert("k", vec![0; MAX_VALUE_LENGTH]).unwrap();
+        let _ = amp_box.insert("k", vec![0; MAX_VALUE_LENGTH]).unwrap();
         assert!(matches!(
             amp_box.insert("k", vec![0; MAX_VALUE_LENGTH + 1]),
             Err(Error::ValueTooLong { len: 65536 })

@@ -14,6 +14,10 @@
 //! than one per frame. Watch all four when touching how a connection reads,
 //! writes, dispatches or answers a request. divan reports throughput in
 //! calls per second alongside the time.
+#![expect(
+    clippy::unwrap_used,
+    reason = "a bench that cannot set up should fail loudly"
+)]
 
 use divan::counter::ItemsCount;
 use divan::{Bencher, black_box};

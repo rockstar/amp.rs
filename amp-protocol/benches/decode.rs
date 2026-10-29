@@ -3,6 +3,10 @@
 //! Run with `cargo bench -p amp-protocol --all-features`. The chunked case is
 //! the one to watch: it used to re-parse the buffer on every chunk, which
 //! made a large box take seconds instead of milliseconds.
+#![expect(
+    clippy::unwrap_used,
+    reason = "a bench that cannot set up should fail loudly"
+)]
 
 use amp_protocol::{AmpBox, codec::AmpCodec};
 use bytes::BytesMut;

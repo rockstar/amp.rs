@@ -326,9 +326,13 @@ where
                 Some(open) => tokio::select! {
                     biased;
                     () = &mut signal => break Ok(()),
-                    permit = Arc::clone(open).acquire_owned() => {
-                        Some(permit.expect("the semaphore is never closed"))
-                    }
+                    permit = Arc::clone(open).acquire_owned() => match permit {
+                        Ok(permit) => Some(permit),
+                        // The semaphore is never closed. Were it, no
+                        // connection could ever be admitted again, which
+                        // is a shutdown.
+                        Err(_closed) => break Ok(()),
+                    },
                 },
                 None => None,
             };
@@ -566,6 +570,7 @@ mod log_test {
     use tracing_subscriber::util::SubscriberInitExt;
 
     use super::*;
+    use crate::client::lock;
     use crate::{Client, Router};
 
     /// Collects what the subscriber writes.
@@ -574,7 +579,7 @@ mod log_test {
 
     impl Log {
         fn lines(&self) -> Vec<String> {
-            let bytes = self.0.lock().unwrap();
+            let bytes = lock(&self.0);
             String::from_utf8_lossy(&bytes)
                 .lines()
                 .map(String::from)
@@ -584,7 +589,7 @@ mod log_test {
 
     impl Write for Log {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            lock(&self.0).extend_from_slice(buf);
             Ok(buf.len())
         }
 

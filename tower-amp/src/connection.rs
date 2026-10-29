@@ -324,8 +324,8 @@ where
                         let incoming = tokio::select! {
                             biased;
                             () = &mut shutdown => return Ok(()),
-                            () = idle(idle_timeout, &in_flight, max_in_flight) => {
-                                return Err(idle_error(idle_timeout));
+                            limit = idle(idle_timeout, &in_flight, max_in_flight) => {
+                                return Err(timed_out(limit, "sent"));
                             }
                             next = stream.next() => match next {
                                 Some(incoming) => incoming?,
@@ -377,9 +377,13 @@ where
                             tokio::select! {
                                 biased;
                                 () = &mut shutdown => return Ok(()),
-                                permit = Arc::clone(&in_flight).acquire_owned() => {
-                                    break permit.expect("the semaphore is never closed");
-                                }
+                                permit = Arc::clone(&in_flight).acquire_owned() => match permit {
+                                    Ok(permit) => break permit,
+                                    // The semaphore is never closed. Were it,
+                                    // no request could ever be admitted
+                                    // again, which is a shutdown.
+                                    Err(_closed) => return Ok(()),
+                                },
                                 () = calling.notified(), if !reading => {}
                                 next = stream.next(), if reading => match next {
                                     Some(incoming) => match Message::from_box(incoming?)? {
@@ -563,8 +567,8 @@ fn answered(pending: &Mutex<Pending>, answer: Answer) {
 async fn refuse(request: Request, responses: &mpsc::Sender<AmpBox>) {
     let err = Error::too_many_requests();
     log::command_failed(&request.command, request.ask.as_deref(), &err);
-    if let Some(ask) = request.ask {
-        let _ = responses.send(error_response(ask, &err)).await;
+    if let Some(response) = request.ask.and_then(|ask| error_response(ask, &err)) {
+        let _ = responses.send(response).await;
     }
 }
 
@@ -578,8 +582,8 @@ fn failed(pending: &Mutex<Pending>, error: ErrorResponse) {
     }
 }
 
-/// Completes once the connection has been idle for `limit`: nothing in
-/// flight, and nothing read. Never completes without a limit.
+/// Completes with `limit` once the connection has been idle for it: nothing
+/// in flight, and nothing read. Never completes without a limit.
 ///
 /// A connection with a request in flight is waiting on its own handler,
 /// not on the peer, so the clock does not run until every permit of
@@ -589,34 +593,30 @@ fn failed(pending: &Mutex<Pending>, error: ErrorResponse) {
 /// the semaphore is not contended within the connection: a request that
 /// arrives drops this future, permits and all, before it waits for one.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-async fn idle(limit: Option<Duration>, in_flight: &Semaphore, max_in_flight: usize) {
+async fn idle(limit: Option<Duration>, in_flight: &Semaphore, max_in_flight: usize) -> Duration {
     let Some(limit) = limit else {
         return std::future::pending().await;
     };
     // `Server::max_in_flight` keeps the limit within `u32`, so this is
     // only defensive.
     let all = u32::try_from(max_in_flight).unwrap_or(u32::MAX);
-    let quiet = in_flight
-        .acquire_many(all)
-        .await
-        .expect("the semaphore is never closed");
+    // The semaphore is never closed. Were it, the connection could never
+    // be found quiet, so the timer would never run.
+    let Ok(quiet) = in_flight.acquire_many(all).await else {
+        return std::future::pending().await;
+    };
     drop(quiet);
     tokio::time::sleep(limit).await;
+    limit
 }
 
 /// Never completes: nothing on this target sets an idle timeout, since the
 /// server does not build here and [`Connection::serve`] has none, and
 /// tokio's timer needs a runtime there is none of.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-async fn idle(limit: Option<Duration>, _in_flight: &Semaphore, _max_in_flight: usize) {
+async fn idle(limit: Option<Duration>, _in_flight: &Semaphore, _max_in_flight: usize) -> Duration {
     debug_assert!(limit.is_none(), "no idle timeout can be set on this target");
     std::future::pending().await
-}
-
-/// The error that ends a connection whose peer sent nothing for `limit`.
-fn idle_error(limit: Option<Duration>) -> Error {
-    let limit = limit.expect("the idle timer only completes with a limit");
-    timed_out(limit, "sent")
 }
 
 /// The error that ends a connection whose peer `did` nothing for `limit`:
@@ -759,7 +759,7 @@ async fn respond<S>(
     };
     let response = match result {
         Ok(results) => match Answer::new(ask.clone(), results).into_box() {
-            Ok(response) => response,
+            Ok(response) => Some(response),
             Err(err) => {
                 let err = Error::Protocol(err);
                 log::command_failed(&command, Some(&ask), &err);
@@ -768,7 +768,9 @@ async fn respond<S>(
         },
         Err(err) => error_response(ask, &err),
     };
-    let _ = responses.send(response).await;
+    if let Some(response) = response {
+        let _ = responses.send(response).await;
+    }
 }
 
 /// Calls `service` with `request`, catching a panic in the handler so that
@@ -810,12 +812,13 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// Builds the error box for `ask`. A code or description longer than a box
 /// value may be is cut down to fit, since the handler's error must be
 /// answered somehow and the alternative is a request the peer waits on
-/// forever.
-fn error_response(ask: Vec<u8>, err: &Error) -> AmpBox {
+/// forever. `None` only if a box still cannot be built, which cannot happen:
+/// the ask came off the wire, and the other fields were cut to fit.
+fn error_response(ask: Vec<u8>, err: &Error) -> Option<AmpBox> {
     let description = err.description();
     ErrorResponse::new(ask, fit(err.code()), fit(&description))
         .into_box()
-        .expect("the ask came off the wire and the other fields were cut to fit")
+        .ok()
 }
 
 /// Truncates `s` to the longest prefix that fits a box value without
@@ -868,7 +871,7 @@ mod test {
     #[test]
     fn over_long_fields_still_make_a_box() {
         let err = Error::new("X".repeat(70_000), "y".repeat(70_000));
-        let amp_box = error_response(b"1".to_vec(), &err);
+        let amp_box = error_response(b"1".to_vec(), &err).unwrap();
         let response = ErrorResponse::from_box(amp_box).unwrap();
         assert_eq!(response.error, b"1");
         assert_eq!(response.code.len(), MAX_VALUE_LENGTH);

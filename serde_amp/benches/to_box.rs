@@ -6,6 +6,10 @@
 //! and the small case guards that. The large case is the one that would make
 //! someone with a big box reach for an index: watch both when touching how
 //! `AmpBox` stores or looks up pairs.
+#![expect(
+    clippy::unwrap_used,
+    reason = "a bench that cannot set up should fail loudly"
+)]
 
 use std::collections::BTreeMap;
 

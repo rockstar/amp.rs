@@ -41,3 +41,5 @@ broken_intra_doc_links = "deny"
 # `#[expect]` warns when the lint it silences stops firing, so a stale
 # silence cannot linger. `#[allow]` never does.
 allow_attributes = "deny"
+expect_used = "deny"
+unwrap_used = "deny"

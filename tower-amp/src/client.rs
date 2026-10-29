@@ -273,22 +273,26 @@ impl Client {
         // A call waits in `pending` for its answer, and is removed from it
         // when this future completes or is dropped. A notification's reply
         // travels with the request, for the writer to answer.
-        let mut written = Some(reply);
-        let _waiting = request.ask.as_mut().map(|ask| {
-            // The ask only has to be unique on this connection, and the
-            // counter is the one place that can guarantee that, so whatever
-            // the caller set is replaced. Only its presence matters.
-            *ask = self
-                .next_ask
-                .fetch_add(1, Ordering::Relaxed)
-                .to_string()
-                .into();
-            lock(&self.pending).insert(ask.clone(), written.take().expect("one reply sender"));
-            Waiting {
-                ask: ask.clone(),
-                pending: &self.pending,
+        let (written, _waiting) = match request.ask.as_mut() {
+            Some(ask) => {
+                // The ask only has to be unique on this connection, and the
+                // counter is the one place that can guarantee that, so
+                // whatever the caller set is replaced. Only its presence
+                // matters.
+                *ask = self
+                    .next_ask
+                    .fetch_add(1, Ordering::Relaxed)
+                    .to_string()
+                    .into();
+                lock(&self.pending).insert(ask.clone(), reply);
+                let waiting = Waiting {
+                    ask: ask.clone(),
+                    pending: &self.pending,
+                };
+                (None, Some(waiting))
             }
-        });
+            None => (Some(reply), None),
+        };
         // Either channel is gone only once the connection has ended, and
         // `run` records why before it drops either of them.
         if self

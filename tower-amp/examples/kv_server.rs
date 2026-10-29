@@ -7,6 +7,10 @@
 //!
 //! Run with `cargo run --example kv_server`, then run one or more
 //! `cargo run --example kv_watcher` against it.
+#![expect(
+    clippy::unwrap_used,
+    reason = "an example reads better without error handling"
+)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;

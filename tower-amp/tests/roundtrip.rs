@@ -2,6 +2,11 @@
 
 // There is no server on WebAssembly; `client.rs` covers the client there.
 #![cfg(not(target_family = "wasm"))]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "a test helper that cannot go on should fail the test"
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

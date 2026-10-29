@@ -3,6 +3,11 @@
 //! connection that runs on WebAssembly, where there is no server. On
 //! wasm32-unknown-unknown there is no tokio runtime either, so there the
 //! tests run under wasm-bindgen-test and wait on the host's timer.
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "a test helper that cannot go on should fail the test"
+)]
 
 use std::time::Duration;
 

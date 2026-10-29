@@ -30,7 +30,7 @@ Usage
 --
 
 ```rust
-use amp_protocol::{AmpBox, Message, Request};
+use amp_protocol::{AmpBox, Answer, Message, Request};
 
 fn main() -> Result<(), amp_protocol::Error> {
     // Build a request and put it on the wire.
@@ -53,7 +53,8 @@ fn main() -> Result<(), amp_protocol::Error> {
     // Reply, echoing the request's `_ask` as `_answer`.
     let mut results = AmpBox::new();
     results.insert("total", "94")?;
-    let answer = request.answer(results).expect("request wanted an answer");
+    let ask = request.ask.expect("request wanted an answer");
+    let answer = Answer::new(ask, results);
     let bytes = answer.into_box()?.encode();
     assert_eq!(
         bytes,

@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use amp_protocol::{AmpBox, Message, Request};
+use amp_protocol::{AmpBox, Answer, ErrorResponse, Message, Request};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::DuplexStream;
@@ -57,11 +57,17 @@ fn respond(request: &Request) -> Option<AmpBox> {
             results
                 .insert("total", (argument("a") + argument("b")).to_string())
                 .unwrap();
-            request.answer(results).map(|a| a.into_box().unwrap())
+            let ask = request.ask.as_ref()?;
+            Some(Answer::new(ask.clone(), results).into_box().unwrap())
         }
-        b"Fail" => request
-            .error("NOPE", "as requested")
-            .map(|e| e.into_box().unwrap()),
+        b"Fail" => {
+            let ask = request.ask.as_ref()?;
+            Some(
+                ErrorResponse::new(ask.clone(), "NOPE", "as requested")
+                    .into_box()
+                    .unwrap(),
+            )
+        }
         _ => None,
     }
 }

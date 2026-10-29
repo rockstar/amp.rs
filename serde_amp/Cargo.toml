@@ -1,6 +1,6 @@
 [package]
 name = "serde_amp"
-version = "0.4.0"
+version = "0.5.0"
 description = "serde support for Asynchronous Messaging Protocol (AMP) boxes"
 keywords = ["serde", "serialization", "amp"]
 categories = ["encoding"]
@@ -18,7 +18,7 @@ include = [
 ]
 
 [dependencies]
-amp-protocol = { path = "../amp-protocol", version = "0.2" }
+amp-protocol = { path = "../amp-protocol", version = "0.3" }
 serde.workspace = true
 
 [dev-dependencies]

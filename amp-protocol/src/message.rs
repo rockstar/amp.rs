@@ -31,29 +31,6 @@ impl Request {
         self
     }
 
-    /// Builds the successful response to this request, or `None` if the
-    /// request wants no response.
-    pub fn answer(&self, results: AmpBox) -> Option<Answer> {
-        self.ask.as_ref().map(|ask| Answer {
-            answer: ask.clone(),
-            results,
-        })
-    }
-
-    /// Builds the failed response to this request, or `None` if the request
-    /// wants no response.
-    pub fn error<C, D>(&self, code: C, description: D) -> Option<ErrorResponse>
-    where
-        C: Into<Vec<u8>>,
-        D: Into<Vec<u8>>,
-    {
-        self.ask.as_ref().map(|ask| ErrorResponse {
-            error: ask.clone(),
-            code: code.into(),
-            description: description.into(),
-        })
-    }
-
     /// Splits a box into a request.
     ///
     /// Fails with [`Error::MissingKey`] if the box has no `_command`.
@@ -291,8 +268,6 @@ mod test {
         let amp_box = request.clone().into_box().unwrap();
         assert_eq!(amp_box.get(KEY_ASK), None);
         assert_eq!(Request::from_box(amp_box).unwrap(), request);
-        assert_eq!(request.answer(AmpBox::new()), None);
-        assert_eq!(request.error("UNKNOWN", "boom"), None);
     }
 
     #[test]
@@ -372,20 +347,6 @@ mod test {
                 (b"total".to_vec(), b"94".to_vec()),
             ]
         );
-    }
-
-    #[test]
-    fn request_answer_and_error_echo_ask() {
-        let request = Request::new("Sum", args()).with_ask("7f");
-        let answer = request
-            .answer(AmpBox::from_pairs([("total", "94")]).unwrap())
-            .unwrap();
-        assert_eq!(answer.answer, b"7f");
-        let error = request
-            .error(ErrorResponse::UNHANDLED, "no such command")
-            .unwrap();
-        assert_eq!(error.error, b"7f");
-        assert_eq!(error.code, b"UNHANDLED");
     }
 
     #[test]

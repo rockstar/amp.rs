@@ -149,6 +149,10 @@ where
     /// reply is next written to it; until then its connection counts
     /// against [`max_connections`](Server::max_connections) like any other.
     ///
+    /// A limit above what one connection could ever hold, such as
+    /// `usize::MAX` for "no limit", is lowered to the most the connection
+    /// can count.
+    ///
     /// # Panics
     ///
     /// If `limit` is zero, since a connection that may never read a request
@@ -158,7 +162,11 @@ where
             limit > 0,
             "a connection must be allowed a request in flight"
         );
-        self.max_in_flight = limit;
+        // The connection counts its requests in flight with a semaphore,
+        // which cannot hold more than `MAX_PERMITS`, and checks for idleness
+        // by taking them all back as a `u32`. Either bound is more requests
+        // than a connection will ever hold.
+        self.max_in_flight = limit.min(Semaphore::MAX_PERMITS).min(u32::MAX as usize);
         self
     }
 

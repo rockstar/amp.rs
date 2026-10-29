@@ -593,8 +593,8 @@ async fn idle(limit: Option<Duration>, in_flight: &Semaphore, max_in_flight: usi
     let Some(limit) = limit else {
         return std::future::pending().await;
     };
-    // The semaphore holds fewer permits than `u32::MAX`, so this is only
-    // defensive.
+    // `Server::max_in_flight` keeps the limit within `u32`, so this is
+    // only defensive.
     let all = u32::try_from(max_in_flight).unwrap_or(u32::MAX);
     let quiet = in_flight
         .acquire_many(all)

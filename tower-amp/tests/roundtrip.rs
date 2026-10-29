@@ -873,6 +873,22 @@ async fn the_in_flight_limit_is_configurable() {
     }
 }
 
+/// The natural spelling of "no limit" is more permits than tokio's
+/// semaphore can hold. It is lowered to what the connection can count,
+/// not left to panic inside the connection's task.
+#[tokio::test]
+async fn an_unbounded_in_flight_limit_is_lowered() {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let server = Server::new(router()).max_in_flight(usize::MAX);
+    let served = tokio::spawn(server.serve_connection(server_io));
+
+    let client = Client::new(client_io);
+    let total = client.call(&Sum { a: 1, b: 2 }).await.unwrap();
+    assert_eq!(total.total, 3);
+    drop(client);
+    ended(served).await.unwrap();
+}
+
 /// A connection that may never read a request would hang its peer, so a
 /// limit of zero is refused where it is set rather than at the first call.
 #[test]

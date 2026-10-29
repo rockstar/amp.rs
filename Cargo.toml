@@ -33,6 +33,7 @@ future_incompatible = { level = "deny", priority = -1 }
 missing_debug_implementations = "deny"
 missing_docs = "deny"
 nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
 trivial_casts = "deny"
 trivial_numeric_casts = "deny"
 unreachable_pub = "deny"
@@ -41,6 +42,10 @@ unused_crate_dependencies = "deny"
 unused_import_braces = "deny"
 unused_lifetimes = "deny"
 unused_results = "deny"
+
+# Spelling out `Formatter<'_>` and the like is noise the compiler infers correctly on its own.
+# Part of rust_2018_idioms.
+elided_lifetimes_in_paths = "allow"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"

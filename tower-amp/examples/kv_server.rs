@@ -244,8 +244,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The connection is built here rather than handed to
         // `serve_connection`, so that this connection's handlers get a
         // handle to call commands on its peer. The router is therefore
-        // built per connection, with that handle in its state.
-        let connection = Connection::new(stream);
+        // built per connection, with that handle in its state. `Connection`
+        // has no idle timeout by default, since clients use it too, so set
+        // the one `serve` would have, or a peer that sends nothing holds
+        // its connection and task for good.
+        let connection = Connection::new(stream).idle_timeout(Duration::from_secs(300));
         let session = Session {
             store: store.clone(),
             id,

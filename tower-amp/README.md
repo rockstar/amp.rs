@@ -237,7 +237,9 @@ reconnects, awaits `Client::closed`, which resolves to the same cause once
 the connection has ended; `Client::is_closed` says whether it has. `serve` and
 `Server` take one service for every connection, so a server whose handlers
 call back accepts connections itself and builds a `Connection` and a router
-for each, as the `kv_server` example does.
+for each, as the `kv_server` example does. Such a server should set an
+`idle_timeout` on each `Connection`, since `Connection` has none by default
+and `Server` closes an idle connection after five minutes.
 
 WebAssembly
 --

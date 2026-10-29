@@ -1,4 +1,8 @@
 #![expect(unused_crate_dependencies)]
+#![expect(
+    clippy::unused_async_trait_impl,
+    reason = "`handle` is an `async fn` by its trait, whether or not a handler has anything to await"
+)]
 //! Tower middleware around an AMP server. The router is an ordinary tower
 //! service, so anything from the tower ecosystem wraps it, and so does a
 //! layer of your own. This server stacks four:

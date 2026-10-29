@@ -710,7 +710,6 @@ mod test {
 
     #[test]
     // Parsing must reproduce each value exactly, so these compare exactly.
-    #[expect(clippy::float_cmp)]
     fn floats_as_twisted_writes_them() {
         assert_eq!(value::<f64>(b"12.9").unwrap(), 12.9);
         assert_eq!(value::<f32>(b"12.9").unwrap(), 12.9);

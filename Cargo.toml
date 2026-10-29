@@ -36,11 +36,15 @@ nonstandard_style = { level = "deny", priority = -1 }
 rust_2018_idioms = { level = "deny", priority = -1 }
 trivial_casts = "deny"
 trivial_numeric_casts = "deny"
+unnameable_types = "deny"
 unreachable_pub = "deny"
 unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 unused_crate_dependencies = "deny"
 unused_import_braces = "deny"
 unused_lifetimes = "deny"
+unused_macro_rules = "deny"
+unused_qualifications = "deny"
 unused_results = "deny"
 
 # Spelling out `Formatter<'_>` and the like is noise the compiler infers correctly on its own.

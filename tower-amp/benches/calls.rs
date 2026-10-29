@@ -1,4 +1,8 @@
 #![expect(unused_crate_dependencies)]
+#![expect(
+    clippy::unused_async_trait_impl,
+    reason = "`handle` is an `async fn` by its trait, whether or not a handler has anything to await"
+)]
 //! Calls through a served connection, one at a time and pipelined.
 //!
 //! Run with `cargo bench -p tower-amp`. A client and a server run on a

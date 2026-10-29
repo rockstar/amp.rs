@@ -1,5 +1,9 @@
 #![expect(unused_crate_dependencies)]
 #![expect(
+    clippy::unused_async_trait_impl,
+    reason = "`handle` is an `async fn` by its trait, whether or not a handler has anything to await"
+)]
+#![expect(
     clippy::cast_precision_loss,
     reason = "`Divide` answers with a float, so its integer operands need not survive exactly"
 )]

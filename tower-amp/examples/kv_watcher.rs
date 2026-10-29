@@ -1,4 +1,8 @@
 #![expect(unused_crate_dependencies)]
+#![expect(
+    clippy::unused_async_trait_impl,
+    reason = "`handle` is an `async fn` by its trait, whether or not a handler has anything to await"
+)]
 //! Watches the key/value store in `kv_server.rs`: subscribes, sets a key,
 //! and prints every change the server pushes. The pushes arrive as
 //! `Changed` commands on the same connection this program calls the server

@@ -1,4 +1,8 @@
 #![expect(unused_crate_dependencies)]
+#![expect(
+    clippy::unused_async_trait_impl,
+    reason = "`handle` is an `async fn` by its trait, whether or not a handler has anything to await"
+)]
 //! A client and a hand-rolled peer joined by an in-memory pipe, so that the
 //! client is tested without the server. This is the only test of a
 //! connection that runs on WebAssembly, where there is no server. On
@@ -257,7 +261,7 @@ async fn a_notification_from_the_peer_is_ignored() {
     assert_eq!(refusal.get("_error"), Some(&b"8"[..]));
     // Nothing else was written on the notification's account.
     drop(client);
-    assert!(drain(&mut peer).await.is_empty());
+    assert_eq!(drain(&mut peer).await, []);
 }
 
 /// A request handed to the client as a service, whose arguments use a key

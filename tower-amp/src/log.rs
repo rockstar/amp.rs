@@ -58,7 +58,7 @@ mod with_tracing {
     pub(crate) fn command_failed(command: &[u8], ask: Option<&[u8]>, err: &Error) {
         let command = self::command(command);
         let ask = self::ask(ask);
-        let error = self::error(err);
+        let error = error(err);
         if matches!(err, Error::Command { .. }) {
             tracing::debug!(%command, %ask, %error, "command failed");
         } else {
@@ -76,7 +76,7 @@ mod with_tracing {
     /// An error from `accept` that the accept loop carries on past.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn accept_skipped(err: &std::io::Error) {
-        let error = self::error(err);
+        let error = error(err);
         tracing::warn!(%error, "could not accept a connection");
     }
 
@@ -86,7 +86,7 @@ mod with_tracing {
     /// anything else is a failure.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn connection_failed(err: &Error) {
-        let error = self::error(err);
+        let error = error(err);
         match err {
             Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
                 tracing::debug!(%error, "connection timed out");

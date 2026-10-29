@@ -1,4 +1,8 @@
 #![expect(unused_crate_dependencies)]
+#![expect(
+    clippy::unused_async_trait_impl,
+    reason = "`handle` is an `async fn` by its trait, whether or not a handler has anything to await"
+)]
 //! A key/value store: commands that share state, an error type of the
 //! server's own, optional arguments, list results, a command with no
 //! results, tower middleware, a hand-written accept loop that reports
@@ -230,6 +234,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::default();
     let listener = TcpListener::bind("127.0.0.1:1234").await?;
     println!("listening on {}", listener.local_addr()?);
+    #[expect(
+        clippy::for_unbounded_range,
+        reason = "a connection counter that outlives u64 is not a concern"
+    )]
     for id in 0u64.. {
         // A peer that resets during the handshake, or a brief shortage of
         // file descriptors, is an error from `accept` and not a reason to

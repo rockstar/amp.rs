@@ -740,15 +740,14 @@ mod log_test {
         let (client_io, server_io) = tokio::io::duplex(4096);
         tokio::spawn(serve_connection(server_io, Router::new()));
         let mut client = Client::new(client_io);
-        let command = "Nope\n2026-10-14T00:00:00Z ERROR tower_amp: admin login \x1b[31msucceeded";
+        let command = "Nope\n2026-10-14 ERROR admin login \x1b[31msucceeded";
         let request = Request::new(command, AmpBox::new()).with_ask("x");
         Service::call(&mut client, request).await.unwrap_err();
 
         let lines = log.lines();
         assert_eq!(lines.len(), 1, "{lines:#?}");
         assert!(!lines[0].contains('\x1b'), "{lines:#?}");
-        let escaped =
-            r#""Nope\n2026-10-14T00:00:00Z ERROR tower_amp: admin login \u{1b}[31msucceeded""#;
+        let escaped = r#""Nope\n2026-10-14 ERROR admin login \u{1b}[31msucceeded""#;
         assert!(
             lines[0].contains(&format!("command={escaped}")),
             "{lines:#?}"
@@ -760,6 +759,44 @@ mod log_test {
             )),
             "{lines:#?}"
         );
+    }
+
+    /// A command name is a box value, so the peer can make it 64 KiB. The
+    /// log shows the start of it, in the command field and in the error
+    /// text that repeats it, and no more.
+    #[tokio::test]
+    async fn long_peer_values_are_cut_short() {
+        let log = Log::default();
+        let _guard = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(LevelFilter::DEBUG)
+            .finish()
+            .set_default();
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server_io, Router::new()));
+        let mut client = Client::new(client_io);
+        let command = "N".repeat(65_535);
+        let request = Request::new(command, AmpBox::new()).with_ask("x");
+        Service::call(&mut client, request).await.unwrap_err();
+
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(
+            lines[0].len() < 1024,
+            "{} bytes: {lines:#?}",
+            lines[0].len()
+        );
+        assert!(
+            lines[0].contains(&format!("command=\"{}\"...", "N".repeat(64))),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[0].contains("error=\"UNHANDLED: unhandled command: NNNN"),
+            "{lines:#?}"
+        );
+        assert!(lines[0].contains("\"..."), "{lines:#?}");
     }
 }
 

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Pending;
 use std::io;
 use std::pin::pin;
@@ -90,6 +91,17 @@ pub struct Server<S, F = Pending<()>> {
     idle_timeout: Option<Duration>,
     max_connections: Option<usize>,
     shutdown: F,
+}
+
+impl<S, F> fmt::Debug for Server<S, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Server")
+            .field("codec", &self.codec)
+            .field("max_in_flight", &self.max_in_flight)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("max_connections", &self.max_connections)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S> Server<S>

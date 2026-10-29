@@ -29,6 +29,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tower = "0.5"
 
 [workspace.lints.rust]
+missing_debug_implementations = "deny"
 missing_docs = "deny"
 unreachable_pub = "deny"
 unsafe_code = "deny"

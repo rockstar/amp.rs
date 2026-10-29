@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::future::{Future, Ready, ready};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +61,14 @@ pub struct Client {
     /// for.
     closed: watch::Receiver<()>,
     timeout: Option<Duration>,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A request queued for the connection's writer.

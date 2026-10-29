@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::pin;
@@ -82,6 +83,15 @@ pub struct Connection<T> {
     /// [`Client::closed`] waits for.
     open: watch::Sender<()>,
     pub(crate) idle_timeout: Option<Duration>,
+}
+
+impl<T> fmt::Debug for Connection<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection")
+            .field("client", &self.client)
+            .field("idle_timeout", &self.idle_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T> Connection<T>

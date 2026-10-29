@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::future::{Future, ready};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -31,6 +32,18 @@ pub struct Router<S = ()> {
     // copying the table and every command name in it.
     handlers: Arc<HashMap<Vec<u8>, Arc<Handler<S>>>>,
     state: S,
+}
+
+impl<S> fmt::Debug for Router<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let commands = self
+            .handlers
+            .keys()
+            .map(|name| String::from_utf8_lossy(name));
+        f.debug_struct("Router")
+            .field("commands", &commands.collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Router<()> {

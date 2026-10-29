@@ -29,19 +29,29 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tower = "0.5"
 
 [workspace.lints.rust]
+future_incompatible = { level = "deny", priority = -1 }
 missing_debug_implementations = "deny"
 missing_docs = "deny"
+nonstandard_style = { level = "deny", priority = -1 }
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
 unreachable_pub = "deny"
 unsafe_code = "deny"
-unused_crate_dependences = "deny"
+unused_import_braces = "deny"
+unused_lifetimes = "deny"
 unused_results = "deny"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
 
 [workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+
 # `#[expect]` warns when the lint it silences stops firing, so a stale
 # silence cannot linger. `#[allow]` never does.
 allow_attributes = "deny"
 expect_used = "deny"
 unwrap_used = "deny"
+
+multiple_crate_versions = "allow"

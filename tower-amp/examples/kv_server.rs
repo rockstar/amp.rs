@@ -226,7 +226,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:1234").await?;
     println!("listening on {}", listener.local_addr()?);
     for id in 0u64.. {
-        let (stream, peer) = listener.accept().await?;
+        // A peer that resets during the handshake, or a brief shortage of
+        // file descriptors, is an error from `accept` and not a reason to
+        // stop. As `serve` does, report it, pause, and carry on.
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                eprintln!("accept failed: {err}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         // As `serve` does, so that replies written back to back are not
         // each held for the acknowledgement of the one before.
         let _ = stream.set_nodelay(true);

@@ -81,11 +81,19 @@ mod with_tracing {
         tracing::warn!(%error, "could not accept a connection");
     }
 
-    /// An error that ended one of `serve`'s connections.
+    /// An error that ended one of `serve`'s connections. A timeout is the
+    /// idle limit doing its job on a peer that kept a connection open and
+    /// quiet, which is routine, so it is only of interest when debugging;
+    /// anything else is a failure.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn connection_failed(err: &Error) {
         let error = self::error(err);
-        tracing::warn!(%error, "connection failed");
+        match err {
+            Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
+                tracing::debug!(%error, "connection timed out")
+            }
+            _ => tracing::warn!(%error, "connection failed"),
+        }
     }
 
     #[cfg(test)]

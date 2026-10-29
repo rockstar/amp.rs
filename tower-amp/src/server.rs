@@ -724,6 +724,66 @@ mod log_test {
         assert!(lines[0].contains(r#"ask="-""#), "{lines:#?}");
     }
 
+    /// A connection closed by the idle timeout is routine, so it is only
+    /// of interest when debugging: a thousand idle pooled clients must not
+    /// put a thousand warnings in the log every few minutes.
+    #[tokio::test]
+    async fn idle_timeouts_are_logged_at_debug() {
+        let log = Log::default();
+        let _guard = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(LevelFilter::DEBUG)
+            .finish()
+            .set_default();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = Server::new(Router::new())
+            .idle_timeout(Duration::from_millis(50))
+            .shutdown(async move {
+                let _ = stopped.await;
+            });
+        let served = tokio::spawn(server.serve(listener));
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client = Client::new(stream);
+        // One call so the connection is up, then nothing until it is cut
+        // off for it.
+        let request = Request::new("Nope", AmpBox::new()).with_ask("x");
+        Service::call(&mut client, request).await.unwrap_err();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !log
+                .lines()
+                .iter()
+                .any(|line| line.contains("sent nothing for"))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the idle timeout should end the connection");
+        stop.send(()).unwrap();
+        served.await.unwrap().unwrap();
+
+        let timed_out: Vec<_> = log
+            .lines()
+            .into_iter()
+            .filter(|line| line.contains("sent nothing for"))
+            .collect();
+        assert_eq!(timed_out.len(), 1, "{timed_out:#?}");
+        assert!(timed_out[0].contains("DEBUG"), "{timed_out:#?}");
+        assert!(
+            timed_out[0].contains("connection timed out"),
+            "{timed_out:#?}"
+        );
+        assert!(
+            !log.lines().iter().any(|line| line.contains("WARN")),
+            "{:#?}",
+            log.lines()
+        );
+    }
+
     /// The command is the peer's bytes, and the error text repeats it. A
     /// newline in it must not become a second log line, and an escape byte
     /// must not reach the terminal as is.

@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! Interoperability with Twisted, the reference implementation of AMP: this
 //! crate's server against Twisted's client, and this crate's client against
 //! Twisted's server, with each side calling a command on the other inside

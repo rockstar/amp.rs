@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! The canonical AMP example: a server with `Sum` and `Divide` commands,
 //! compatible with the client in Twisted's AMP documentation.
 //!

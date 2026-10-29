@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! Watches the key/value store in `kv_server.rs`: subscribes, sets a key,
 //! and prints every change the server pushes. The pushes arrive as
 //! `Changed` commands on the same connection this program calls the server

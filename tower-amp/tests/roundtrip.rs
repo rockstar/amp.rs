@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! A client and a served connection joined by an in-memory pipe.
 
 // There is no server on WebAssembly; `client.rs` covers the client there.

@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! Calls the `Sum` and `Divide` commands of the server in `sum_server.rs`.
 //!
 //! Start that server first, then run with `cargo run --example client`.

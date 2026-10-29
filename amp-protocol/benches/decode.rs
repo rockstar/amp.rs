@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! Decoding throughput, whole and as a stream.
 //!
 //! Run with `cargo bench -p amp-protocol --all-features`. The chunked case is

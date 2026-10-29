@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! The `#[command]` attribute's error messages, and a case it must accept.
 //! Each `.rs` under `tests/ui` has the compiler's output in a `.stderr`
 //! next to it; run with `TRYBUILD=overwrite` to regenerate those.

@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! Tower middleware around an AMP server. The router is an ordinary tower
 //! service, so anything from the tower ecosystem wraps it, and so does a
 //! layer of your own. This server stacks four:

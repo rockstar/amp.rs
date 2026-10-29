@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(test, expect(unused_crate_dependencies))]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 

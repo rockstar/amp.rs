@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! Calls through a served connection, one at a time and pipelined.
 //!
 //! Run with `cargo bench -p tower-amp`. A client and a server run on a

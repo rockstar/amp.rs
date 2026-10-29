@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! Building a box through serde, small and large.
 //!
 //! Run with `cargo bench -p serde_amp`. `AmpBox::insert` scans the existing

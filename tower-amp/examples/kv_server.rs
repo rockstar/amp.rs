@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! A key/value store: commands that share state, an error type of the
 //! server's own, optional arguments, list results, a command with no
 //! results, tower middleware, a hand-written accept loop that reports

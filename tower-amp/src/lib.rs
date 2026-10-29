@@ -1,3 +1,4 @@
+#![cfg_attr(test, expect(unused_crate_dependencies))]
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

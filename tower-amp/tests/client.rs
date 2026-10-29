@@ -1,3 +1,4 @@
+#![expect(unused_crate_dependencies)]
 //! A client and a hand-rolled peer joined by an in-memory pipe, so that the
 //! client is tested without the server. This is the only test of a
 //! connection that runs on WebAssembly, where there is no server. On

@@ -442,10 +442,10 @@ tower-amp = { version = "0.3", features = ["tracing"] }
 Not yet supported: TLS. A connection error inside `serve` ends that
 connection and is only logged; write the accept loop yourself with
 `serve_connection` or `Server::serve_connection` to handle it, and set
-`TCP_NODELAY` on each stream yourself. `serve` itself survives a peer that
-hangs up before it is accepted and a process briefly out of file
-descriptors, and returns only on an error that means the listener is no
-good.
+`TCP_NODELAY` on each stream yourself. `serve` itself survives every
+accept error but one that means the listener is no good: a peer that hangs
+up before it is accepted is skipped at once, and anything else, such as a
+process briefly out of file descriptors, after a short pause.
 
 License
 --

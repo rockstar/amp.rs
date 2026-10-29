@@ -17,10 +17,11 @@ use tower::Service;
 use crate::connection::{DEFAULT_MAX_IN_FLIGHT, Owner};
 use crate::{Connection, Error, log};
 
-/// How long the accept loop waits after `accept` fails for want of a file
-/// descriptor, so that it neither spins nor gives up while the process is
-/// briefly at its limit.
-const OUT_OF_DESCRIPTORS_BACKOFF: Duration = Duration::from_millis(100);
+/// How long the accept loop waits after `accept` fails for a reason other
+/// than the peer hanging up, such as the process being out of file
+/// descriptors or the kernel out of socket memory, so that it neither spins
+/// nor gives up while the condition is briefly in effect.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// How long a connection may sit idle unless told otherwise: long enough
 /// that a client which keeps a connection open between calls is rarely cut
@@ -420,13 +421,14 @@ where
 /// Accepts connections on `listener` forever, serving each one with a clone
 /// of `service` on its own task.
 ///
-/// Returns only when accepting a connection fails for good. A peer that
-/// drops its connection before it is accepted, or an accept that fails
-/// because the process is briefly out of file descriptors, is skipped and
-/// the loop carries on; anything else, such as the listener being closed,
-/// ends `serve` with that error, once the connections already accepted
-/// have finished the requests they had received. An error on one
-/// connection ends that connection. With the `tracing` feature, a skipped
+/// Returns only when the listener itself is no good. A peer that drops its
+/// connection before it is accepted is skipped at once; any other accept
+/// error, such as the process being briefly out of file descriptors or the
+/// kernel out of socket memory, is skipped after a short pause, and the
+/// loop carries on. Only an error that says the listener is gone, such as
+/// its descriptor being closed, ends `serve` with that error, once the
+/// connections already accepted have finished the requests they had
+/// received. An error on one connection ends that connection. With the `tracing` feature, a skipped
 /// accept error and a connection's error are logged; without it they are
 /// discarded, and calling [`serve_connection`] from your own accept loop is
 /// the way to observe the latter.
@@ -455,35 +457,44 @@ where
 ///
 /// A peer that resets or hangs up between connecting and being accepted
 /// surfaces as a connection error on `accept`, and says nothing about the
-/// listener. Running out of file descriptors (`EMFILE`, `ENFILE`) clears
-/// once a connection closes, but retrying at once would spin until then.
-/// Both are routine under load or a port scan, and neither is a reason to
-/// stop serving. This matches what hyper's `AddrIncoming` and axum's
-/// `serve` do.
+/// listener, so it is retried at once. Everything else is retried after a
+/// pause, unless it says the listener itself is gone. Running out of file
+/// descriptors (`EMFILE`, `ENFILE`) clears once a connection closes, the
+/// kernel running out of socket memory (`ENOMEM`, `ENOBUFS`) clears on its
+/// own, and Linux hands out errors pending on the new socket, such as
+/// `EPROTO` and `ENETDOWN`, through `accept` as well. All of these are
+/// routine under load or a connection flood, none is a reason to stop
+/// serving, and retrying any of them at once would spin until it cleared.
+/// axum's `serve` does the same: it ends for nothing, and pauses on every
+/// error that is not a hung-up peer.
 fn retry_after(err: &io::Error) -> Option<Duration> {
     match err.kind() {
         io::ErrorKind::ConnectionAborted
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::ConnectionRefused
         | io::ErrorKind::Interrupted => Some(Duration::ZERO),
-        _ if out_of_descriptors(err) => Some(OUT_OF_DESCRIPTORS_BACKOFF),
-        _ => None,
+        _ if listener_is_gone(err) => None,
+        _ => Some(ACCEPT_BACKOFF),
     }
 }
 
-/// Whether `err` is `EMFILE` or `ENFILE`: the process or the system has no
-/// file descriptor left for the connection. `io::ErrorKind` has no variant
-/// for either, so this goes by the OS error code.
-fn out_of_descriptors(err: &io::Error) -> bool {
-    const OUT_OF_DESCRIPTORS: &[i32] = if cfg!(windows) {
-        // WSAEMFILE; Windows has no per-system equivalent of ENFILE.
-        &[10024]
+/// Whether `err` means the listener can never accept again: `EBADF`,
+/// `ENOTSOCK` or `EINVAL`, which `accept` returns for a descriptor that is
+/// closed, is not a socket, or is not listening. `io::ErrorKind` has no
+/// variant for the first two, so this goes by the OS error code.
+fn listener_is_gone(err: &io::Error) -> bool {
+    const LISTENER_GONE: &[i32] = if cfg!(windows) {
+        // WSAEBADF, WSAEINVAL, WSAENOTSOCK.
+        &[10009, 10022, 10038]
+    } else if cfg!(any(target_os = "linux", target_os = "android")) {
+        // EBADF, EINVAL, ENOTSOCK.
+        &[9, 22, 88]
     } else {
-        // ENFILE, EMFILE: the same on Linux, macOS and the BSDs.
-        &[23, 24]
+        // EBADF, EINVAL, ENOTSOCK on macOS and the BSDs.
+        &[9, 22, 38]
     };
     err.raw_os_error()
-        .is_some_and(|code| OUT_OF_DESCRIPTORS.contains(&code))
+        .is_some_and(|code| LISTENER_GONE.contains(&code))
 }
 
 /// Serves one connection until the peer closes it.
@@ -785,18 +796,43 @@ mod test {
         let codes: &[i32] = if cfg!(windows) { &[10024] } else { &[23, 24] };
         for &code in codes {
             let err = io::Error::from_raw_os_error(code);
-            assert_eq!(retry_after(&err), Some(OUT_OF_DESCRIPTORS_BACKOFF), "{err}");
+            assert_eq!(retry_after(&err), Some(ACCEPT_BACKOFF), "{err}");
         }
     }
 
     #[test]
-    fn other_accept_errors_end_serve() {
-        for err in [
+    fn transient_accept_errors_back_off() {
+        let mut errors = vec![
             io::Error::from(io::ErrorKind::NotConnected),
             io::Error::from(io::ErrorKind::Other),
-            // EBADF: the listener's descriptor is gone.
-            io::Error::from_raw_os_error(9),
-        ] {
+            io::Error::other("no code at all"),
+        ];
+        if cfg!(unix) {
+            // ENOMEM, then ENOBUFS: socket memory pressure.
+            errors.push(io::Error::from_raw_os_error(12));
+            let enobufs = if cfg!(any(target_os = "linux", target_os = "android")) {
+                105
+            } else {
+                55
+            };
+            errors.push(io::Error::from_raw_os_error(enobufs));
+        }
+        for err in errors {
+            assert_eq!(retry_after(&err), Some(ACCEPT_BACKOFF), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_listener_that_is_gone_ends_serve() {
+        let codes: &[i32] = if cfg!(windows) {
+            &[10009, 10022, 10038]
+        } else if cfg!(any(target_os = "linux", target_os = "android")) {
+            &[9, 22, 88]
+        } else {
+            &[9, 22, 38]
+        };
+        for &code in codes {
+            let err = io::Error::from_raw_os_error(code);
             assert_eq!(retry_after(&err), None, "{err}");
         }
     }

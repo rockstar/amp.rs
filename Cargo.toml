@@ -22,7 +22,7 @@ futures-util = "0.3"
 proc-macro2 = "1"
 quote = "1"
 serde = "1"
-syn = "2"
+syn = "3"
 # 1.37 for `mpsc::Receiver::is_empty`.
 tokio = { version = "1.37", default-features = false }
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -53,5 +53,3 @@ cargo = { level = "deny", priority = -1 }
 allow_attributes = "deny"
 expect_used = "deny"
 unwrap_used = "deny"
-
-multiple_crate_versions = "allow"
